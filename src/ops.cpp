@@ -285,3 +285,48 @@ Tensor min_op(Tensor& a) {
             result.data[0] = a.data[i];
     return result;
 }
+
+// Clip — clamp all values between min and max
+Tensor clip(Tensor& a, float min_val, float max_val) {
+    Tensor result(a.shape);
+    for (int i = 0; i < a.num_el(); i++){
+        if (a.data[i] > max_val){
+            result.data[i] = max_val;
+        } else if (a.data[i] < min_val) {
+            result.data[i] = min_val;
+        } else {
+            result.data[i] = a.data[i];
+        }
+    }
+
+    return result;
+}
+
+// Broadcast add — adds a 1D bias tensor to every row of a 2D tensor
+// e.g. a={32,64} + b={64} -> {32,64}
+Tensor broadcast_add(Tensor& a, Tensor& b) {
+
+
+    if (a.shape.size() != 2)
+        throw runtime_error("broadcast_add: 'a' must be a 2D tensor, got " + to_string(a.shape.size()) + "D");
+
+    if (b.shape.size() != 1)
+        throw runtime_error("broadcast_add: 'b' must be a 1D tensor, got " + to_string(b.shape.size()) + "D");
+
+    if (b.shape[0] != a.shape[1])
+        throw runtime_error("broadcast_add: 'b' size " + to_string(b.shape[0]) +
+                            " must match a's columns " + to_string(a.shape[1]));
+
+    Tensor result(a.shape);
+
+    for (int i = 0; i < a.shape[0]; i++){
+        for (int j = 0; j < a.shape[1]; j++){
+            result.data[i * a.shape[1] + j] = a.data[i * a.shape[1] + j] + b.data[j];
+        }
+    }
+
+    return result;
+    
+}
+
+
