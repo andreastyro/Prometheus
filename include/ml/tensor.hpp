@@ -1,12 +1,20 @@
 #pragma once
 #include <vector>
 #include <stdexcept>
+#include <random>
+#include <stdexcept>
 
 class Tensor {
 public:
 
     std::vector <float> data;
     std::vector <int> shape;
+
+    // Create tensor from existing data
+    Tensor(std::vector<int> shape_, std::vector<float> data_) {
+        shape = shape_;
+        data  = data_;
+    }
 
     Tensor(std::vector<int> shape_){
         shape = shape_;
@@ -52,5 +60,14 @@ public:
         t.fill(1.0f);
         return t;
     }
+
+    // Random normal values (mean=0, std=1)
+    static Tensor randn(std::vector<int> shape);
+    
+    // Flip rows and cols (2D only)
+    Tensor transpose() const;
+
+    // Change shape without changing data
+    Tensor reshape(std::vector<int> new_shape) const;
 
 };

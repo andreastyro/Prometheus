@@ -248,7 +248,6 @@ Tensor sum(Tensor& a, int axis) {
     }
 }
 
-
 // Mean of all elements (axis=-1) or along a given axis
 Tensor mean(Tensor& a, int axis) {
 
@@ -265,4 +264,24 @@ Tensor mean(Tensor& a, int axis) {
         s.data[i] /= count;
 
     return s;
+}
+
+// Max element — returns a scalar tensor
+Tensor max_op(Tensor& a) {
+    Tensor result({1});
+    result.data[0] = a.data[0];
+    for (int i = 1; i < a.num_el(); i++)
+        if (a.data[i] > result.data[0])
+            result.data[0] = a.data[i];
+    return result;
+}
+
+// Min element — returns a scalar tensor
+Tensor min_op(Tensor& a) {
+    Tensor result({1});
+    result.data[0] = a.data[0];
+    for (int i = 1; i < a.num_el(); i++)
+        if (a.data[i] < result.data[0])
+            result.data[0] = a.data[i];
+    return result;
 }
