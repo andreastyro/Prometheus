@@ -1,4 +1,4 @@
-#include "../include/ml/tensor.hpp"
+#include "ml/tensor.hpp"
 #include <cmath>
 #include <string>
 
@@ -143,7 +143,7 @@ Tensor tanh_op(Tensor& a) {
 // Softmax: converts logits to probabilities along each row
 Tensor softmax(Tensor& a) {
 
-    Tensor result(a.shape);    
+    Tensor result(a.shape);
 
     for (int i = 0; i < a.shape[0]; i++){
 

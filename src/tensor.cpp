@@ -1,4 +1,4 @@
-#include "../include/ml/tensor.hpp"
+#include "ml/tensor.hpp"
 #include <stdio.h>
 #include <random>
 #include <stdexcept>
