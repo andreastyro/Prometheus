@@ -1,6 +1,8 @@
 #include "ml/nn/activations.hpp"
 #include "ml/ops.hpp"
 
+using namespace std;
+
 Tensor ReLU::forward(Tensor& input) {
     return relu(input);
 }
@@ -32,3 +34,4 @@ Tensor Softmax::forward(Tensor& input){
 std::vector<Tensor*> Softmax::parameters(){
     return {};
 }
+

@@ -13,7 +13,7 @@ public:
     std::vector<Tensor*> parameters() override;
 };
 
-class tanh : public Module {
+class Tanh : public Module {
 public:
     Tensor forward(Tensor& input) override;
     std::vector<Tensor*> parameters() override;
