@@ -2,12 +2,18 @@
 #include "ml/tensor.hpp"
 
 Tensor add(Tensor& a, Tensor& b);
+Tensor add(float scalar, Tensor& a);
 Tensor multiply(Tensor& a, Tensor& b);
+Tensor multiply(float scalar, Tensor& a);
 Tensor matmul(Tensor& a, Tensor& b);
 Tensor relu(Tensor& a);
 Tensor sigmoid(Tensor& a);
 Tensor subtract(Tensor& a, Tensor& b);
+Tensor subtract(float scalar, Tensor& a);
+Tensor subtract(Tensor& a, float scalar);
 Tensor divide(Tensor& a, Tensor& b);
+Tensor divide(float scalar, Tensor& a);
+Tensor divide(Tensor& a, float scalar);
 Tensor tanh_op(Tensor& a);
 Tensor softmax(Tensor& a);
 Tensor log_op(Tensor& a);

@@ -1,4 +1,5 @@
 #include "ml/nn/batchnorm.hpp"
+#include "ml/ops.hpp"
 #include <cmath>
 #include <string>
 
@@ -16,5 +17,5 @@ BatchNorm::BatchNorm(int num_features_, float eps_, bool training_){
 Tensor BatchNorm::forward(Tensor& input){
     Tensor result(input.shape);
 
-    result
+    return;
 }

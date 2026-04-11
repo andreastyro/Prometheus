@@ -21,6 +21,14 @@ Tensor add(Tensor& a, Tensor& b) {
     }
 }
 
+// Scalar + tensor
+Tensor add(float scalar, Tensor& a) {
+    Tensor result(a.shape);
+    for (int i = 0; i < a.num_el(); i++)
+        result.data[i] = scalar + a.data[i];
+    return result;
+}
+
 // Element-wise multiplication: a * b
 Tensor multiply(Tensor& a, Tensor& b) {
 
@@ -37,6 +45,14 @@ Tensor multiply(Tensor& a, Tensor& b) {
     } else{
         throw runtime_error("Tensors must have the same shape for element-wise multiplication.");
     }
+}
+
+// Scalar * tensor
+Tensor multiply(float scalar, Tensor& a) {
+    Tensor result(a.shape);
+    for (int i = 0; i < a.num_el(); i++)
+        result.data[i] = scalar * a.data[i];
+    return result;
 }
 
 // Matrix multiplication: a x b
@@ -106,6 +122,22 @@ Tensor subtract(Tensor& a, Tensor& b) {
 
 }
 
+// Scalar - tensor
+Tensor subtract(float scalar, Tensor& a) {
+    Tensor result(a.shape);
+    for (int i = 0; i < a.num_el(); i++)
+        result.data[i] = scalar - a.data[i];
+    return result;
+}
+
+// Tensor - scalar
+Tensor subtract(Tensor& a, float scalar) {
+    Tensor result(a.shape);
+    for (int i = 0; i < a.num_el(); i++)
+        result.data[i] = a.data[i] - scalar;
+    return result;
+}
+
 // Element-wise division: a / b
 Tensor divide(Tensor& a, Tensor& b) {
     if (a.shape == b.shape){
@@ -128,6 +160,27 @@ Tensor divide(Tensor& a, Tensor& b) {
     } else{
         throw runtime_error("Tensors must have the same shape for element-wise division.");
     }
+}
+
+// Scalar / tensor
+Tensor divide(float scalar, Tensor& a) {
+    Tensor result(a.shape);
+    for (int i = 0; i < a.num_el(); i++) {
+        if (a.data[i] == 0)
+            throw std::runtime_error("Division by zero at index " + std::to_string(i));
+        result.data[i] = scalar / a.data[i];
+    }
+    return result;
+}
+
+// Tensor / scalar
+Tensor divide(Tensor& a, float scalar) {
+    if (scalar == 0)
+        throw std::runtime_error("Division by zero");
+    Tensor result(a.shape);
+    for (int i = 0; i < a.num_el(); i++)
+        result.data[i] = a.data[i] / scalar;
+    return result;
 }
 
 // Tanh activation: (e^x - e^-x) / (e^x + e^-x)
