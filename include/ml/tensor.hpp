@@ -2,15 +2,15 @@
 #include <vector>
 #include <stdexcept>
 #include <random>
-#include <stdexcept>
+#include <memory>
 #include "ml/autograd.hpp"
 
-class Tensor {
+class Tensor : public std::enable_shared_from_this<Tensor> {
 public:
 
-    std::vector <float> data;
-    std::vector <int> shape;
-    std::vector <float> grad; /**  Gradient of the loss with respect to each element in data */
+    std::vector<float> data;
+    std::vector<int> shape;
+    std::vector<float> grad; /**  Gradient of the loss with respect to each element in data */
     bool requires_grad = false;
 
     std::shared_ptr<GradNode> grad_fn = nullptr;
@@ -57,13 +57,13 @@ public:
             i = val;
     }
 
-    static Tensor zeros(std::vector<int> shape){
-        return Tensor(shape);
+    static TensorPtr zeros(std::vector<int> shape){
+        return std::make_shared<Tensor>(shape);
     }
 
-    static Tensor ones(std::vector<int> shape){
-        Tensor t(shape);
-        t.fill(1.0f);
+    static TensorPtr ones(std::vector<int> shape){
+        auto t = std::make_shared<Tensor>(shape);
+        t->fill(1.0f);
         return t;
     }
 
@@ -72,13 +72,13 @@ public:
     }
 
     // Random normal values (mean=0, std=1)
-    static Tensor randn(std::vector<int> shape);
-    
+    static TensorPtr randn(std::vector<int> shape);
+
     // Flip rows and cols (2D only)
-    Tensor transpose() const;
+    TensorPtr transpose() const;
 
     // Change shape without changing data
-    Tensor reshape(std::vector<int> new_shape) const;
+    TensorPtr reshape(std::vector<int> new_shape) const;
 
     // Backpropagate gradients through the computation graph
     void backward();

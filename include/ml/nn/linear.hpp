@@ -3,10 +3,10 @@
 
 class Linear : public Module {
 public:
-    Tensor weights;
-    Tensor bias;
+    TensorPtr weights;
+    TensorPtr bias;
     Linear(int in_features, int out_features);
 
-    Tensor forward(Tensor& input) override;
-    std::vector<Tensor*> parameters() override;
+    TensorPtr forward(TensorPtr input) override;
+    std::vector<TensorPtr> parameters() override;
 };

@@ -3,35 +3,34 @@
 
 using namespace std;
 
-Tensor ReLU::forward(Tensor& input) {
+TensorPtr ReLU::forward(TensorPtr input) {
     return relu(input);
 }
 
-std::vector<Tensor*> ReLU::parameters() {
+vector<TensorPtr> ReLU::parameters() {
     return {};
 }
 
-Tensor Sigmoid::forward(Tensor& input) {
+TensorPtr Sigmoid::forward(TensorPtr input) {
     return sigmoid(input);
 }
 
-std::vector<Tensor*> Sigmoid::parameters() {
+vector<TensorPtr> Sigmoid::parameters() {
     return {};
 }
 
-Tensor Tanh::forward(Tensor& input) {
+TensorPtr Tanh::forward(TensorPtr input) {
     return tanh_op(input);
 }
 
-std::vector<Tensor*> Tanh::parameters(){
+vector<TensorPtr> Tanh::parameters(){
     return {};
 }
 
-Tensor Softmax::forward(Tensor& input){
+TensorPtr Softmax::forward(TensorPtr input){
     return softmax(input);
 }
 
-std::vector<Tensor*> Softmax::parameters(){
+vector<TensorPtr> Softmax::parameters(){
     return {};
 }
-

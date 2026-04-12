@@ -8,6 +8,6 @@ public:
 
     Dropout(float rate, bool training = true);
 
-    Tensor forward(Tensor& input) override;
-    std::vector<Tensor*> parameters() override;
+    TensorPtr forward(TensorPtr input) override;
+    std::vector<TensorPtr> parameters() override;
 };

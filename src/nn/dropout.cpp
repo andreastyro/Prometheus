@@ -1,5 +1,6 @@
 #include "ml/nn/dropout.hpp"
 #include <random>
+#include <memory>
 
 using namespace std;
 
@@ -8,7 +9,7 @@ Dropout::Dropout(float rate, bool training){
     this->training = training;
 }
 
-Tensor Dropout::forward(Tensor& input){
+TensorPtr Dropout::forward(TensorPtr input){
     if (training == false)
         return input;
 
@@ -17,17 +18,17 @@ Tensor Dropout::forward(Tensor& input){
 
     float scale = 1.0f / (1.0f - rate);
 
-    Tensor result(input.shape);
+    auto result = make_shared<Tensor>(input->shape);
 
-    for (int i = 0; i < input.num_el(); i++) {
+    for (int i = 0; i < input->num_el(); i++) {
         if (dist(rng) < rate)
-            result.data[i] = 0.0f;
+            result->data[i] = 0.0f;
         else
-            result.data[i] = input.data[i] * scale;
+            result->data[i] = input->data[i] * scale;
     }
     return result;
 }
 
-std::vector<Tensor*> Dropout::parameters(){
+vector<TensorPtr> Dropout::parameters(){
     return {};
 }

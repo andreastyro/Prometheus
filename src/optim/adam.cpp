@@ -4,22 +4,22 @@
 #include <stdio.h>
 #include <algorithm>
 #include <vector>
+#include <cmath>
 
 using namespace std;
 
-Adam::Adam(vector<Tensor*> parameters, float lr, float beta1, float beta2, float eps){
-    this->parameters = parameters;
+Adam::Adam(vector<TensorPtr> params, float lr, float beta1, float beta2, float eps){
+    this->parameters = params;
     this->lr = lr;
     this->beta1 = beta1;
     this->beta2 = beta2;
     this->eps = eps;
     this->t = 0;
-    
-    for (Tensor* p : parameters){
+
+    for (auto& p : parameters){
         m.push_back(vector<float>(p->num_el(), 0.0f));
         v.push_back(vector<float>(p->num_el(), 0.0f));
     }
-
 }
 
 void Adam::step(){
@@ -28,9 +28,9 @@ void Adam::step(){
 
     t += 1;
 
-    for (int i = 0; i < parameters.size(); i++){
+    for (int i = 0; i < (int)parameters.size(); i++){
 
-        Tensor* p = parameters[i];
+        auto& p = parameters[i];
 
         for (int j = 0; j < p->num_el(); j++){
             m[i][j] = beta1 * m[i][j] + (1 - beta1) * p->grad[j];
@@ -40,8 +40,6 @@ void Adam::step(){
             v_hat = v[i][j] / (1 - pow(beta2, t));
 
             p->data[j] -= lr * m_hat / (sqrt(v_hat) + eps);
-
         }
-
     }
 }

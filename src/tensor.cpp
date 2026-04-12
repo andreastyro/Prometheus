@@ -22,32 +22,32 @@ void Tensor::print() const {
 }
 
 // Random normal values (mean=0, std=1)
-Tensor Tensor::randn(vector<int> shape) {
-    Tensor t(shape);
+TensorPtr Tensor::randn(vector<int> shape) {
+    auto t = make_shared<Tensor>(shape);
     random_device rd;                        // seed from hardware
     mt19937 gen(rd());                       // mersenne twister generator
     normal_distribution<float> dist(0.0f, 1.0f); // mean=0, std=1
-    for (float& x : t.data)
+    for (float& x : t->data)
         x = dist(gen);
     return t;
 }
 
 // Flip rows and cols (2D only)
-Tensor Tensor::transpose() const {
+TensorPtr Tensor::transpose() const {
 
     if (shape.size() != 2)
         throw runtime_error("transpose: only supported for 2D tensors");
-    
+
     int rows = shape[0], cols = shape[1];
-    Tensor result({cols, rows});
+    auto result = make_shared<Tensor>(vector<int>{cols, rows});
     for (int i = 0; i < rows; i++)
         for (int j = 0; j < cols; j++)
-            result.data[j * rows + i] = data[i * cols + j];
+            result->data[j * rows + i] = data[i * cols + j];
     return result;
 }
 
 // Change shape without changing data
-Tensor Tensor::reshape(vector<int> new_shape) const {
+TensorPtr Tensor::reshape(vector<int> new_shape) const {
     int new_total = 1;
     for (int i : new_shape)
         new_total *= i;
@@ -56,12 +56,12 @@ Tensor Tensor::reshape(vector<int> new_shape) const {
         throw runtime_error("reshape: cannot reshape tensor of size " + to_string(num_el()) +
                             " into shape with size " + to_string(new_total));
 
-    Tensor result(new_shape);
-    result.data = data;
+    auto result = make_shared<Tensor>(new_shape);
+    result->data = data;
     return result;
 }
 
-void dfs(Tensor* node, vector<Tensor*>& order, unordered_set<Tensor*>& visited){
+void dfs(TensorPtr node, vector<TensorPtr>& order, unordered_set<TensorPtr>& visited){
     if (visited.count(node)){
         return; // already visited
     }
@@ -69,7 +69,7 @@ void dfs(Tensor* node, vector<Tensor*>& order, unordered_set<Tensor*>& visited){
     visited.insert(node);
 
     if (node->grad_fn) {
-        for (Tensor* input : node->grad_fn->inputs){
+        for (TensorPtr& input : node->grad_fn->inputs){
             dfs(input, order, visited);
         }
     }
@@ -80,17 +80,17 @@ void dfs(Tensor* node, vector<Tensor*>& order, unordered_set<Tensor*>& visited){
 void Tensor::backward(){
 
     grad.assign(data.size(), 1.0f);
-    
-    vector <Tensor*> order;
-    unordered_set <Tensor*> visited;
 
-    dfs(this, order, visited); // order of nodes
+    vector<TensorPtr> order;
+    unordered_set<TensorPtr> visited;
+
+    dfs(shared_from_this(), order, visited); // order of nodes
 
     reverse(order.begin(), order.end());
 
-    for (Tensor* input : order){
-        if (input->grad_fn){
-            input->grad_fn->backward_fn();
+    for (TensorPtr& t : order){
+        if (t->grad_fn){
+            t->grad_fn->backward_fn();
         }
     }
 

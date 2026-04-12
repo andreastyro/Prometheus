@@ -5,13 +5,12 @@
 class Optimizer {
 public:
 
-    std::vector<Tensor*> parameters;
+    std::vector<TensorPtr> parameters;
 
     virtual void step() = 0;
 
     void zero_grad() {
-        for (Tensor* p : parameters)
+        for (auto& p : parameters)
             p->reset_grad();
     }
-
 };

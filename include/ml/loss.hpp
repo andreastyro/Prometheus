@@ -1,7 +1,7 @@
 #pragma once
 #include "ml/tensor.hpp"
 
-Tensor mse_loss(Tensor& pred, Tensor& target);
-Tensor mae_loss(Tensor& pred, Tensor& target);
-Tensor bce_loss(Tensor& pred, Tensor& target);
-Tensor cross_entropy_loss(Tensor& pred, Tensor& target);
+TensorPtr mse_loss(TensorPtr pred, TensorPtr target);
+TensorPtr mae_loss(TensorPtr pred, TensorPtr target);
+TensorPtr bce_loss(TensorPtr pred, TensorPtr target);
+TensorPtr cross_entropy_loss(TensorPtr pred, TensorPtr target);

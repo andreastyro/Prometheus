@@ -3,13 +3,11 @@
 #include "ml/tensor.hpp"
 #include "ml/optim/optimizer.hpp"
 
-
-class SGD : public Optimizer{
+class SGD : public Optimizer {
 public:
     float lr;
 
-    SGD(std::vector<Tensor*> params, float lr);
+    SGD(std::vector<TensorPtr> params, float lr);
 
     void step() override;
-
 };

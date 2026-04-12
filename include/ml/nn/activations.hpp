@@ -3,24 +3,24 @@
 
 class ReLU : public Module {
 public:
-    Tensor forward(Tensor& input) override;
-    std::vector<Tensor*> parameters() override;
+    TensorPtr forward(TensorPtr input) override;
+    std::vector<TensorPtr> parameters() override;
 };
 
 class Sigmoid : public Module {
 public:
-    Tensor forward(Tensor &input) override;
-    std::vector<Tensor*> parameters() override;
+    TensorPtr forward(TensorPtr input) override;
+    std::vector<TensorPtr> parameters() override;
 };
 
 class Tanh : public Module {
 public:
-    Tensor forward(Tensor& input) override;
-    std::vector<Tensor*> parameters() override;
+    TensorPtr forward(TensorPtr input) override;
+    std::vector<TensorPtr> parameters() override;
 };
 
 class Softmax : public Module {
 public:
-    Tensor forward(Tensor& input) override;
-    std::vector<Tensor*> parameters() override;
+    TensorPtr forward(TensorPtr input) override;
+    std::vector<TensorPtr> parameters() override;
 };

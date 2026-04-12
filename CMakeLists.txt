@@ -11,7 +11,6 @@ set(SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/linear.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/activations.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/dropout.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/batchnorm.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/sequential.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/optim/sgd.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/optim/adam.cpp
@@ -21,6 +20,9 @@ set(SOURCES
 add_library(prometheus ${SOURCES})
 target_include_directories(prometheus PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
-# Build the test executable
+# Build the test executables
 add_executable(test_tensor ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tensor.cpp)
 target_link_libraries(test_tensor prometheus)
+
+add_executable(test_model ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_model.cpp)
+target_link_libraries(test_model prometheus)
