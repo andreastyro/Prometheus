@@ -20,17 +20,20 @@ Tensor add(Tensor& a, Tensor& b) {
 
             auto node = make_shared<GradNode>(); //shared_ptr<GradNode>
 
-            node->inputs = {&a, &b};
-            node->backward_fn = [&a, &b, &result](){
+            node->inputs = {&a, &b}; // GradNode points to tensor that created it
+            result.grad_fn = node; // tensor points to its GradNode, can follow result.grad_fn->inputs for dfs
+
+            // forward logic ends here
+
+            node->backward_fn = [&a, &b, &result](){ // set backward function for add
                 for (int i = 0; i < result.num_el(); i++){
                     if (a.requires_grad) a.grad[i] += result.grad[i]; // Add grad of previous operation's result
                     if (b.requires_grad) b.grad[i] += result.grad[i];
                 }
             };
-            result.grad_fn = node;
+
         }
         
-
         return result;
 
     } else {
@@ -43,6 +46,18 @@ Tensor add(float scalar, Tensor& a) {
     Tensor result(a.shape);
     for (int i = 0; i < a.num_el(); i++)
         result.data[i] = scalar + a.data[i];
+
+    if (a.requires_grad) {
+        result.requires_grad = true;
+        auto node = make_shared<GradNode>();
+        node->inputs = {&a};
+        node->backward_fn = [&a, &result]() {
+            for (int i = 0; i < result.num_el(); i++)
+                a.grad[i] += result.grad[i];
+        };
+        result.grad_fn = node;
+    }
+
     return result;
 }
 
@@ -51,13 +66,26 @@ Tensor multiply(Tensor& a, Tensor& b) {
 
     if (a.shape == b.shape){
 
-        Tensor product(a.shape);
+        Tensor result(a.shape);
 
         for(int i = 0; i < a.num_el(); i++){
-            product.data[i] = a.data[i] * b.data[i];
+            result.data[i] = a.data[i] * b.data[i];
         }
 
-        return product;
+        if (a.requires_grad || b.requires_grad) {
+            result.requires_grad = true;
+            auto node = make_shared<GradNode>();
+            node->inputs = {&a, &b}; // these are used by dfs
+            node->backward_fn = [&a, &b, &result](){
+                for (int i = 0; i < result.num_el(); i++){
+                    if (a.requires_grad) a.grad[i] += b.data[i] * result.grad[i];
+                    if (b.requires_grad) b.grad[i] += a.data[i] * result.grad[i];
+                }
+            };
+            result.grad_fn = node;
+        }
+
+        return result;
 
     } else{
         throw runtime_error("Tensors must have the same shape for element-wise multiplication.");
@@ -69,6 +97,18 @@ Tensor multiply(float scalar, Tensor& a) {
     Tensor result(a.shape);
     for (int i = 0; i < a.num_el(); i++)
         result.data[i] = scalar * a.data[i];
+
+    if (a.requires_grad) {
+        result.requires_grad = true;
+        auto node = make_shared<GradNode>();
+        node->inputs = {&a};
+        node->backward_fn = [&a, &result, scalar]() {
+            for (int i = 0; i < result.num_el(); i++)
+                a.grad[i] += scalar * result.grad[i];
+        };
+        result.grad_fn = node;
+    }
+
     return result;
 }
 
@@ -77,17 +117,44 @@ Tensor matmul(Tensor& a, Tensor& b) {
 
     if (a.shape[1] == b.shape[0]){
 
-        Tensor mat_prod({a.shape[0], b.shape[1]});
+        Tensor result({a.shape[0], b.shape[1]});
 
         for(int i = 0; i < a.shape[0]; i++){
             for(int j = 0; j < b.shape[1]; j++){
                 for(int k = 0; k < a.shape[1]; k++){
-                    mat_prod.data[i * b.shape[1] + j] += a.data[i * a.shape[1] + k] * b.data[k * b.shape[1] + j];
+                    result.data[i * b.shape[1] + j] += a.data[i * a.shape[1] + k] * b.data[k * b.shape[1] + j];
                 }
             }
         }
 
-        return mat_prod;
+        if (a.requires_grad || b.requires_grad){
+            result.requires_grad = true;
+            
+            auto node = make_shared<GradNode>();
+            node->inputs = {&a, &b}; 
+            result.grad_fn = node;
+
+            node->backward_fn = [&a, &b, &result](){
+
+                Tensor grad_out({a.shape[0], b.shape[1]}, result.grad);           
+
+                if (a.requires_grad){
+                    Tensor bT = b.transpose();
+                    Tensor dA = matmul(grad_out, bT);
+                    for (int i = 0; i < a.num_el(); i++) a.grad[i] += dA.data[i];
+                }
+
+                if (b.requires_grad){
+                    Tensor aT = a.transpose();
+                    Tensor dB = matmul(aT, grad_out);
+                    for (int i = 0; i < b.num_el(); i++) b.grad[i] += dB.data[i];
+                }
+
+            };
+
+        }
+
+        return result;
 
     } else if (b.shape[1] == a.shape[0]) {
         // user passed them in the wrong order, swap and retry
@@ -132,6 +199,19 @@ Tensor subtract(Tensor& a, Tensor& b) {
             difference.data[i] = a.data[i] - b.data[i];
         }
 
+        if (a.requires_grad || b.requires_grad) {
+            difference.requires_grad = true;
+            auto node = make_shared<GradNode>();
+            node->inputs = {&a, &b};
+            difference.grad_fn = node;
+            node->backward_fn = [&a, &b, &difference]() {
+                for (int i = 0; i < difference.num_el(); i++) {
+                    if (a.requires_grad) a.grad[i] += difference.grad[i];
+                    if (b.requires_grad) b.grad[i] -= difference.grad[i];
+                }
+            };
+        }
+
         return difference;
     } else{
         throw runtime_error("Tensors must have the same shape for element-wise subtraction.");
@@ -139,19 +219,43 @@ Tensor subtract(Tensor& a, Tensor& b) {
 
 }
 
-// Scalar - tensor
+// Scalar - tensor  (d/da = -1)
 Tensor subtract(float scalar, Tensor& a) {
     Tensor result(a.shape);
     for (int i = 0; i < a.num_el(); i++)
         result.data[i] = scalar - a.data[i];
+
+    if (a.requires_grad) {
+        result.requires_grad = true;
+        auto node = make_shared<GradNode>();
+        node->inputs = {&a};
+        result.grad_fn = node;
+        node->backward_fn = [&a, &result]() {
+            for (int i = 0; i < result.num_el(); i++)
+                a.grad[i] -= result.grad[i];
+        };
+    }
+
     return result;
 }
 
-// Tensor - scalar
+// Tensor - scalar  (d/da = 1)
 Tensor subtract(Tensor& a, float scalar) {
     Tensor result(a.shape);
     for (int i = 0; i < a.num_el(); i++)
         result.data[i] = a.data[i] - scalar;
+
+    if (a.requires_grad) {
+        result.requires_grad = true;
+        auto node = make_shared<GradNode>();
+        node->inputs = {&a};
+        result.grad_fn = node;
+        node->backward_fn = [&a, &result]() {
+            for (int i = 0; i < result.num_el(); i++)
+                a.grad[i] += result.grad[i];
+        };
+    }
+
     return result;
 }
 
