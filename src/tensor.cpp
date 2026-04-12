@@ -1,8 +1,11 @@
 #include "ml/tensor.hpp"
+#include "ml/autograd.hpp"
 #include <stdio.h>
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
+#include <algorithm>
 
 using namespace std;
 
@@ -56,4 +59,39 @@ Tensor Tensor::reshape(vector<int> new_shape) const {
     Tensor result(new_shape);
     result.data = data;
     return result;
+}
+
+void dfs(Tensor* node, vector<Tensor*>& order, unordered_set<Tensor*>& visited){
+    if (visited.count(node)){
+        return; // already visited
+    }
+
+    visited.insert(node);
+
+    if (node->grad_fn) {
+        for (Tensor* input : node->grad_fn->inputs){
+            dfs(input, order, visited);
+        }
+    }
+
+    order.push_back(node);
+}
+
+void Tensor::backward(){
+
+    grad.assign(data.size(), 1.0f);
+    
+    vector <Tensor*> order;
+    unordered_set <Tensor*> visited;
+
+    dfs(this, order, visited); // order of nodes
+
+    reverse(order.begin(), order.end());
+
+    for (Tensor* input : order){
+        if (input->grad_fn){
+            input->grad_fn->backward_fn();
+        }
+    }
+
 }

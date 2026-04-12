@@ -3,29 +3,35 @@
 #include <stdexcept>
 #include <random>
 #include <stdexcept>
+#include "ml/autograd.hpp"
 
 class Tensor {
 public:
 
     std::vector <float> data;
     std::vector <int> shape;
+    std::vector <float> grad;
+    bool requires_grad = false;
+
+    std::shared_ptr<GradNode> grad_fn = nullptr;
 
     // Create tensor from existing data
     Tensor(std::vector<int> shape_, std::vector<float> data_) {
         shape = shape_;
         data  = data_;
+        grad.resize(data.size(), 0.0f);
     }
 
     Tensor(std::vector<int> shape_){
         shape = shape_;
-        
+
         int total = 1;
 
-        for (int i : shape) 
+        for (int i : shape)
             total *= i;
 
-        data.resize(total, 0.0f); // Create empty Tensor of 0s with shape_
-
+        data.resize(total, 0.0f); // find number of elements
+        grad.resize(total, 0.0f); // number of gradients = number of weights/elements
     }
 
     int num_el() const{
@@ -61,6 +67,10 @@ public:
         return t;
     }
 
+    void reset_grad() {
+        grad.assign(data.size(), 0.0f);
+    }
+
     // Random normal values (mean=0, std=1)
     static Tensor randn(std::vector<int> shape);
     
@@ -69,5 +79,8 @@ public:
 
     // Change shape without changing data
     Tensor reshape(std::vector<int> new_shape) const;
+
+    // Backpropagate gradients through the computation graph
+    void backward();
 
 };
