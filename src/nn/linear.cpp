@@ -6,6 +6,8 @@ using namespace std;
 Linear::Linear(int in_features, int out_features)
     : weights(Tensor::randn({in_features, out_features})),
       bias(Tensor::zeros({out_features})) {
+    weights.requires_grad = true;
+    bias.requires_grad = true;
 }
 
 Tensor Linear::forward(Tensor& input){

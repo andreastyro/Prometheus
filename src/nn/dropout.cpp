@@ -3,9 +3,9 @@
 
 using namespace std;
 
-Dropout::Dropout(float rate_, bool training_){
-    rate = rate_;
-    training = training_;
+Dropout::Dropout(float rate, bool training){
+    this->rate = rate;
+    this->training = training;
 }
 
 Tensor Dropout::forward(Tensor& input){

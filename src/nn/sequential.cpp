@@ -4,8 +4,8 @@
 
 using namespace std;
 
-Sequential::Sequential(vector<Module*> layers_){
-    layers = layers_;
+Sequential::Sequential(vector<Module*> layers){
+    this->layers = layers;
 }
 
 Tensor Sequential::forward(Tensor &input){

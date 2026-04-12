@@ -5,17 +5,17 @@
 
 using namespace std;
 
-BatchNorm::BatchNorm(int num_features_, float eps_, bool training_){
+BatchNorm::BatchNorm(int num_features, float eps, bool training){
     
-    gamma = Tensor::ones({num_features_});
-    beta = Tensor::zeros({num_features_});
-    eps = eps_;
-    training = training_;
+    gamma = Tensor::ones({num_features});
+    beta = Tensor::zeros({num_features});
+    this->eps = eps;
+    this->training = training;
     
 }
 
 Tensor BatchNorm::forward(Tensor& input){
     Tensor result(input.shape);
 
-    return;
+    return result;
 }
