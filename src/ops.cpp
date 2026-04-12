@@ -5,6 +5,15 @@
 
 using namespace std;
 
+// Helper: set up a GradNode and attach it to result
+shared_ptr<GradNode> make_node(Tensor& result, vector<Tensor*> inputs) {
+    result.requires_grad = true;
+    auto node = make_shared<GradNode>();
+    node->inputs = inputs;
+    result.grad_fn = node;
+    return node;
+}
+
 // Element-wise addition: a + b
 Tensor add(Tensor& a, Tensor& b) {
     if (a.shape == b.shape){
@@ -16,12 +25,7 @@ Tensor add(Tensor& a, Tensor& b) {
         }
 
         if (a.requires_grad || b.requires_grad) {
-            result.requires_grad = true;
-
-            auto node = make_shared<GradNode>(); //shared_ptr<GradNode>
-
-            node->inputs = {&a, &b}; // GradNode points to tensor that created it
-            result.grad_fn = node; // tensor points to its GradNode, can follow result.grad_fn->inputs for dfs
+            auto node = make_node(result, {&a, &b});
 
             // forward logic ends here
 
@@ -48,14 +52,11 @@ Tensor add(float scalar, Tensor& a) {
         result.data[i] = scalar + a.data[i];
 
     if (a.requires_grad) {
-        result.requires_grad = true;
-        auto node = make_shared<GradNode>();
-        node->inputs = {&a};
+        auto node = make_node(result, {&a});
         node->backward_fn = [&a, &result]() {
             for (int i = 0; i < result.num_el(); i++)
                 a.grad[i] += result.grad[i];
         };
-        result.grad_fn = node;
     }
 
     return result;
@@ -73,16 +74,13 @@ Tensor multiply(Tensor& a, Tensor& b) {
         }
 
         if (a.requires_grad || b.requires_grad) {
-            result.requires_grad = true;
-            auto node = make_shared<GradNode>();
-            node->inputs = {&a, &b}; // these are used by dfs
+            auto node = make_node(result, {&a, &b});
             node->backward_fn = [&a, &b, &result](){
                 for (int i = 0; i < result.num_el(); i++){
                     if (a.requires_grad) a.grad[i] += b.data[i] * result.grad[i];
                     if (b.requires_grad) b.grad[i] += a.data[i] * result.grad[i];
                 }
             };
-            result.grad_fn = node;
         }
 
         return result;
@@ -99,14 +97,11 @@ Tensor multiply(float scalar, Tensor& a) {
         result.data[i] = scalar * a.data[i];
 
     if (a.requires_grad) {
-        result.requires_grad = true;
-        auto node = make_shared<GradNode>();
-        node->inputs = {&a};
+        auto node = make_node(result, {&a});
         node->backward_fn = [&a, &result, scalar]() {
             for (int i = 0; i < result.num_el(); i++)
                 a.grad[i] += scalar * result.grad[i];
         };
-        result.grad_fn = node;
     }
 
     return result;
@@ -128,11 +123,7 @@ Tensor matmul(Tensor& a, Tensor& b) {
         }
 
         if (a.requires_grad || b.requires_grad){
-            result.requires_grad = true;
-            
-            auto node = make_shared<GradNode>();
-            node->inputs = {&a, &b}; 
-            result.grad_fn = node;
+            auto node = make_node(result, {&a, &b});
 
             node->backward_fn = [&a, &b, &result](){
 
@@ -174,6 +165,14 @@ Tensor relu(Tensor& a) {
         result.data[i] = a.data[i] > 0 ? a.data[i] : 0.0f;
     }
 
+    if (a.requires_grad) {
+        auto node = make_node(result, {&a});
+        node->backward_fn = [&a, &result]() {
+            for (int i = 0; i < result.num_el(); i++)
+                if (a.data[i] > 0) a.grad[i] += result.grad[i];
+        };
+    }
+
     return result;
 }
 
@@ -183,6 +182,19 @@ Tensor sigmoid(Tensor& a) {
     Tensor result(a.shape);
     for (int i = 0; i < a.num_el(); i++){
         result.data[i] = 1.0f / (1.0f + exp(-a.data[i]));
+    }
+
+    if (a.requires_grad){
+        auto node = make_node(result, {&a});
+
+        node->backward_fn = [&a, &result](){
+
+            for (int i = 0; i < result.num_el(); i++){
+                a.grad[i] += result.data[i] * (1 - result.data[i]) * result.grad[i];
+            }
+
+        };
+
     }
 
     return result;
@@ -200,10 +212,7 @@ Tensor subtract(Tensor& a, Tensor& b) {
         }
 
         if (a.requires_grad || b.requires_grad) {
-            difference.requires_grad = true;
-            auto node = make_shared<GradNode>();
-            node->inputs = {&a, &b};
-            difference.grad_fn = node;
+            auto node = make_node(difference, {&a, &b});
             node->backward_fn = [&a, &b, &difference]() {
                 for (int i = 0; i < difference.num_el(); i++) {
                     if (a.requires_grad) a.grad[i] += difference.grad[i];
@@ -226,10 +235,7 @@ Tensor subtract(float scalar, Tensor& a) {
         result.data[i] = scalar - a.data[i];
 
     if (a.requires_grad) {
-        result.requires_grad = true;
-        auto node = make_shared<GradNode>();
-        node->inputs = {&a};
-        result.grad_fn = node;
+        auto node = make_node(result, {&a});
         node->backward_fn = [&a, &result]() {
             for (int i = 0; i < result.num_el(); i++)
                 a.grad[i] -= result.grad[i];
@@ -246,10 +252,7 @@ Tensor subtract(Tensor& a, float scalar) {
         result.data[i] = a.data[i] - scalar;
 
     if (a.requires_grad) {
-        result.requires_grad = true;
-        auto node = make_shared<GradNode>();
-        node->inputs = {&a};
-        result.grad_fn = node;
+        auto node = make_node(result, {&a});
         node->backward_fn = [&a, &result]() {
             for (int i = 0; i < result.num_el(); i++)
                 a.grad[i] += result.grad[i];
@@ -263,7 +266,7 @@ Tensor subtract(Tensor& a, float scalar) {
 Tensor divide(Tensor& a, Tensor& b) {
     if (a.shape == b.shape){
 
-        Tensor quotient(a.shape);
+        Tensor result(a.shape);
 
         for (int i = 0; i < a.num_el(); i++){
 
@@ -273,17 +276,32 @@ Tensor divide(Tensor& a, Tensor& b) {
                 throw runtime_error("Division by zero at row " + to_string(row) + ", col " + to_string(col));
             }
 
-            quotient.data[i] = a.data[i] / b.data[i];
+            result.data[i] = a.data[i] / b.data[i];
         }
 
-        return quotient;
+        if (a.requires_grad || b.requires_grad){
+
+            auto node = make_node(result, {&a, &b});
+
+            node->backward_fn = [&a, &b, &result](){
+
+                for (int i = 0; i < result.num_el(); i++){
+                    if (a.requires_grad) a.grad[i] += result.grad[i] / b.data[i];
+                    if (b.requires_grad) b.grad[i] += -result.grad[i] * a.data[i] / (b.data[i] * b.data[i]); 
+                }
+
+            };
+
+        }
+
+        return result;
 
     } else{
         throw runtime_error("Tensors must have the same shape for element-wise division.");
     }
 }
 
-// Scalar / tensor
+// Scalar / tensor  dL/da = -scalar * result.grad / a^2
 Tensor divide(float scalar, Tensor& a) {
     Tensor result(a.shape);
     for (int i = 0; i < a.num_el(); i++) {
@@ -291,16 +309,34 @@ Tensor divide(float scalar, Tensor& a) {
             throw std::runtime_error("Division by zero at index " + std::to_string(i));
         result.data[i] = scalar / a.data[i];
     }
+
+    if (a.requires_grad) {
+        auto node = make_node(result, {&a});
+        node->backward_fn = [&a, &result, scalar]() {
+            for (int i = 0; i < result.num_el(); i++)
+                a.grad[i] += -scalar * result.grad[i] / (a.data[i] * a.data[i]);
+        };
+    }
+
     return result;
 }
 
-// Tensor / scalar
+// Tensor / scalar  dL/da = result.grad / scalar
 Tensor divide(Tensor& a, float scalar) {
     if (scalar == 0)
         throw std::runtime_error("Division by zero");
     Tensor result(a.shape);
     for (int i = 0; i < a.num_el(); i++)
         result.data[i] = a.data[i] / scalar;
+
+    if (a.requires_grad) {
+        auto node = make_node(result, {&a});
+        node->backward_fn = [&a, &result, scalar]() {
+            for (int i = 0; i < result.num_el(); i++)
+                a.grad[i] += result.grad[i] / scalar;
+        };
+    }
+
     return result;
 }
 
@@ -309,6 +345,16 @@ Tensor tanh_op(Tensor& a) {
     Tensor result(a.shape);
     for (int i = 0; i < a.num_el(); i++){
         result.data[i] = (exp(a.data[i]) - exp(-a.data[i])) / (exp(a.data[i]) + exp(-a.data[i]));
+    }
+
+    if (a.requires_grad){
+        auto node = make_node(result, {&a});
+
+        node->backward_fn = [&a, &result](){
+            for (int i = 0; i < result.num_el(); i++){
+                a.grad[i] += (1 - result.data[i] * result.data[i]) * result.grad[i];
+            }
+        };
     }
 
     return result;
@@ -333,6 +379,39 @@ Tensor softmax(Tensor& a) {
         }
     }
 
+    if (a.requires_grad){
+
+        auto node = make_node(result, {&a});
+        int rows = a.shape[0], cols = a.shape[1];
+
+        node->backward_fn = [&a, &result, cols, rows](){
+
+            Tensor jacobian({cols, cols});
+
+            for (int i = 0; i < rows; i++){
+                
+                // fill jacobian for row i
+
+                for (int j = 0; j < cols; j++){
+                    for (int k = 0; k < cols; k++){
+                        float s_j = result.data[i * cols + j];
+                        float s_k = result.data[i * cols + k];
+
+                        jacobian.data[j * cols + k] = s_j * ((j == k ? 1.0f : 0.0f) - s_k);
+                    }
+                }
+
+                for (int j = 0; j < cols; j++){
+                    for (int k = 0; k < cols; k++){
+                        a.grad[i * cols + j] += jacobian.data[j * cols + k] * result.grad[i * cols + k];
+                    }
+                }
+
+            }
+        };
+
+    }
+
     return result;
 }
 
@@ -345,6 +424,14 @@ Tensor log_op(Tensor& a) {
         result.data[i] = log(a.data[i]);
     }
 
+    if (a.requires_grad) {
+        auto node = make_node(result, {&a});
+        node->backward_fn = [&a, &result]() {
+            for (int i = 0; i < result.num_el(); i++)
+                a.grad[i] += result.grad[i] / a.data[i];  // d(ln x)/dx = 1/x
+        };
+    }
+
     return result;
 }
 
@@ -355,6 +442,14 @@ Tensor exp_op(Tensor& a) {
         result.data[i] = exp(a.data[i]);
     }
 
+    if (a.requires_grad) {
+        auto node = make_node(result, {&a});
+        node->backward_fn = [&a, &result]() {
+            for (int i = 0; i < result.num_el(); i++)
+                a.grad[i] += result.data[i] * result.grad[i];  // d(e^x)/dx = e^x = result
+        };
+    }
+
     return result;
 }
 
@@ -363,6 +458,14 @@ Tensor pow_op(Tensor& a, float p) {
     Tensor result(a.shape);
     for (int i = 0; i < a.num_el(); i++){
         result.data[i] = pow(a.data[i], p);
+    }
+
+    if (a.requires_grad) {
+        auto node = make_node(result, {&a});
+        node->backward_fn = [&a, &result, p]() {
+            for (int i = 0; i < result.num_el(); i++)
+                a.grad[i] += p * pow(a.data[i], p - 1) * result.grad[i];  // d(x^p)/dx = p*x^(p-1)
+        };
     }
 
     return result;
@@ -378,6 +481,14 @@ Tensor sqrt_op(Tensor& a) {
         result.data[i] = sqrt(a.data[i]);
     }
 
+    if (a.requires_grad) {
+        auto node = make_node(result, {&a});
+        node->backward_fn = [&a, &result]() {
+            for (int i = 0; i < result.num_el(); i++)
+                a.grad[i] += result.grad[i] / (2.0f * result.data[i]);  // d(sqrt(x))/dx = 1/(2*sqrt(x))
+        };
+    }
+
     return result;
 }
 
@@ -388,33 +499,73 @@ Tensor abs_op(Tensor& a) {
         result.data[i] = abs(a.data[i]);
     }
 
+    if (a.requires_grad){
+        auto node = make_node(result, {&a});
+
+        node->backward_fn = [&a, &result](){
+            for (int i = 0; i < result.num_el(); i++){
+                if (a.data[i] > 0) a.grad[i] += result.grad[i];
+                else if (a.data[i] < 0) a.grad[i] -= result.grad[i];
+            }
+        };
+
+    }
+
     return result;
 }
 
 // Sum all elements (axis=-1) or along a given axis
 Tensor sum(Tensor& a, int axis) {
 
+    int rows = a.shape[0], cols = a.shape[1];
+
     // global sum — returns a single value
     if (axis == -1) {
         Tensor result({1});
         for (int i = 0; i < a.num_el(); i++)
             result.data[0] += a.data[i];
+
+        if (a.requires_grad) {
+            auto node = make_node(result, {&a});
+            node->backward_fn = [&a, &result]() {
+                for (int i = 0; i < a.num_el(); i++)
+                    a.grad[i] += result.grad[0];  // every element gets the same gradient
+            };
+        }
         return result;
 
     // sum down rows — one sum per column e.g. {2,3} -> {3}
     } else if (axis == 0) {
-        Tensor result({a.shape[1]});
-        for (int i = 0; i < a.shape[0]; i++)
-            for (int j = 0; j < a.shape[1]; j++)
-                result.data[j] += a.data[i * a.shape[1] + j];
+        Tensor result({cols});
+        for (int i = 0; i < rows; i++)
+            for (int j = 0; j < cols; j++)
+                result.data[j] += a.data[i * cols + j];
+
+        if (a.requires_grad) {
+            auto node = make_node(result, {&a});
+            node->backward_fn = [&a, &result, rows, cols]() {
+                for (int i = 0; i < rows; i++)
+                    for (int j = 0; j < cols; j++)
+                        a.grad[i * cols + j] += result.grad[j];  // each element gets its column's gradient
+            };
+        }
         return result;
 
     // sum across columns — one sum per row e.g. {2,3} -> {2}
     } else if (axis == 1) {
-        Tensor result({a.shape[0]});
-        for (int i = 0; i < a.shape[0]; i++)
-            for (int j = 0; j < a.shape[1]; j++)
-                result.data[i] += a.data[i * a.shape[1] + j];
+        Tensor result({rows});
+        for (int i = 0; i < rows; i++)
+            for (int j = 0; j < cols; j++)
+                result.data[i] += a.data[i * cols + j];
+
+        if (a.requires_grad) {
+            auto node = make_node(result, {&a});
+            node->backward_fn = [&a, &result, rows, cols]() {
+                for (int i = 0; i < rows; i++)
+                    for (int j = 0; j < cols; j++)
+                        a.grad[i * cols + j] += result.grad[i];  // each element gets its row's gradient
+            };
+        }
         return result;
 
     } else {
@@ -425,19 +576,41 @@ Tensor sum(Tensor& a, int axis) {
 // Mean of all elements (axis=-1) or along a given axis
 Tensor mean(Tensor& a, int axis) {
 
-    Tensor s = sum(a, axis);
+    int rows = a.shape[0], cols = a.shape[1];
 
-    // divide by number of elements that were summed
     float count;
     if      (axis == -1) count = a.num_el();
-    else if (axis == 0)  count = a.shape[0];  // summed over rows
-    else if (axis == 1)  count = a.shape[1];  // summed over cols
+    else if (axis == 0)  count = rows;
+    else if (axis == 1)  count = cols;
     else throw runtime_error("Invalid axis " + to_string(axis) + ", must be -1, 0, or 1");
 
-    for (int i = 0; i < s.num_el(); i++)
-        s.data[i] /= count;
+    Tensor result = sum(a, axis);
+    for (int i = 0; i < result.num_el(); i++)
+        result.data[i] /= count;
 
-    return s;
+    if (a.requires_grad) {
+
+        auto node = make_node(result, {&a});
+
+        node->backward_fn = [&a, &result, axis, count, rows, cols]() {
+            if (axis == -1) {
+                for (int i = 0; i < a.num_el(); i++)
+                    a.grad[i] += result.grad[0] / count;
+
+            } else if (axis == 0) {
+                for (int i = 0; i < rows; i++)
+                    for (int j = 0; j < cols; j++)
+                        a.grad[i * cols + j] += result.grad[j] / count; // mean of column
+
+            } else if (axis == 1) {
+                for (int i = 0; i < rows; i++)
+                    for (int j = 0; j < cols; j++)
+                        a.grad[i * cols + j] += result.grad[i] / count; // mean of row
+            }
+        };
+    }
+
+    return result;
 }
 
 // Max element — returns a scalar tensor
@@ -499,8 +672,25 @@ Tensor broadcast_add(Tensor& a, Tensor& b) {
         }
     }
 
+    if (a.requires_grad || b.requires_grad) {
+        auto node = make_node(result, {&a, &b});
+        node->backward_fn = [&a, &b, &result]() {
+            int rows = a.shape[0], cols = a.shape[1];
+
+            for (int i = 0; i < rows; i++) {
+                for (int j = 0; j < cols; j++) {
+                    if (a.requires_grad)
+                        a.grad[i * cols + j] += result.grad[i * cols + j];
+
+                    if (b.requires_grad)
+                        b.grad[j] += result.grad[i * cols + j];  // accumulate over all rows
+                }
+            }
+        };
+    }
+
     return result;
-    
+
 }
 
 
