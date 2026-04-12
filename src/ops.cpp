@@ -1,4 +1,5 @@
 #include "ml/tensor.hpp"
+#include "ml/autograd.hpp"
 #include <cmath>
 #include <string>
 
@@ -13,6 +14,22 @@ Tensor add(Tensor& a, Tensor& b) {
         for(int i = 0; i < a.num_el(); i++){
             result.data[i] = a.data[i] + b.data[i];
         }
+
+        if (a.requires_grad || b.requires_grad) {
+            result.requires_grad = true;
+
+            auto node = make_shared<GradNode>(); //shared_ptr<GradNode>
+
+            node->inputs = {&a, &b};
+            node->backward_fn = [&a, &b, &result](){
+                for (int i = 0; i < result.num_el(); i++){
+                    if (a.requires_grad) a.grad[i] += result.grad[i]; // Add grad of previous operation's result
+                    if (b.requires_grad) b.grad[i] += result.grad[i];
+                }
+            };
+            result.grad_fn = node;
+        }
+        
 
         return result;
 

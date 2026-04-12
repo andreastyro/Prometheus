@@ -10,7 +10,7 @@ public:
 
     std::vector <float> data;
     std::vector <int> shape;
-    std::vector <float> grad;
+    std::vector <float> grad; /**  Gradient of the loss with respect to each element in data */
     bool requires_grad = false;
 
     std::shared_ptr<GradNode> grad_fn = nullptr;
