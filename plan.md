@@ -60,7 +60,6 @@ Build a minimal but functional ML library that can train neural networks, then e
 - [x] `Tanh` — activation layer
 - [x] `Softmax` — activation layer (used in output for classification)
 - [x] `Dropout` — randomly zero out neurons during training (regularization)
-- [ ] `BatchNorm` — normalize activations across a batch
 - [x] `Sequential` — chain layers together: `Sequential({Linear, ReLU, Linear})`
 
 ---
@@ -70,11 +69,6 @@ Build a minimal but functional ML library that can train neural networks, then e
 - [x] `mae_loss(pred, target)` — mean absolute error (regression)
 - [x] `binary_cross_entropy(pred, target)` — binary classification
 - [x] `cross_entropy_loss(logits, targets)` — multi-class classification
-- [ ] `huber_loss(pred, target)` — robust regression loss, less sensitive to outliers
-- [ ] `kl_divergence(p, q)` — difference between two probability distributions (used in VAEs)
-- [ ] `reconstruction_loss(input, output)` — input vs output similarity for autoencoders
-- [ ] `contrastive_loss(anchor, positive, negative)` — pulls similar samples together (self-supervised)
-
 ---
 
 ### Phase 5 — Optimizers
@@ -83,9 +77,6 @@ Build a minimal but functional ML library that can train neural networks, then e
 - [x] `SGD with momentum` — SGD with momentum term, faster convergence
 - [x] `Adam` — adaptive moment estimation, most commonly used
 - [x] `RMSprop` — another adaptive optimizer, good for RNNs
-- [ ] `learning rate scheduler` — decay lr during training (step, cosine, exponential)
-- [ ] `L1/L2 weight decay` — regularization built into optimizer
-
 ---
 
 ### Phase 6 — Autograd (Automatic Differentiation)
@@ -108,9 +99,9 @@ This is the hardest phase — without it you have to compute gradients by hand.
 ---
 
 ### Phase 8 — Model Utilities
-- [ ] `save(path)` — save model weights to a file
-- [ ] `load(path)` — load model weights from a file
-- [ ] Training loop helper — forward, loss, backward, step
+- [x] `save(path)` — save model weights to a file
+- [x] `load(path)` — load model weights from a file
+- [x] Training loop helper — forward, loss, backward, step
 - [ ] `accuracy(pred, target)` — compute accuracy metric
 - [ ] Loss/accuracy history tracking
 - [ ] `ModelSummary` — print layer names, shapes, and parameter count
@@ -155,7 +146,25 @@ This is the hardest phase — without it you have to compute gradients by hand.
 
 ---
 
-### Phase 12 — Python Bindings
+### Phase 12 — Extended Features
+These were deferred from earlier phases — implement after Phase 11 to round out the core library.
+
+#### Layers
+- [ ] `BatchNorm` — normalize activations across a batch
+
+#### Loss Functions
+- [ ] `huber_loss(pred, target)` — robust regression loss, less sensitive to outliers
+- [ ] `kl_divergence(p, q)` — difference between two probability distributions (used in VAEs)
+- [ ] `reconstruction_loss(input, output)` — input vs output similarity for autoencoders
+- [ ] `contrastive_loss(anchor, positive, negative)` — pulls similar samples together (self-supervised)
+
+#### Optimizers
+- [ ] `learning rate scheduler` — decay lr during training (step, cosine, exponential)
+- [ ] `L1/L2 weight decay` — regularization built into optimizer
+
+---
+
+### Phase 13 — Python Bindings
 - [ ] Install pybind11
 - [ ] Wrap `Tensor` class — expose data, shape, get, set, print
 - [ ] Wrap ops — add, matmul, relu, sigmoid etc.
@@ -168,7 +177,7 @@ This is the hardest phase — without it you have to compute gradients by hand.
 
 ---
 
-### Phase 13 — Examples
+### Phase 14 — Examples
 - [ ] XOR problem — simplest possible neural network
 - [ ] MNIST digit classifier — image classification with Linear layers
 - [ ] MNIST with Conv2D — same task using convolutional layers
@@ -179,13 +188,13 @@ This is the hardest phase — without it you have to compute gradients by hand.
 
 ---
 
-### Phase 14 — Advanced (Ambitious)
+### Phase 15 — Advanced (Ambitious)
 - [ ] ONNX export — save model in standard format other frameworks can load
 - [ ] Mixed precision training — use float16 for speed
 
 ---
 
-### Phase 14b — Meta-Learning
+### Phase 16 — Meta-Learning
 Train models that can adapt to new tasks with very few examples. Requires autograd (Phase 6) to be complete first since meta-learning involves differentiating through the training process itself.
 
 #### Algorithms
@@ -204,7 +213,7 @@ Train models that can adapt to new tasks with very few examples. Requires autogr
 
 ---
 
-### Phase 15 *(Optional)* — Continual Learning
+### Phase 17 *(Optional)* — Continual Learning
 Train models sequentially on new tasks without forgetting previous ones. Intersects naturally with meta-learning — a promising direction for novel research. Requires Phases 6 (autograd) and 14b (meta-learning) first.
 
 #### The Problem
@@ -230,7 +239,7 @@ Combining meta-learning (Phase 12b) with continual learning is an active open pr
 
 ---
 
-### Phase 16 *(Optional)* — CPU Performance Optimizations
+### Phase 18 *(Optional)* — CPU Performance Optimizations
 Complete Phase 1-12 before starting this. These replace the internals of existing ops without changing the API.
 - [ ] Cache-friendly matmul — reorder loops so memory is read sequentially (5-10x speedup)
 - [ ] OpenMP parallelism — parallelize loops across CPU cores with `#pragma omp parallel for` (4-8x speedup)
@@ -239,7 +248,7 @@ Complete Phase 1-12 before starting this. These replace the internals of existin
 
 ---
 
-### Phase 17 *(Optional)* — GPU Support (CUDA)
+### Phase 19 *(Optional)* — GPU Support (CUDA)
 Requires an NVIDIA GPU and CUDA Toolkit installed. Each op gets a GPU kernel alongside the CPU version.
 - [ ] Add `device` field to Tensor — `CPU` or `GPU`
 - [ ] `to(device)` method — move tensor between CPU and GPU memory
@@ -251,7 +260,7 @@ Requires an NVIDIA GPU and CUDA Toolkit installed. Each op gets a GPU kernel alo
 
 ---
 
-### Phase 18 *(Optional, TBD)* — Agentic Interface
+### Phase 20 *(Optional, TBD)* — Agentic Interface
 To be defined once the core library is complete. Could involve an AI agent that uses the library as a tool, automatic hyperparameter search, neural architecture search, or self-tuning training loops. Revisit this phase when we get there.
 
 ---

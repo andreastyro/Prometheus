@@ -53,5 +53,35 @@ int main() {
     auto pred = model.forward(input);
     pred->print();
 
+    // --- Manual model (no Sequential) ---
+    printf("\n=== Manual model (no Sequential) ===\n");
+    Linear l1(2, 4);
+    ReLU relu;
+    Linear l2(4, 1);
+
+    auto params = l1.parameters();
+    auto p2 = l2.parameters();
+    params.insert(params.end(), p2.begin(), p2.end());
+
+    Adam optimizer2(params, 0.01f);
+
+    for (int step = 0; step < 100; step++){
+        optimizer2.zero_grad();
+
+        auto h = relu.forward(l1.forward(input));
+        auto out = l2.forward(h);
+        auto loss = mse_loss(out, target);
+
+        loss->backward();
+        optimizer2.step();
+
+        if ((step + 1) % 20 == 0)
+            printf("Step %d | Loss: %.4f\n", step + 1, loss->data[0]);
+    }
+
+    printf("\nFinal predictions (manual):\n");
+    auto out = l2.forward(relu.forward(l1.forward(input)));
+    out->print();
+
     return 0;
 }

@@ -1,5 +1,6 @@
 #pragma once
 #include "ml/tensor.hpp"
+#include <cmath>
 
 
 struct DataSplit {
@@ -26,6 +27,7 @@ public:
     bool has_next(); // check if next batch exists
     void reset(); // reset index to 0 for next epoch
     void reshuffle(); // reshuflle after each epoch
+    int size(){ return (int)ceil((float)x->shape[0] / batch_size); }
 
 };
 

@@ -18,6 +18,8 @@ set(SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/data/dataloader.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/data/csv.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/data/image.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/utils/model_io.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/utils/trainer.cpp
 )
 
 # Build the library
@@ -39,3 +41,9 @@ target_link_libraries(test_csv prometheus)
 
 add_executable(test_image ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_image.cpp)
 target_link_libraries(test_image prometheus)
+
+add_executable(test_model_io ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_model_io.cpp)
+target_link_libraries(test_model_io prometheus)
+
+add_executable(test_trainer ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_trainer.cpp)
+target_link_libraries(test_trainer prometheus)
