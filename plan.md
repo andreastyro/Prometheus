@@ -99,7 +99,7 @@ This is the hardest phase — without it you have to compute gradients by hand.
 ---
 
 ### Phase 7 — Data Utilities
-- [ ] `DataLoader` — load data in batches
+- [x] `DataLoader` — load data in batches
 - [ ] `shuffle()` — shuffle dataset each epoch
 - [ ] CSV reader — load tabular data from a file
 - [ ] Simple image loader — load grayscale images as tensors

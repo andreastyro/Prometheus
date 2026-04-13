@@ -14,6 +14,8 @@ set(SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/sequential.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/optim/sgd.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/optim/adam.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/optim/rmsprop.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/dataloader.cpp
 )
 
 # Build the library
@@ -26,3 +28,6 @@ target_link_libraries(test_tensor prometheus)
 
 add_executable(test_model ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_model.cpp)
 target_link_libraries(test_model prometheus)
+
+add_executable(test_dataloader ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_dataloader.cpp)
+target_link_libraries(test_dataloader prometheus)
