@@ -60,5 +60,39 @@ int main() {
     for (float v : b2x->data) printf("%.0f ", v);
     printf("\n");
 
+    // 10 samples, 2 features
+    auto x2 = make_shared<Tensor>(
+        vector<int>{10, 2},
+        vector<float>{1,2, 3,4, 5,6, 7,8, 9,10, 11,12, 13,14, 15,16, 17,18, 19,20}
+    );
+    auto y2 = make_shared<Tensor>(
+        vector<int>{10, 1},
+        vector<float>{0,1,0,1,0,1,0,1,0,1}
+    );
+
+    printf("\n=== Train/Test split (70/30) ===\n");
+    DataSplit split = data_split(x2, y2, 0.7f, 0.0f, 0.3f, false);
+    printf("x_train rows=%d | x_test rows=%d\n", split.x_train->shape[0], split.x_test->shape[0]);
+    printf("x_train: ");
+    for (float v : split.x_train->data) printf("%.0f ", v);
+    printf("\nx_test:  ");
+    for (float v : split.x_test->data) printf("%.0f ", v);
+    printf("\n");
+
+    printf("\n=== Train/Val/Test split (60/20/20) ===\n");
+    DataSplit split2 = data_split(x2, y2, 0.6f, 0.2f, 0.2f, false);
+    printf("x_train rows=%d | x_val rows=%d | x_test rows=%d\n",
+        split2.x_train->shape[0], split2.x_val->shape[0], split2.x_test->shape[0]);
+
+    printf("\n=== Shuffled Train/Val/Test split (60/20/20) ===\n");
+    DataSplit split3 = data_split(x2, y2, 0.6f, 0.2f, 0.2f, true);
+    printf("x_train rows=%d: ", split3.x_train->shape[0]);
+    for (float v : split3.x_train->data) printf("%.0f ", v);
+    printf("\nx_val   rows=%d: ", split3.x_val->shape[0]);
+    for (float v : split3.x_val->data) printf("%.0f ", v);
+    printf("\nx_test  rows=%d: ", split3.x_test->shape[0]);
+    for (float v : split3.x_test->data) printf("%.0f ", v);
+    printf("\n");
+
     return 0;
 }
