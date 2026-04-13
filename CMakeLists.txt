@@ -17,6 +17,7 @@ set(SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/optim/rmsprop.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/data/dataloader.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/data/csv.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/data/image.cpp
 )
 
 # Build the library
@@ -35,3 +36,6 @@ target_link_libraries(test_dataloader prometheus)
 
 add_executable(test_csv ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_csv.cpp)
 target_link_libraries(test_csv prometheus)
+
+add_executable(test_image ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_image.cpp)
+target_link_libraries(test_image prometheus)

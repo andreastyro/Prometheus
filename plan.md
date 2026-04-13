@@ -102,7 +102,7 @@ This is the hardest phase — without it you have to compute gradients by hand.
 - [x] `DataLoader` — load data in batches
 - [x] `shuffle()` — shuffle dataset each epoch
 - [x] CSV reader — load tabular data from a file
-- [ ] Simple image loader — load grayscale images as tensors
+- [x] Simple image loader — load grayscale images as tensors
 - [x] Train/val/test split
 
 ---
