@@ -67,11 +67,11 @@ include/ml/
 ├── ops.hpp
 ├── loss.hpp
 ├── autograd.hpp
-├── nn/          — layers
-├── optim/       — optimizers
+├── nn/          — module, linear, activations, dropout, sequential
+├── optim/       — optimizer, sgd, adam, rmsprop
 ├── data/        — dataloader, csv, image loader
 ├── metrics/     — accuracy, precision, recall etc.
-└── utils/       — model save/load, trainer
+└── utils/       — model_io, trainer
 
 src/             — implementations
 tests/           — one test file per component

@@ -2,6 +2,8 @@
 #include "ml/tensor.hpp"
 #include <vector>
 
+enum class WeightInit { DEFAULT, XAVIER, KAIMING };
+
 class Module {
 public:
 

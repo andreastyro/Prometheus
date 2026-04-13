@@ -20,6 +20,9 @@ set(SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/data/image.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/utils/model_io.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/utils/trainer.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/utils/summary.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/utils/early_stopping.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/metrics/metrics.cpp
 )
 
 # Build the library
@@ -47,3 +50,9 @@ target_link_libraries(test_model_io prometheus)
 
 add_executable(test_trainer ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_trainer.cpp)
 target_link_libraries(test_trainer prometheus)
+
+add_executable(test_summary ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_summary.cpp)
+target_link_libraries(test_summary prometheus)
+
+add_executable(test_early_stopping ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_early_stopping.cpp)
+target_link_libraries(test_early_stopping prometheus)

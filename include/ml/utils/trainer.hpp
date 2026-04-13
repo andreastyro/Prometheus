@@ -4,8 +4,14 @@
 #include "ml/data/dataloader.hpp"
 #include "ml/optim/optimizer.hpp"
 #include <functional>
+#include <vector>
 
-void train(
+struct TrainHistory {
+    std::vector<float> loss;
+    std::vector<float> accuracy;
+};
+
+TrainHistory train(
     Module& model,
     DataLoader& loader,
     Optimizer& optimizer,

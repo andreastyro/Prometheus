@@ -5,7 +5,7 @@ class Linear : public Module {
 public:
     TensorPtr weights;
     TensorPtr bias;
-    Linear(int in_features, int out_features);
+    Linear(int in_features, int out_features, std::string init = "default");
 
     TensorPtr forward(TensorPtr input) override;
     std::vector<TensorPtr> parameters() override;
