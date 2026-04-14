@@ -27,3 +27,4 @@ TensorPtr max_op(TensorPtr a);
 TensorPtr min_op(TensorPtr a);
 TensorPtr clip(TensorPtr a, float min_val, float max_val);
 TensorPtr broadcast_add(TensorPtr a, TensorPtr b);
+TensorPtr argmax(TensorPtr a);

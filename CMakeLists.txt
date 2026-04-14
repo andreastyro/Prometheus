@@ -56,3 +56,6 @@ target_link_libraries(test_summary prometheus)
 
 add_executable(test_early_stopping ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_early_stopping.cpp)
 target_link_libraries(test_early_stopping prometheus)
+
+add_executable(test_metrics ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_metrics.cpp)
+target_link_libraries(test_metrics prometheus)

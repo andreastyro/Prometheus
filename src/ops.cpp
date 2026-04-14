@@ -694,3 +694,25 @@ TensorPtr broadcast_add(TensorPtr a, TensorPtr b) {
 
     return result;
 }
+
+// Argmax — returns a 1D tensor of class indices, one per row
+TensorPtr argmax(TensorPtr a) {
+    int rows = a->shape[0];
+    int cols = a->shape[1];
+    auto result = make_shared<Tensor>(vector<int>{rows});
+
+    for (int i = 0; i < rows; i++){
+        int best = 0;
+        float max_val = a->data[i * cols];
+        for (int j = 1; j < cols; j++){
+            if (a->data[i * cols + j] > max_val){
+                max_val = a->data[i * cols + j];
+                best = j;
+            }
+        }
+        result->data[i] = (float)best;
+    }
+
+    return result;
+}
+
