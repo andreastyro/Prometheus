@@ -25,6 +25,8 @@ set(SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/metrics/metrics.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/flatten.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/conv2d.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/maxpool2d.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/avgpool2d.cpp
 )
 
 # Build the library
@@ -64,3 +66,6 @@ target_link_libraries(test_metrics prometheus)
 
 add_executable(test_conv2d ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_conv2d.cpp)
 target_link_libraries(test_conv2d prometheus)
+
+add_executable(test_maxpool2d ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_maxpool2d.cpp)
+target_link_libraries(test_maxpool2d prometheus)

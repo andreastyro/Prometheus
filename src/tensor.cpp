@@ -95,3 +95,9 @@ void Tensor::backward(){
     }
 
 }
+
+TensorPtr Tensor::detach() const {
+    auto t = make_shared<Tensor>(shape, data);
+    t->requires_grad = false;
+    return t;
+}

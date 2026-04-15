@@ -83,6 +83,9 @@ public:
     // Backpropagate gradients through the computation graph
     void backward();
 
+    // Returns a new tensor with the same data but detached from the computation graph
+    TensorPtr detach() const;
+
 };
 
 inline std::shared_ptr<GradNode> make_node(TensorPtr result, std::vector<TensorPtr> inputs) {

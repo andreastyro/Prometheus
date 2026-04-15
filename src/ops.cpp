@@ -117,7 +117,7 @@ TensorPtr matmul(TensorPtr a, TensorPtr b) {
             node->backward_fn = [a, b, result](){
                 int a_rows = a->shape[0], inner = a->shape[1], b_cols = b->shape[1];
 
-                if (a->requires_grad){
+                if (a->requires_grad){ // for previous layer
                     // dA = grad_out * bT
                     for (int i = 0; i < a_rows; i++)
                         for (int j = 0; j < inner; j++)
@@ -125,7 +125,7 @@ TensorPtr matmul(TensorPtr a, TensorPtr b) {
                                 a->grad[i * inner + j] += result->grad[i * b_cols + k] * b->data[j * b_cols + k];
                 }
 
-                if (b->requires_grad){
+                if (b->requires_grad){ // for weight update
                     // dB = aT * grad_out
                     for (int i = 0; i < inner; i++)
                         for (int j = 0; j < b_cols; j++)
