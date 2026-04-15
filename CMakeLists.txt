@@ -23,6 +23,8 @@ set(SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/utils/summary.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/utils/early_stopping.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/metrics/metrics.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/flatten.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/conv2d.cpp
 )
 
 # Build the library
@@ -59,3 +61,6 @@ target_link_libraries(test_early_stopping prometheus)
 
 add_executable(test_metrics ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_metrics.cpp)
 target_link_libraries(test_metrics prometheus)
+
+add_executable(test_conv2d ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_conv2d.cpp)
+target_link_libraries(test_conv2d prometheus)

@@ -5,14 +5,6 @@
 
 using namespace std;
 
-// Helper: set up a GradNode and attach it to result
-shared_ptr<GradNode> make_node(TensorPtr result, vector<TensorPtr> inputs) {
-    result->requires_grad = true;
-    auto node = make_shared<GradNode>();
-    node->inputs = inputs;
-    result->grad_fn = node;
-    return node;
-}
 
 // Element-wise addition: a + b
 TensorPtr add(TensorPtr a, TensorPtr b) {

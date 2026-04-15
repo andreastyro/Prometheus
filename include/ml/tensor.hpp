@@ -84,3 +84,11 @@ public:
     void backward();
 
 };
+
+inline std::shared_ptr<GradNode> make_node(TensorPtr result, std::vector<TensorPtr> inputs) {
+    result->requires_grad = true;
+    auto node = std::make_shared<GradNode>();
+    node->inputs = inputs;
+    result->grad_fn = node;
+    return node;
+}
