@@ -27,6 +27,8 @@ set(SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/conv2d.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/maxpool2d.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/avgpool2d.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/convtranspose2d.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/rnn.cpp
 )
 
 # Build the library
@@ -69,3 +71,9 @@ target_link_libraries(test_conv2d prometheus)
 
 add_executable(test_maxpool2d ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_maxpool2d.cpp)
 target_link_libraries(test_maxpool2d prometheus)
+
+add_executable(test_convtranspose2d ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_convtranspose2d.cpp)
+target_link_libraries(test_convtranspose2d prometheus)
+
+add_executable(test_rnn ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_rnn.cpp)
+target_link_libraries(test_rnn prometheus)
