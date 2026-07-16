@@ -1,0 +1,13 @@
+{
+  "pythonPath": "C:/Python314/python.exe",
+  "pythonVersion": "3.14",
+  "stubPath": "stubs",
+  "include": [
+    "."
+  ],
+  "exclude": [
+    "build",
+    "dist",
+    ".git"
+  ]
+}
