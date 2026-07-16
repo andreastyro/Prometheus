@@ -1,0 +1,122 @@
+name: Build and publish wheels
+
+on:
+  push:
+    tags:
+      - "v*"          # run on version tags: v0.1.0, v1.0.0, etc.
+  workflow_dispatch:  # allow manual trigger from GitHub UI
+
+jobs:
+  # ── Build wheels for every OS ───────────────────────────────────────────────
+  build_wheels:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Install OpenBLAS before cibuildwheel runs so it is available inside
+      # the build environment that cibuildwheel creates.
+      - name: Install OpenBLAS (macOS)
+        if: runner.os == 'macOS'
+        run: brew install openblas
+
+      - name: Download OpenBLAS (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Download pre-built OpenBLAS for Windows
+          $url = "https://github.com/OpenMathLib/OpenBLAS/releases/download/v0.3.26/OpenBLAS-0.3.26-x64.zip"
+          Invoke-WebRequest $url -OutFile openblas.zip
+          Expand-Archive openblas.zip -DestinationPath openblas
+          echo "OPENBLAS_ROOT=${{ github.workspace }}\openblas" >> $env:GITHUB_ENV
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.19.0
+        env:
+          # Build for Python 3.10, 3.11, 3.12, 3.13 — skip 32-bit and musl
+          CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-*"
+          CIBW_SKIP:  "*-win32 *-manylinux_i686 *-musllinux*"
+
+          # Install OpenBLAS inside the Linux manylinux container
+          CIBW_BEFORE_BUILD_LINUX: >
+            yum install -y openblas-devel ||
+            apt-get install -y libopenblas-dev
+
+          # Build flags — use OpenBLAS + OpenMP on all platforms
+          CIBW_ENVIRONMENT: >
+            PROMETHEUS_USE_OPENBLAS=1
+            PROMETHEUS_USE_OPENMP=1
+            OPENBLAS_ROOT=${{ env.OPENBLAS_ROOT }}
+
+          # macOS: tell the linker where Homebrew put OpenBLAS
+          CIBW_ENVIRONMENT_MACOS: >
+            PROMETHEUS_USE_OPENBLAS=1
+            PROMETHEUS_USE_OPENMP=1
+            OPENBLAS_ROOT=/usr/local/opt/openblas
+
+          # Bundle shared libraries into the wheel so users don't need to
+          # install OpenBLAS separately
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: >
+            auditwheel repair -w {dest_dir} {wheel}
+          CIBW_REPAIR_WHEEL_COMMAND_MACOS: >
+            delocate-wheel -w {dest_dir} -v {wheel}
+
+      - name: Upload wheels as artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: ./wheelhouse/*.whl
+
+  # ── Build MKL wheel (Intel-optimised, separate upload) ──────────────────────
+  build_wheels_mkl:
+    name: MKL wheel (Linux, Intel)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build MKL wheels
+        uses: pypa/cibuildwheel@v2.19.0
+        env:
+          CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-*"
+          CIBW_SKIP:  "*-win32 *-manylinux_i686 *-musllinux*"
+          # Install MKL inside the container via pip (Intel distributes MKL on PyPI)
+          CIBW_BEFORE_BUILD_LINUX: pip install mkl mkl-devel
+          CIBW_ENVIRONMENT: >
+            PROMETHEUS_USE_MKL=1
+            PROMETHEUS_USE_OPENMP=1
+            MKLROOT=/usr/local
+
+      - name: Upload MKL wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-mkl
+          path: ./wheelhouse/*.whl
+
+  # ── Publish to PyPI on release tag ──────────────────────────────────────────
+  publish:
+    name: Publish to PyPI
+    needs: [build_wheels, build_wheels_mkl]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - name: Download all wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+
+      - name: List wheels
+        run: ls dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_TOKEN }}

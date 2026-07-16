@@ -1,5 +1,6 @@
 #include "ml/tensor.hpp"
 #include "ml/autograd.hpp"
+#include "ml/matmul_backend.hpp"
 #include <cmath>
 #include <string>
 
@@ -103,13 +104,8 @@ TensorPtr matmul(TensorPtr a, TensorPtr b) {
 
         auto result = make_shared<Tensor>(vector<int>{a->shape[0], b->shape[1]});
 
-        for(int i = 0; i < a->shape[0]; i++){
-            for(int j = 0; j < b->shape[1]; j++){
-                for(int k = 0; k < a->shape[1]; k++){
-                    result->data[i * b->shape[1] + j] += a->data[i * a->shape[1] + k] * b->data[k * b->shape[1] + j];
-                }
-            }
-        }
+        matmul_forward(a->shape[0], b->shape[1], a->shape[1],
+                       a->data.data(), b->data.data(), result->data.data());
 
         if (a->requires_grad || b->requires_grad){
             auto node = make_node(result, {a, b});
@@ -117,21 +113,13 @@ TensorPtr matmul(TensorPtr a, TensorPtr b) {
             node->backward_fn = [a, b, result](){
                 int a_rows = a->shape[0], inner = a->shape[1], b_cols = b->shape[1];
 
-                if (a->requires_grad){ // for previous layer
-                    // dA = grad_out * bT
-                    for (int i = 0; i < a_rows; i++)
-                        for (int j = 0; j < inner; j++)
-                            for (int k = 0; k < b_cols; k++)
-                                a->grad[i * inner + j] += result->grad[i * b_cols + k] * b->data[j * b_cols + k];
-                }
+                if (a->requires_grad)
+                    matmul_backward_a(a_rows, inner, b_cols,
+                                      result->grad.data(), b->data.data(), a->grad.data());
 
-                if (b->requires_grad){ // for weight update
-                    // dB = aT * grad_out
-                    for (int i = 0; i < inner; i++)
-                        for (int j = 0; j < b_cols; j++)
-                            for (int k = 0; k < a_rows; k++)
-                                b->grad[i * b_cols + j] += a->data[k * inner + i] * result->grad[k * b_cols + j];
-                }
+                if (b->requires_grad)
+                    matmul_backward_b(a_rows, inner, b_cols,
+                                      result->grad.data(), a->data.data(), b->grad.data());
             };
         }
 
@@ -640,6 +628,17 @@ TensorPtr clip(TensorPtr a, float min_val, float max_val) {
         } else {
             result->data[i] = a->data[i];
         }
+    }
+
+    if (a->requires_grad) {
+        auto node = make_node(result, {a});
+        node->backward_fn = [a, result, min_val, max_val]() {
+            for (int i = 0; i < result->num_el(); i++) {
+                // gradient is 1 where value wasn't clamped, 0 where it was
+                if (a->data[i] > min_val && a->data[i] < max_val)
+                    a->grad[i] += result->grad[i];
+            }
+        };
     }
 
     return result;
