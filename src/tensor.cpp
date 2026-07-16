@@ -101,3 +101,40 @@ TensorPtr Tensor::detach() const {
     t->requires_grad = false;
     return t;
 }
+
+// float32 bits -> float16 bits (IEEE 754 half)
+static uint16_t f32_to_f16(float f) {
+    uint32_t x;
+    memcpy(&x, &f, 4);
+    uint16_t sign  = (x >> 16) & 0x8000;
+    int32_t  exp   = ((x >> 23) & 0xFF) - 127 + 15;
+    uint32_t mant  = x & 0x7FFFFF;
+    if (exp <= 0)  return sign;
+    if (exp >= 31) return sign | 0x7C00;
+    return sign | (uint16_t)(exp << 10) | (uint16_t)(mant >> 13);
+}
+
+// float16 bits -> float32
+static float f16_to_f32(uint16_t h) {
+    uint32_t sign = (h & 0x8000) << 16;
+    int32_t  exp  = (h >> 10) & 0x1F;
+    uint32_t mant = h & 0x3FF;
+    uint32_t x;
+    if (exp == 0)       x = sign | (mant << 13);
+    else if (exp == 31) x = sign | 0x7F800000 | (mant << 13);
+    else                x = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+    float f;
+    memcpy(&f, &x, 4);
+    return f;
+}
+
+TensorPtr Tensor::half() const {
+    auto out = make_shared<Tensor>(shape);
+    for (int i = 0; i < (int)data.size(); i++)
+        out->data[i] = f16_to_f32(f32_to_f16(data[i]));
+    return out;
+}
+
+TensorPtr Tensor::to_float() const {
+    return make_shared<Tensor>(shape, data);
+}
