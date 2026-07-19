@@ -33,45 +33,39 @@ static void matmul_tiled(int m, int n, int k,
 void matmul_forward(int m, int n, int k,
                     const float* a, const float* b, float* c) {
 #if defined(PROMETHEUS_USE_OPENBLAS) || defined(PROMETHEUS_USE_MKL)
-    if (m > 128 || n > 128 || k > 128) {
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                    m, n, k, 1.0f, a, k, b, n, 0.0f, c, n);
-        return;
-    }
-#endif
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                m, n, k, 1.0f, a, k, b, n, 0.0f, c, n);
+#else
     matmul_tiled(m, n, k, a, b, c);
+#endif
 }
 
 void matmul_backward_a(int m, int inner, int b_cols,
                        const float* grad_out, const float* b_data, float* a_grad) {
 #if defined(PROMETHEUS_USE_OPENBLAS) || defined(PROMETHEUS_USE_MKL)
-    if (m > 128 || inner > 128 || b_cols > 128) {
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                    m, inner, b_cols,
-                    1.0f, grad_out, b_cols, b_data, b_cols,
-                    1.0f, a_grad, inner);
-        return;
-    }
-#endif
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                m, inner, b_cols,
+                1.0f, grad_out, b_cols, b_data, b_cols,
+                1.0f, a_grad, inner);
+#else
     for (int i = 0; i < m; i++)
         for (int j = 0; j < inner; j++)
             for (int kk = 0; kk < b_cols; kk++)
                 a_grad[i * inner + j] += grad_out[i * b_cols + kk] * b_data[j * b_cols + kk];
+#endif
 }
 
 void matmul_backward_b(int m, int inner, int b_cols,
                        const float* grad_out, const float* a_data, float* b_grad) {
 #if defined(PROMETHEUS_USE_OPENBLAS) || defined(PROMETHEUS_USE_MKL)
-    if (m > 128 || inner > 128 || b_cols > 128) {
-        cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
-                    inner, b_cols, m,
-                    1.0f, a_data, inner, grad_out, b_cols,
-                    1.0f, b_grad, b_cols);
-        return;
-    }
-#endif
+    cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+                inner, b_cols, m,
+                1.0f, a_data, inner, grad_out, b_cols,
+                1.0f, b_grad, b_cols);
+#else
     for (int i = 0; i < inner; i++)
         for (int j = 0; j < b_cols; j++)
             for (int kk = 0; kk < m; kk++)
                 b_grad[i * b_cols + j] += a_data[kk * inner + i] * grad_out[kk * b_cols + j];
+#endif
 }
