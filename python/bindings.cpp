@@ -28,9 +28,13 @@
 
 #include "ml/optim/sgd.hpp"
 #include "ml/optim/adam.hpp"
+#include "ml/optim/adamw.hpp"
 #include "ml/optim/rmsprop.hpp"
 #include "ml/optim/scheduler.hpp"
 #include "ml/optim/grad_scaler.hpp"
+#include "ml/utils/grad_clip.hpp"
+#include "ml/utils/model_io.hpp"
+#include "ml/data/tokenizer.hpp"
 
 namespace py = pybind11;
 
@@ -117,9 +121,11 @@ PYBIND11_MODULE(prometheus, m) {
     m.def("mean",          &mean,    py::arg("a"), py::arg("axis") = -1);
     m.def("max_op",        &max_op);
     m.def("min_op",        &min_op);
-    m.def("clip",          &clip);
+    m.def("clip",           &clip);
     m.def("broadcast_add", &broadcast_add);
-    m.def("argmax",        &argmax);
+    m.def("argmax",         &argmax);
+    m.def("clip_grad_norm", &clip_grad_norm,
+          py::arg("params"), py::arg("max_norm"));
 
     // -------------------------------------------------------------------------
     // Loss
@@ -260,7 +266,8 @@ PYBIND11_MODULE(prometheus, m) {
         .def("parameters", &GroupNorm::parameters);
 
     py::class_<MultiHeadAttention, Module, std::shared_ptr<MultiHeadAttention>>(m, "MultiHeadAttention")
-        .def(py::init<int, int>())
+        .def(py::init<int, int, bool>(),
+             py::arg("embed_dim"), py::arg("num_heads"), py::arg("causal") = false)
         .def("forward",    &MultiHeadAttention::forward)
         .def("parameters", &MultiHeadAttention::parameters);
 
@@ -294,9 +301,23 @@ PYBIND11_MODULE(prometheus, m) {
         .def(py::init<std::vector<TensorPtr>, float, float, float, float>(),
              py::arg("params"), py::arg("lr") = 0.001f,
              py::arg("beta1") = 0.9f, py::arg("beta2") = 0.999f, py::arg("eps") = 1e-8f)
-        .def("step",      &Adam::step)
-        .def("zero_grad", &Adam::zero_grad)
+        .def("step",       &Adam::step)
+        .def("zero_grad",  &Adam::zero_grad)
+        .def("save_state", &Adam::save_state, py::arg("path"))
+        .def("load_state", &Adam::load_state, py::arg("path"))
         .def_readwrite("lr", &Adam::lr);
+
+    py::class_<AdamW>(m, "AdamW")
+        .def(py::init<std::vector<TensorPtr>, float, float, float, float, float>(),
+             py::arg("params"), py::arg("lr") = 0.001f,
+             py::arg("beta1") = 0.9f, py::arg("beta2") = 0.999f,
+             py::arg("eps") = 1e-8f, py::arg("weight_decay") = 0.01f)
+        .def("step",         &AdamW::step)
+        .def("zero_grad",    &AdamW::zero_grad)
+        .def("save_state",   &AdamW::save_state, py::arg("path"))
+        .def("load_state",   &AdamW::load_state, py::arg("path"))
+        .def_readwrite("lr",           &AdamW::lr)
+        .def_readwrite("weight_decay", &AdamW::weight_decay);
 
     py::class_<RMSprop>(m, "RMSprop")
         .def(py::init<std::vector<TensorPtr>, float, float, float>(),
@@ -346,4 +367,51 @@ PYBIND11_MODULE(prometheus, m) {
         .def("update",     &GradScaler::update)
         .def_readwrite("scale",   &GradScaler::scale)
         .def_readwrite("enabled", &GradScaler::enabled);
+
+    // -------------------------------------------------------------------------
+    // Model I/O
+    // -------------------------------------------------------------------------
+    m.def("save_model", &save, py::arg("path"), py::arg("params"));
+    m.def("load_model", &load, py::arg("path"));
+
+    py::class_<Checkpoint>(m, "Checkpoint")
+        .def_readonly("epoch", &Checkpoint::epoch)
+        .def_readonly("loss",  &Checkpoint::loss);
+
+    m.def("save_checkpoint", &save_checkpoint,
+          py::arg("path"), py::arg("params"), py::arg("epoch"), py::arg("loss"));
+    // Returns (Checkpoint, list[Tensor]) — Python can't mutate a passed-in list.
+    m.def("load_checkpoint", [](const std::string& path) {
+        std::vector<TensorPtr> params;
+        Checkpoint ckpt = load_checkpoint(path, params);
+        return py::make_tuple(ckpt, params);
+    }, py::arg("path"));
+
+    // -------------------------------------------------------------------------
+    // Tokenizer
+    // -------------------------------------------------------------------------
+    py::class_<Tokenizer>(m, "Tokenizer")
+        .def(py::init<>())
+        .def("build_from_text", &Tokenizer::build_from_text,
+             py::arg("text"), py::arg("max_vocab") = 50000)
+        .def("build_from_file", &Tokenizer::build_from_file,
+             py::arg("path"), py::arg("max_vocab") = 50000)
+        .def("save",   &Tokenizer::save,   py::arg("path"))
+        .def("load",   &Tokenizer::load,   py::arg("path"))
+        .def("encode", &Tokenizer::encode,
+             py::arg("text"), py::arg("add_bos") = false, py::arg("add_eos") = false)
+        .def("decode", &Tokenizer::decode,
+             py::arg("ids"), py::arg("skip_special") = true)
+        .def("vocab_size", &Tokenizer::vocab_size)
+        .def("has_token",  &Tokenizer::has_token, py::arg("token"))
+        .def("token_to_id", [](Tokenizer& tok, const std::string& t) {
+            return tok.token_to_id(t);
+        }, py::arg("token"))
+        .def("id_to_token", [](Tokenizer& tok, int id) {
+            return tok.id_to_token(id);
+        }, py::arg("id"))
+        .def_readonly_static("UNK_ID", &Tokenizer::UNK_ID)
+        .def_readonly_static("PAD_ID", &Tokenizer::PAD_ID)
+        .def_readonly_static("BOS_ID", &Tokenizer::BOS_ID)
+        .def_readonly_static("EOS_ID", &Tokenizer::EOS_ID);
 }

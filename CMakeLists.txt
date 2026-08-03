@@ -46,6 +46,9 @@ set(SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/attention.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/positional_encoding.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/transformer.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/optim/adamw.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/utils/grad_clip.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/data/tokenizer.cpp
 )
 
 # ── Build the library ─────────────────────────────────────────────────────────
@@ -166,3 +169,15 @@ target_link_libraries(test_transformer prometheus)
 
 add_executable(benchmark_matmul ${CMAKE_CURRENT_SOURCE_DIR}/tests/benchmark_matmul.cpp)
 target_link_libraries(benchmark_matmul prometheus)
+
+add_executable(test_grad_clip   ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_grad_clip.cpp)
+target_link_libraries(test_grad_clip prometheus)
+
+add_executable(test_adamw       ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_adamw.cpp)
+target_link_libraries(test_adamw prometheus)
+
+add_executable(test_tokenizer   ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tokenizer.cpp)
+target_link_libraries(test_tokenizer prometheus)
+
+add_executable(test_checkpoint  ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_checkpoint.cpp)
+target_link_libraries(test_checkpoint prometheus)

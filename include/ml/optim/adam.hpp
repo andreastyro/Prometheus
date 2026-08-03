@@ -1,5 +1,6 @@
 #pragma once
 #include <vector>
+#include <string>
 #include "ml/tensor.hpp"
 #include "ml/optim/optimizer.hpp"
 
@@ -36,4 +37,9 @@ public:
          float lr = 0.001f, float beta1 = 0.9f, float beta2 = 0.999f, float eps = 1e-8f);
 
     void step() override;
+
+    // Persist the optimiser state (t, m, v) so training can be resumed exactly.
+    // Pair with save_checkpoint / load_checkpoint for full checkpoint support.
+    void save_state(const std::string& path) const;
+    void load_state(const std::string& path);
 };

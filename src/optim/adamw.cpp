@@ -1,56 +1,48 @@
-#include "ml/tensor.hpp"
-#include "ml/autograd.hpp"
-#include "ml/optim/adam.hpp"
-#include <stdio.h>
-#include <algorithm>
-#include <vector>
+#include "ml/optim/adamw.hpp"
 #include <cmath>
 #include <fstream>
 #include <stdexcept>
 
 using namespace std;
 
-Adam::Adam(vector<TensorPtr> params, float lr, float beta1, float beta2, float eps){
+AdamW::AdamW(vector<TensorPtr> params, float lr, float beta1, float beta2,
+             float eps, float weight_decay)
+    : lr(lr), beta1(beta1), beta2(beta2), eps(eps), weight_decay(weight_decay), t(0)
+{
     this->parameters = params;
-    this->lr = lr;
-    this->beta1 = beta1;
-    this->beta2 = beta2;
-    this->eps = eps;
-    this->t = 0;
-
-    for (auto& p : parameters){
+    for (auto& p : parameters) {
         m.push_back(vector<float>(p->num_el(), 0.0f));
         v.push_back(vector<float>(p->num_el(), 0.0f));
     }
 }
 
-void Adam::step(){
-
-    float m_hat, v_hat;
-
+void AdamW::step() {
     t += 1;
     float bc1 = 1.0f - std::pow(beta1, t);
     float bc2 = 1.0f - std::pow(beta2, t);
 
-    for (int i = 0; i < (int)parameters.size(); i++){
-
+    for (int i = 0; i < (int)parameters.size(); i++) {
         auto& p = parameters[i];
+        for (int j = 0; j < p->num_el(); j++) {
+            float g = p->grad[j];
 
-        for (int j = 0; j < p->num_el(); j++){
-            m[i][j] = beta1 * m[i][j] + (1 - beta1) * p->grad[j];
-            v[i][j] = beta2 * v[i][j] + (1 - beta2) * (p->grad[j] * p->grad[j]);
+            m[i][j] = beta1 * m[i][j] + (1.0f - beta1) * g;
+            v[i][j] = beta2 * v[i][j] + (1.0f - beta2) * g * g;
 
-            m_hat = m[i][j] / bc1;
-            v_hat = v[i][j] / bc2;
+            float m_hat = m[i][j] / bc1;
+            float v_hat = v[i][j] / bc2;
 
-            p->data[j] -= lr * m_hat / (sqrt(v_hat) + eps);
+            // adaptive update (same as Adam)
+            p->data[j] -= lr * m_hat / (std::sqrt(v_hat) + eps);
+            // decoupled weight decay (NOT folded into gradient)
+            p->data[j] -= lr * weight_decay * p->data[j];
         }
     }
 }
 
-void Adam::save_state(const std::string& path) const {
-    std::ofstream file(path, std::ios::binary);
-    if (!file) throw std::runtime_error("Adam::save_state: cannot open " + path);
+void AdamW::save_state(const string& path) const {
+    ofstream file(path, ios::binary);
+    if (!file) throw runtime_error("AdamW::save_state: cannot open " + path);
 
     file.write(reinterpret_cast<const char*>(&t), sizeof(int));
     int n_params = (int)m.size();
@@ -64,9 +56,9 @@ void Adam::save_state(const std::string& path) const {
     }
 }
 
-void Adam::load_state(const std::string& path) {
-    std::ifstream file(path, std::ios::binary);
-    if (!file) throw std::runtime_error("Adam::load_state: cannot open " + path);
+void AdamW::load_state(const string& path) {
+    ifstream file(path, ios::binary);
+    if (!file) throw runtime_error("AdamW::load_state: cannot open " + path);
 
     file.read(reinterpret_cast<char*>(&t), sizeof(int));
     int n_params;

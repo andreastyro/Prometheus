@@ -36,9 +36,12 @@ public:
     int embed_dim; // total embedding dimension
     int num_heads; // number of attention heads to run in parallel
     int head_dim;  // dimension per head = embed_dim / num_heads
+    bool causal_;  // if true, mask future positions so each token only sees the past
 
-    // embed_dim must be divisible by num_heads
-    MultiHeadAttention(int embed_dim, int num_heads);
+    // embed_dim must be divisible by num_heads.
+    // Set causal=true for GPT-style autoregressive models where each position
+    // may only attend to itself and earlier positions (upper triangle masked).
+    MultiHeadAttention(int embed_dim, int num_heads, bool causal = false);
 
     // Compute multi-head self-attention over the input sequence
     TensorPtr forward(TensorPtr input) override;

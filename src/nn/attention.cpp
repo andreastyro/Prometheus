@@ -5,8 +5,8 @@
 
 using namespace std;
 
-MultiHeadAttention::MultiHeadAttention(int embed_dim, int num_heads)
-    : embed_dim(embed_dim), num_heads(num_heads), head_dim(embed_dim / num_heads) {
+MultiHeadAttention::MultiHeadAttention(int embed_dim, int num_heads, bool causal)
+    : embed_dim(embed_dim), num_heads(num_heads), head_dim(embed_dim / num_heads), causal_(causal) {
 
     if (embed_dim % num_heads != 0)
         throw runtime_error("MultiHeadAttention: embed_dim must be divisible by num_heads");
@@ -48,6 +48,13 @@ TensorPtr MultiHeadAttention::forward(TensorPtr input) {
         auto K_h_T = K_h->transpose();
         auto scores = matmul(Q_h, K_h_T);
         for (float& v : scores->data) v *= scale;
+
+        // causal mask: each position may only attend to itself and earlier positions
+        if (causal_) {
+            for (int t = 0; t < seq_len; t++)
+                for (int j = t + 1; j < seq_len; j++)
+                    scores->data[t * seq_len + j] = -1e9f;
+        }
 
         // softmax over each row — each token's attention weights over all tokens
         auto weights = make_shared<Tensor>(vector<int>{seq_len, seq_len});
