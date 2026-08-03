@@ -48,7 +48,6 @@ set(SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/transformer.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/optim/adamw.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/utils/grad_clip.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/data/tokenizer.cpp
 )
 
 # ── Build the library ─────────────────────────────────────────────────────────
@@ -175,9 +174,6 @@ target_link_libraries(test_grad_clip prometheus)
 
 add_executable(test_adamw       ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_adamw.cpp)
 target_link_libraries(test_adamw prometheus)
-
-add_executable(test_tokenizer   ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tokenizer.cpp)
-target_link_libraries(test_tokenizer prometheus)
 
 add_executable(test_checkpoint  ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_checkpoint.cpp)
 target_link_libraries(test_checkpoint prometheus)

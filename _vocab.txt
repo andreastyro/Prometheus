@@ -1,0 +1,12 @@
+<UNK>
+<PAD>
+<BOS>
+<EOS>
+the
+brown
+dog
+fox
+jumps
+lazy
+over
+quick

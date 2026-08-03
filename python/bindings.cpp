@@ -34,7 +34,6 @@
 #include "ml/optim/grad_scaler.hpp"
 #include "ml/utils/grad_clip.hpp"
 #include "ml/utils/model_io.hpp"
-#include "ml/data/tokenizer.hpp"
 
 namespace py = pybind11;
 
@@ -387,31 +386,4 @@ PYBIND11_MODULE(prometheus, m) {
         return py::make_tuple(ckpt, params);
     }, py::arg("path"));
 
-    // -------------------------------------------------------------------------
-    // Tokenizer
-    // -------------------------------------------------------------------------
-    py::class_<Tokenizer>(m, "Tokenizer")
-        .def(py::init<>())
-        .def("build_from_text", &Tokenizer::build_from_text,
-             py::arg("text"), py::arg("max_vocab") = 50000)
-        .def("build_from_file", &Tokenizer::build_from_file,
-             py::arg("path"), py::arg("max_vocab") = 50000)
-        .def("save",   &Tokenizer::save,   py::arg("path"))
-        .def("load",   &Tokenizer::load,   py::arg("path"))
-        .def("encode", &Tokenizer::encode,
-             py::arg("text"), py::arg("add_bos") = false, py::arg("add_eos") = false)
-        .def("decode", &Tokenizer::decode,
-             py::arg("ids"), py::arg("skip_special") = true)
-        .def("vocab_size", &Tokenizer::vocab_size)
-        .def("has_token",  &Tokenizer::has_token, py::arg("token"))
-        .def("token_to_id", [](Tokenizer& tok, const std::string& t) {
-            return tok.token_to_id(t);
-        }, py::arg("token"))
-        .def("id_to_token", [](Tokenizer& tok, int id) {
-            return tok.id_to_token(id);
-        }, py::arg("id"))
-        .def_readonly_static("UNK_ID", &Tokenizer::UNK_ID)
-        .def_readonly_static("PAD_ID", &Tokenizer::PAD_ID)
-        .def_readonly_static("BOS_ID", &Tokenizer::BOS_ID)
-        .def_readonly_static("EOS_ID", &Tokenizer::EOS_ID);
 }
