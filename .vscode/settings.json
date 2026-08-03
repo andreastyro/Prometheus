@@ -1,0 +1,7 @@
+{
+  "python.defaultInterpreterPath": "C:/Python314/python.exe",
+  "python.analysis.extraPaths": [
+    "C:/Users/andre/Desktop/Projects/prometheus"
+  ],
+  "python.analysis.stubPath": "stubs"
+}
