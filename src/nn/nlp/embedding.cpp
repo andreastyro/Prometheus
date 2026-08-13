@@ -1,4 +1,4 @@
-#include "ml/nn/embedding.hpp"
+#include "ml/nn/nlp/embedding.hpp"
 #include <stdexcept>
 #include <string>
 

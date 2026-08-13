@@ -1,7 +1,7 @@
 #pragma once
 #include "ml/nn/module.hpp"
-#include "ml/nn/attention.hpp"
-#include "ml/nn/layernorm.hpp"
+#include "ml/nn/nlp/attention.hpp"
+#include "ml/nn/nlp/layernorm.hpp"
 #include "ml/nn/linear.hpp"
 
 // TransformerBlock — one complete transformer layer.

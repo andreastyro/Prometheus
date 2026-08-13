@@ -1,4 +1,4 @@
-#include "ml/nn/positional_encoding.hpp"
+#include "ml/nn/nlp/positional_encoding.hpp"
 #include <cmath>
 
 using namespace std;

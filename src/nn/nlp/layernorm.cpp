@@ -1,4 +1,4 @@
-#include "ml/nn/layernorm.hpp"
+#include "ml/nn/nlp/layernorm.hpp"
 #include <cmath>
 
 using namespace std;

@@ -1,5 +1,5 @@
 #include "ml/tensor.hpp"
-#include "ml/nn/conv2d.hpp"
+#include "ml/nn/vision/conv2d.hpp"
 #include "ml/nn/flatten.hpp"
 #include "ml/autograd.hpp"
 #include <stdio.h>
