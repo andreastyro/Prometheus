@@ -13,6 +13,7 @@
 #include "ml/nn/sequential.hpp"
 #include "ml/nn/flatten.hpp"
 #include "ml/nn/vision/conv2d.hpp"
+#include "ml/nn/vision/residual_block.hpp"
 #include "ml/nn/vision/maxpool2d.hpp"
 #include "ml/nn/vision/avgpool2d.hpp"
 #include "ml/nn/vision/convtranspose2d.hpp"
@@ -205,6 +206,13 @@ PYBIND11_MODULE(prometheus, m) {
              py::arg("stride") = 1, py::arg("padding") = 0, py::arg("weight_init") = "default")
         .def("forward",    &Conv2D::forward)
         .def("parameters", &Conv2D::parameters);
+
+    py::class_<ResidualBlock, Module, std::shared_ptr<ResidualBlock>>(m, "ResidualBlock")
+        .def(py::init<int, int, int, int>(),
+             py::arg("in_channels"), py::arg("out_channels"),
+             py::arg("stride") = 1, py::arg("num_groups") = 1)
+        .def("forward",    &ResidualBlock::forward)
+        .def("parameters", &ResidualBlock::parameters);
 
     py::class_<MaxPool2D, Module, std::shared_ptr<MaxPool2D>>(m, "MaxPool2D")
         .def(py::init<int, int>(), py::arg("kernel_size"), py::arg("stride") = -1)

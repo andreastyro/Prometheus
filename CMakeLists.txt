@@ -33,6 +33,7 @@ set(SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/metrics/metrics.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/flatten.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/vision/conv2d.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/vision/residual_block.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/vision/maxpool2d.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/vision/avgpool2d.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/vision/convtranspose2d.cpp
