@@ -47,6 +47,7 @@ set(SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/nlp/attention.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/nlp/positional_encoding.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/nlp/transformer.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/nlp/gpt.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/optim/adamw.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/utils/grad_clip.cpp
 )
@@ -178,3 +179,6 @@ target_link_libraries(test_adamw prometheus)
 
 add_executable(test_checkpoint  ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_checkpoint.cpp)
 target_link_libraries(test_checkpoint prometheus)
+
+add_executable(test_gpt         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gpt.cpp)
+target_link_libraries(test_gpt prometheus)

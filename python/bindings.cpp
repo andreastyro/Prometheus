@@ -26,6 +26,7 @@
 #include "ml/nn/nlp/attention.hpp"
 #include "ml/nn/nlp/transformer.hpp"
 #include "ml/nn/nlp/positional_encoding.hpp"
+#include "ml/nn/nlp/gpt.hpp"
 
 #include "ml/optim/sgd.hpp"
 #include "ml/optim/adam.hpp"
@@ -109,9 +110,11 @@ PYBIND11_MODULE(prometheus, m) {
     m.def("divide",        py::overload_cast<TensorPtr, float>(&divide));
     m.def("matmul",        &matmul);
     m.def("relu",          &relu);
+    m.def("gelu",          &gelu);
     m.def("sigmoid",       &sigmoid);
     m.def("tanh_op",       &tanh_op);
     m.def("softmax",       &softmax);
+    m.def("reshape_op",    &reshape_op, py::arg("a"), py::arg("new_shape"));
     m.def("log_op",        &log_op);
     m.def("exp_op",        &exp_op);
     m.def("pow_op",        &pow_op);
@@ -130,10 +133,14 @@ PYBIND11_MODULE(prometheus, m) {
     // -------------------------------------------------------------------------
     // Loss
     // -------------------------------------------------------------------------
-    m.def("mse_loss",           &mse_loss);
-    m.def("mae_loss",           &mae_loss);
-    m.def("bce_loss",           &bce_loss);
-    m.def("cross_entropy_loss", &cross_entropy_loss);
+    m.def("mse_loss",                &mse_loss);
+    m.def("mae_loss",                &mae_loss);
+    m.def("bce_loss",                &bce_loss);
+    m.def("cross_entropy_loss",      &cross_entropy_loss);
+    m.def("cross_entropy_sparse",    &cross_entropy_sparse,
+          py::arg("logits"), py::arg("target_idx"));
+    m.def("cross_entropy_sparse_seq",&cross_entropy_sparse_seq,
+          py::arg("logits"), py::arg("targets"));
     m.def("huber_loss",         &huber_loss,         py::arg("pred"), py::arg("target"), py::arg("delta") = 1.0f);
     m.def("kl_divergence",      &kl_divergence);
     m.def("reconstruction_loss",&reconstruction_loss);
@@ -273,16 +280,38 @@ PYBIND11_MODULE(prometheus, m) {
         .def("parameters", &GroupNorm::parameters);
 
     py::class_<MultiHeadAttention, Module, std::shared_ptr<MultiHeadAttention>>(m, "MultiHeadAttention")
-        .def(py::init<int, int, bool>(),
-             py::arg("embed_dim"), py::arg("num_heads"), py::arg("causal") = false)
+        .def(py::init<int, int, bool, bool>(),
+             py::arg("embed_dim"), py::arg("num_heads"),
+             py::arg("causal") = false, py::arg("rope") = false)
         .def("forward",    &MultiHeadAttention::forward)
         .def("parameters", &MultiHeadAttention::parameters);
 
     py::class_<TransformerBlock, Module, std::shared_ptr<TransformerBlock>>(m, "TransformerBlock")
-        .def(py::init<int, int, int>(),
-             py::arg("embed_dim"), py::arg("num_heads"), py::arg("ff_dim"))
+        .def(py::init<int, int, int, bool, bool>(),
+             py::arg("embed_dim"), py::arg("num_heads"), py::arg("ff_dim"),
+             py::arg("causal") = false, py::arg("rope") = false)
         .def("forward",    &TransformerBlock::forward)
         .def("parameters", &TransformerBlock::parameters);
+
+    py::class_<KVCache>(m, "KVCache")
+        .def("reset",    &KVCache::reset)
+        .def_readonly("past_len", &KVCache::past_len);
+
+    py::class_<GPT>(m, "GPT")
+        .def(py::init<int, int, int, int, int, int, bool>(),
+             py::arg("vocab_size"), py::arg("max_seq_len"), py::arg("embed_dim"),
+             py::arg("num_heads"), py::arg("num_layers"),
+             py::arg("ff_dim") = 0, py::arg("rope") = false)
+        .def("forward",         &GPT::forward)
+        .def("forward_cached",  &GPT::forward_cached,
+             py::arg("token_id"), py::arg("cache"))
+        .def("make_kv_cache",   &GPT::make_kv_cache)
+        .def("parameters",      &GPT::parameters)
+        .def_readonly("vocab_size_",   &GPT::vocab_size_)
+        .def_readonly("embed_dim_",    &GPT::embed_dim_)
+        .def_readonly("max_seq_len_",  &GPT::max_seq_len_)
+        .def_readonly("num_layers_",   &GPT::num_layers_)
+        .def_readonly("rope_",         &GPT::rope_);
 
     py::class_<PositionalEncoding>(m, "PositionalEncoding")
         .def(py::init<int, int>(), py::arg("max_len"), py::arg("embed_dim"))

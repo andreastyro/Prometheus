@@ -45,3 +45,15 @@ TensorPtr l1_regularization(std::vector<TensorPtr> params, float lambda_);
 /// L2 regularisation: sum(w^2) * lambda — penalises large weights, keeps them small.
 /// Add to the main loss to penalise large weights and reduce overfitting.
 TensorPtr l2_regularization(std::vector<TensorPtr> params, float lambda_);
+
+/// Sparse cross-entropy for a single position.
+/// logits: raw unnormalised scores [vocab_size] (NOT softmaxed)
+/// target_idx: the correct class index (integer)
+/// Numerically stable via log-sum-exp. Backward: softmax(logits) - one_hot(target)
+TensorPtr cross_entropy_sparse(TensorPtr logits, int target_idx);
+
+/// Sparse cross-entropy over a full sequence in one call.
+/// logits: [seq_len, vocab_size] raw scores
+/// targets: vector of seq_len correct class indices
+/// Returns mean loss over all positions.
+TensorPtr cross_entropy_sparse_seq(TensorPtr logits, const std::vector<int>& targets);

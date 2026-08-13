@@ -707,3 +707,50 @@ TensorPtr argmax(TensorPtr a) {
     return result;
 }
 
+// GELU activation — tanh approximation used by GPT-2/3/4.
+// Formula: x * 0.5 * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
+TensorPtr gelu(TensorPtr a) {
+    auto result = make_shared<Tensor>(a->shape);
+    int n = a->num_el();
+    constexpr float kSqrt2OverPi = 0.7978845608f;
+
+    for (int i = 0; i < n; i++) {
+        float x = a->data[i];
+        float inner = kSqrt2OverPi * (x + 0.044715f * x * x * x);
+        result->data[i] = 0.5f * x * (1.0f + tanhf(inner));
+    }
+
+    if (a->requires_grad) {
+        auto node = make_node(result, {a});
+        node->backward_fn = [a, result]() {
+            constexpr float k = 0.7978845608f;
+            int m = a->num_el();
+            for (int i = 0; i < m; i++) {
+                float x = a->data[i];
+                float inner = k * (x + 0.044715f * x * x * x);
+                float t = tanhf(inner);
+                float d_inner = k * (1.0f + 3.0f * 0.044715f * x * x);
+                float grad = 0.5f * (1.0f + t) + 0.5f * x * (1.0f - t * t) * d_inner;
+                a->grad[i] += result->grad[i] * grad;
+            }
+        };
+    }
+
+    return result;
+}
+
+// reshape_op — gradient-tracking reshape (unlike Tensor::reshape which is in-place).
+TensorPtr reshape_op(TensorPtr a, std::vector<int> new_shape) {
+    auto result = make_shared<Tensor>(new_shape);
+    result->data = a->data;
+
+    if (a->requires_grad) {
+        auto node = make_node(result, {a});
+        node->backward_fn = [a, result]() {
+            for (int i = 0; i < (int)result->grad.size(); i++)
+                a->grad[i] += result->grad[i];
+        };
+    }
+
+    return result;
+}
