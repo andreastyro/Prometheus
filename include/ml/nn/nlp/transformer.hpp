@@ -42,7 +42,9 @@ public:
     int embed_dim;
 
     // ff_dim: inner dimension of the feedforward network, typically 4 * embed_dim
-    TransformerBlock(int embed_dim, int num_heads, int ff_dim);
+    // causal: if true, each position only attends to itself and earlier positions (GPT style)
+    // rope:   if true, use Rotary Position Embedding in the attention layer
+    TransformerBlock(int embed_dim, int num_heads, int ff_dim, bool causal = false, bool rope = false);
 
     TensorPtr forward(TensorPtr input) override;
 

@@ -80,3 +80,11 @@ TensorPtr broadcast_add(TensorPtr a, TensorPtr b);
 /// Returns a tensor where each value is the index of the max along the last axis.
 /// Used to convert softmax output into class predictions.
 TensorPtr argmax(TensorPtr a);
+
+/// GELU: Gaussian Error Linear Unit — x * Φ(x), approximated with tanh.
+/// The activation used inside GPT-2/3/4 feedforward blocks.
+TensorPtr gelu(TensorPtr a);
+
+/// Gradient-tracking reshape. Returns a new tensor with the given shape
+/// but the same element count; gradients flow back through the reshape.
+TensorPtr reshape_op(TensorPtr a, std::vector<int> new_shape);

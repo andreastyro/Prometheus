@@ -1,6 +1,10 @@
 #include "ml/loss.hpp"
 #include "ml/ops.hpp"
+#include "ml/autograd.hpp"
 #include <cmath>
+#include <algorithm>
+
+using namespace std;
 
 TensorPtr mse_loss(TensorPtr pred, TensorPtr target){
     auto diff = subtract(pred, target);
@@ -109,4 +113,75 @@ TensorPtr l2_regularization(std::vector<TensorPtr> params, float lambda_) {
             total += v * v;
     out->data[0] = lambda_ * total;
     return out;
+}
+
+// Sparse cross-entropy (single position).
+// Numerically stable: loss = log(Σ exp(logits)) - logits[target]
+//                          = log(Σ exp(logits - max)) + max - logits[target]
+TensorPtr cross_entropy_sparse(TensorPtr logits, int target_idx) {
+    int n = logits->num_el();
+    float max_v = *std::max_element(logits->data.begin(), logits->data.end());
+
+    float sum_exp = 0.0f;
+    for (float v : logits->data)
+        sum_exp += std::expf(v - max_v);
+
+    float loss_val = std::logf(sum_exp) + max_v - logits->data[target_idx];
+
+    auto result = make_shared<Tensor>(std::vector<int>{1});
+    result->data[0] = loss_val;
+
+    if (logits->requires_grad) {
+        auto node = make_node(result, {logits});
+        node->backward_fn = [logits, result, target_idx, n, max_v, sum_exp]() {
+            float scale = result->grad[0];
+            for (int j = 0; j < n; j++) {
+                float p = std::expf(logits->data[j] - max_v) / sum_exp;
+                logits->grad[j] += scale * (p - (j == target_idx ? 1.0f : 0.0f));
+            }
+        };
+    }
+
+    return result;
+}
+
+// Sparse cross-entropy over a full sequence — avoids building a loop in Python.
+// logits: [seq_len, vocab_size],  targets: seq_len ints.
+// Returns mean loss (scalar) with proper backward to all logit positions.
+TensorPtr cross_entropy_sparse_seq(TensorPtr logits, const std::vector<int>& targets) {
+    int seq_len  = logits->shape[0];
+    int vocab    = logits->shape[1];
+
+    // Forward: accumulate loss per position
+    std::vector<float> max_v(seq_len), sum_exp(seq_len, 0.0f);
+    for (int t = 0; t < seq_len; t++) {
+        float mx = logits->data[t * vocab];
+        for (int v = 1; v < vocab; v++)
+            mx = std::max(mx, logits->data[t * vocab + v]);
+        max_v[t] = mx;
+        for (int v = 0; v < vocab; v++)
+            sum_exp[t] += std::expf(logits->data[t * vocab + v] - mx);
+    }
+
+    float total = 0.0f;
+    for (int t = 0; t < seq_len; t++)
+        total += std::logf(sum_exp[t]) + max_v[t] - logits->data[t * vocab + targets[t]];
+
+    auto result = make_shared<Tensor>(std::vector<int>{1});
+    result->data[0] = total / (float)seq_len;
+
+    if (logits->requires_grad) {
+        auto node = make_node(result, {logits});
+        node->backward_fn = [logits, result, targets, seq_len, vocab, max_v, sum_exp]() {
+            float scale = result->grad[0] / (float)seq_len;
+            for (int t = 0; t < seq_len; t++) {
+                for (int v = 0; v < vocab; v++) {
+                    float p = std::expf(logits->data[t * vocab + v] - max_v[t]) / sum_exp[t];
+                    logits->grad[t * vocab + v] += scale * (p - (v == targets[t] ? 1.0f : 0.0f));
+                }
+            }
+        };
+    }
+
+    return result;
 }
