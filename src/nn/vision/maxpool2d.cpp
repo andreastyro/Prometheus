@@ -1,4 +1,4 @@
-#include "ml/nn/maxpool2d.hpp"
+#include "ml/nn/vision/maxpool2d.hpp"
 #include <limits>
 
 using namespace std;

@@ -1,5 +1,5 @@
 #include "ml/tensor.hpp"
-#include "ml/nn/layernorm.hpp"
+#include "ml/nn/nlp/layernorm.hpp"
 #include <stdio.h>
 #include <cmath>
 

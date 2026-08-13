@@ -1,4 +1,4 @@
-#include "ml/nn/lstm.hpp"
+#include "ml/nn/rnn/lstm.hpp"
 #include "ml/ops.hpp"
 
 using namespace std;

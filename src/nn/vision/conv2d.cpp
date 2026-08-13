@@ -1,4 +1,4 @@
-#include "ml/nn/conv2d.hpp"
+#include "ml/nn/vision/conv2d.hpp"
 #include <cmath>
 
 using namespace std;

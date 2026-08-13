@@ -1,4 +1,4 @@
-#include "ml/nn/gru.hpp"
+#include "ml/nn/rnn/gru.hpp"
 #include "ml/ops.hpp"
 
 using namespace std;

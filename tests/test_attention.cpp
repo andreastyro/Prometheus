@@ -1,5 +1,5 @@
 #include "ml/tensor.hpp"
-#include "ml/nn/attention.hpp"
+#include "ml/nn/nlp/attention.hpp"
 #include <stdio.h>
 #include <cmath>
 

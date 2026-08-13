@@ -1,5 +1,5 @@
 #include "ml/tensor.hpp"
-#include "ml/nn/gru.hpp"
+#include "ml/nn/rnn/gru.hpp"
 #include <stdio.h>
 
 using namespace std;

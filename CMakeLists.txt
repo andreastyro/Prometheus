@@ -32,20 +32,20 @@ set(SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/utils/early_stopping.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/metrics/metrics.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/flatten.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/conv2d.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/maxpool2d.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/avgpool2d.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/convtranspose2d.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/rnn.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/lstm.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/gru.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/vision/conv2d.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/vision/maxpool2d.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/vision/avgpool2d.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/vision/convtranspose2d.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/rnn/rnn.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/rnn/lstm.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/rnn/gru.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/optim/grad_scaler.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/embedding.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/layernorm.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/nlp/embedding.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/nlp/layernorm.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/groupnorm.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/attention.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/positional_encoding.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/transformer.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/nlp/attention.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/nlp/positional_encoding.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/nlp/transformer.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/optim/adamw.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/utils/grad_clip.cpp
 )

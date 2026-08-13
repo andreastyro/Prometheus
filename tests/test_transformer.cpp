@@ -1,6 +1,6 @@
 #include "ml/tensor.hpp"
-#include "ml/nn/positional_encoding.hpp"
-#include "ml/nn/transformer.hpp"
+#include "ml/nn/nlp/positional_encoding.hpp"
+#include "ml/nn/nlp/transformer.hpp"
 #include <stdio.h>
 #include <cmath>
 

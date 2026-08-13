@@ -1,7 +1,7 @@
 #include "ml/tensor.hpp"
-#include "ml/nn/maxpool2d.hpp"
-#include "ml/nn/avgpool2d.hpp"
-#include "ml/nn/conv2d.hpp"
+#include "ml/nn/vision/maxpool2d.hpp"
+#include "ml/nn/vision/avgpool2d.hpp"
+#include "ml/nn/vision/conv2d.hpp"
 #include "ml/nn/flatten.hpp"
 #include <stdio.h>
 

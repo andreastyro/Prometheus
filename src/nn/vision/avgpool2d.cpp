@@ -1,4 +1,4 @@
-#include "ml/nn/avgpool2d.hpp"
+#include "ml/nn/vision/avgpool2d.hpp"
 
 using namespace std;
 
