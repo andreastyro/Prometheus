@@ -3,12 +3,17 @@
 #include <string>
 #include <fstream>
 #include <sstream>
+#include <stdexcept>
 
 using namespace std;
 
 pair<TensorPtr, TensorPtr> read_csv(const string& path, int y_col, bool header){
 
     ifstream file(path);
+    if (!file)
+        throw runtime_error("read_csv: cannot open '" + path + "' (paths are relative to the "
+                            "current working directory)");
+
     string line;
 
     if (header) getline(file, line);

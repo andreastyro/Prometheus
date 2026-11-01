@@ -6,11 +6,16 @@
 
 using namespace std;
 
+#include <stdexcept>
+
 TensorPtr load_image(const string& path, bool normalize){
 
     int width, height, channels;
 
     unsigned char* img = stbi_load(path.c_str(), &width, &height, &channels, 0);
+    if (!img)
+        throw runtime_error("load_image: cannot open '" + path + "' (paths are relative to the "
+                            "current working directory): " + stbi_failure_reason());
 
     vector<int> tensor_shape = {channels, width, height};
 

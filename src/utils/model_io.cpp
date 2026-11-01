@@ -7,6 +7,9 @@ using namespace std;
 
 void save(const string& path, vector<TensorPtr> params){
     ofstream file(path, ios::binary);
+    if (!file)
+        throw runtime_error("save: cannot write '" + path + "' (does the directory exist? "
+                            "paths are relative to the current working directory)");
 
     int num_params = params.size();
     file.write((char*)&num_params, sizeof(int));
@@ -25,9 +28,14 @@ void save(const string& path, vector<TensorPtr> params){
 
 vector<TensorPtr> load(const string& path){
     ifstream file(path, ios::binary);
+    if (!file)
+        throw runtime_error("load: cannot open '" + path + "' (paths are relative to the "
+                            "current working directory)");
 
-    int num_params;
+    int num_params = 0;
     file.read((char*)&num_params, sizeof(int));
+    if (!file || num_params < 0)
+        throw runtime_error("load: '" + path + "' is not a valid model file");
 
     vector<TensorPtr> params;
 
