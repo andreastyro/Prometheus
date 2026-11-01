@@ -41,27 +41,6 @@ static void check(const string& name,
     CHECK_TRUE((name + " gradients").c_str(), r.passed);
 }
 
-// Known-broken checks. These layers build a correct forward pass but assemble
-// their result into a raw buffer, which detaches it from the graph they built,
-// so every analytical gradient comes back exactly 0. Marking them xfail keeps
-// the suite usable as a regression gate while the bugs are tracked. The mark is
-// strict: if one starts passing, that is reported as a failure so the entry gets
-// removed rather than silently masking a fix.
-static void check_xfail(const string& name,
-                        const string& why,
-                        function<TensorPtr()> f,
-                        vector<TensorPtr> inputs,
-                        GradCheckOptions o = OPTS) {
-    GradCheckResult r = gradcheck(name, f, inputs, o);
-    if (r.passed) {
-        printf("  %-44s XPASS - now correct, remove the xfail\n", name.c_str());
-        CHECK_TRUE((name + " is marked broken but now passes").c_str(), false);
-    } else {
-        printf("  %-44s XFAIL %d/%d (%s)\n",
-               name.c_str(), r.failed, r.checked, why.c_str());
-    }
-}
-
 static TensorPtr tin(vector<int> shape, bool grad = true) {
     auto t = make_shared<Tensor>(shape);
     // offset by 0.05 so no element lands on 0, where relu/mae/huber have a
@@ -119,7 +98,7 @@ int main() {
         for (int i = 0; i < q->num_el(); i++) q->data[i] = 1.0f - q->data[i];  // differ from p
         q->requires_grad = false;
         check("bce_loss",      [&]{ return bce_loss(p, q); },      {p});
-        check_xfail("kl_divergence", "computed on raw floats, no grad node", [&]{ return kl_divergence(p, q); }, {p});
+        check("kl_divergence", [&]{ return kl_divergence(p, q); }, {p});
 
         auto logits = tprob({2, 4});
         auto onehot = make_shared<Tensor>(vector<int>{2, 4},
@@ -149,12 +128,12 @@ int main() {
 
         GroupNorm gn(2, 4);
         auto xg = tin({1, 4, 2, 2});
-        check_xfail("GroupNorm", "no backward implemented at all", [&]{ return gn.forward(xg); },
+        check("GroupNorm", [&]{ return gn.forward(xg); },
               {gn.parameters()[0], gn.parameters()[1], xg});
 
         BatchNorm bn(4);
         auto xb = tin({3, 4});
-        check_xfail("BatchNorm", "no backward implemented at all", [&]{ return bn.forward(xb); },
+        check("BatchNorm", [&]{ return bn.forward(xb); },
               {bn.parameters()[0], bn.parameters()[1], xb});
 
         Embedding emb(6, 4);
@@ -178,19 +157,19 @@ int main() {
         RNN rnn(3, 4);
         auto xr = tin({5, 1, 3});
         auto pr = rnn.parameters();
-        check_xfail("RNN", "output sequence detached; hidden state is fine", [&]{ return rnn.forward(xr); }, {pr[0], pr[1], pr[2], xr});
+        check("RNN", [&]{ return rnn.forward(xr); }, {pr[0], pr[1], pr[2], xr});
 
         LSTM lstm(3, 4);
         auto xl = tin({5, 1, 3});
         vector<TensorPtr> li = lstm.parameters();
         li.push_back(xl);
-        check_xfail("LSTM", "output sequence detached; hidden state is fine", [&]{ return lstm.forward(xl); }, li);
+        check("LSTM", [&]{ return lstm.forward(xl); }, li);
 
         GRU gru(3, 4);
         auto xu = tin({5, 1, 3});
         vector<TensorPtr> ui = gru.parameters();
         ui.push_back(xu);
-        check_xfail("GRU", "output sequence detached; hidden state is fine", [&]{ return gru.forward(xu); }, ui);
+        check("GRU", [&]{ return gru.forward(xu); }, ui);
     }
 
     printf("\n=== vision layers ===\n");
@@ -216,8 +195,13 @@ int main() {
         ResidualBlock rb(2, 2, 1, 1);
         auto xb = tin({1, 2, 4, 4});
         auto prb = rb.parameters();
-        check_xfail("ResidualBlock", "contains GroupNorm, which has no backward", [&]{ return rb.forward(xb); },
-              {prb[0], prb[prb.size() - 1], xb});
+        // Two ReLUs inside: the default eps = 1e-2 is large enough to flip an
+        // activation sign, which makes the central difference straddle the kink
+        // and report a false mismatch. A smaller step stays on one side.
+        GradCheckOptions relu_safe;
+        relu_safe.eps = 1e-3f;
+        check("ResidualBlock", [&]{ return rb.forward(xb); },
+              {prb[0], prb[prb.size() - 1], xb}, relu_safe);
     }
 
     printf("\n=== attention / transformer ===\n");

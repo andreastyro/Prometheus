@@ -1,5 +1,6 @@
 #include "ml/nn/rnn/gru.hpp"
 #include "ml/ops.hpp"
+#include "ml/nn/rnn/sequence_ops.hpp"
 
 using namespace std;
 
@@ -26,14 +27,13 @@ pair<TensorPtr, TensorPtr> GRU::forward(TensorPtr input, TensorPtr h0) {
 
     TensorPtr h = h0 ? h0 : Tensor::zeros({batch, hidden_size});
 
-    auto output = make_shared<Tensor>(vector<int>{seq_len, batch, hidden_size});
+    // collected per timestep, then stacked differentiably at the end
+    vector<TensorPtr> steps;
+    steps.reserve(seq_len);
 
     for (int t = 0; t < seq_len; t++) {
         // slice x_t: [batch, input_size]
-        auto x_t = make_shared<Tensor>(vector<int>{batch, input_sz});
-        for (int b = 0; b < batch; b++)
-            for (int i = 0; i < input_sz; i++)
-                x_t->data[b * input_sz + i] = input->data[t * (batch * input_sz) + b * input_sz + i];
+        auto x_t = rnn_slice_step(input, t);
 
         // r_t = sigmoid(x_t @ W_xr + h @ W_hr + b_r)
         auto r_t = sigmoid(broadcast_add(add(matmul(x_t, W_xr), matmul(h, W_hr)), b_r));
@@ -44,11 +44,10 @@ pair<TensorPtr, TensorPtr> GRU::forward(TensorPtr input, TensorPtr h0) {
         // h_t = (1 - z_t) * n_t + z_t * h
         h = add(multiply(subtract(1.0f, z_t), n_t), multiply(z_t, h));
 
-        // store h into output[t]
-        for (int b = 0; b < batch; b++)
-            for (int i = 0; i < hidden_size; i++)
-                output->data[t * (batch * hidden_size) + b * hidden_size + i] = h->data[b * hidden_size + i];
+        steps.push_back(h);
     }
+
+    auto output = rnn_stack_steps(steps);
 
     return {output, h};
 }

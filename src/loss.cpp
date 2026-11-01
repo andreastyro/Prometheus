@@ -66,18 +66,19 @@ TensorPtr huber_loss(TensorPtr pred, TensorPtr target, float delta) {
 }
 
 TensorPtr kl_divergence(TensorPtr p, TensorPtr q) {
-    // sum(p * log(p / (q + eps))) — eps avoids log(0)
-    int n = p->num_el();
-    auto out = Tensor::zeros({1});
-    float total = 0.0f;
-    for (int i = 0; i < n; i++) {
-        float pi = p->data[i];
-        float qi = q->data[i] + 1e-8f;
-        if (pi > 0.0f)
-            total += pi * std::log(pi / qi);
-    }
-    out->data[0] = total;
-    return out;
+    // sum(p * log(p / q)), built from autograd ops so the gradient with
+    // respect to p comes for free. The previous version looped over raw
+    // floats and returned a detached tensor, so p never received a gradient.
+    const float eps = 1e-8f;
+
+    auto p_safe = clip(p, eps, 1.0f);
+    auto q_safe = clip(q, eps, 1.0f);
+
+    auto ratio = divide(p_safe, q_safe);
+    auto terms = multiply(p_safe, log_op(ratio));
+
+    // sum over every element, matching the previous reduction
+    return multiply((float)terms->num_el(), mean(terms, -1));
 }
 
 TensorPtr reconstruction_loss(TensorPtr input, TensorPtr output) {

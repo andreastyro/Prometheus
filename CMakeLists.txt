@@ -38,6 +38,7 @@ set(SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/vision/avgpool2d.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/vision/convtranspose2d.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/rnn/rnn.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/rnn/sequence_ops.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/rnn/lstm.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/rnn/gru.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/optim/grad_scaler.cpp
