@@ -577,12 +577,45 @@ def test_wider_shapes():
           arr(mha.forward(tensor([seq, embed], xa))), out @ Wo, atol=1e-4)
 
 
+def test_batchnorm_modes():
+    print("\n=== BatchNorm training vs inference ===\n")
+    bn = p.BatchNorm(3, 1e-5, True, 0.1)
+    g, b = arr(bn.parameters()[0]), arr(bn.parameters()[1])
+    X = spread(12).reshape(4, 3)
+
+    # training: batch statistics, and the running estimate is folded in
+    out = arr(bn.forward(tensor([4, 3], X)))
+    mu, var = X.mean(axis=0), X.var(axis=0)
+    check("BatchNorm train uses batch stats",
+          out, g * (X - mu) / np.sqrt(var + 1e-5) + b, atol=1e-4)
+
+    rm = 0.9 * 0.0 + 0.1 * mu          # running_mean starts at 0
+    rv = 0.9 * 1.0 + 0.1 * var         # running_var starts at 1
+    check("running_mean after one batch", np.array(bn.running_mean), rm, atol=1e-6)
+    check("running_var after one batch",  np.array(bn.running_var),  rv, atol=1e-6)
+
+    # inference: running estimate, and no further updates
+    bn.eval()
+    out = arr(bn.forward(tensor([4, 3], X)))
+    check("BatchNorm eval uses running stats",
+          out, g * (X - rm) / np.sqrt(rv + 1e-5) + b, atol=1e-4)
+    # running stats are stored as float32, so compare at float32 precision
+    check("eval leaves running_mean untouched", np.array(bn.running_mean), rm, atol=1e-6)
+
+    # a single sample has zero batch variance, so this only works in eval mode
+    one = spread(3).reshape(1, 3)
+    out = arr(bn.forward(tensor([1, 3], one)))
+    check("single-sample inference",
+          out, g * (one - rm) / np.sqrt(rv + 1e-5) + b, atol=1e-4)
+
+
 def main():
     print("Forward-pass verification against numpy reference implementations")
     test_ops()
     test_linear()
     test_embedding_flatten()
     test_norms()
+    test_batchnorm_modes()
     test_vision()
     test_rnn()
     test_lstm_gru()

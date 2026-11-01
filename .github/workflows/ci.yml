@@ -80,3 +80,25 @@ jobs:
 
       - name: Python API and binding checks
         run: python tests/test_python_api.py
+
+  # ── ASAN + UBSAN: catches uninitialised reads, overflows, bad frees ───────
+  sanitizers:
+    name: Address and UB sanitizers
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build instrumented
+        run: |
+          cmake -S . -B build-san -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+          cmake --build build-san
+
+      - name: Run the suite under the sanitizers
+        env:
+          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: ctest --test-dir build-san --output-on-failure
+

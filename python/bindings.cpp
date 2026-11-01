@@ -310,11 +310,17 @@ PYBIND11_MODULE(prometheus, m) {
         .def("parameters", &GroupNorm::parameters);
 
     py::class_<BatchNorm, Module, std::shared_ptr<BatchNorm>>(m, "BatchNorm")
-        .def(py::init<int, float, bool>(),
+        .def(py::init<int, float, bool, float>(),
              py::arg("num_features"), py::arg("eps") = 1e-5f,
-             py::arg("training") = true)
+             py::arg("training") = true, py::arg("momentum") = 0.1f)
         .def("forward",    &BatchNorm::forward)
-        .def("parameters", &BatchNorm::parameters);
+        .def("parameters", &BatchNorm::parameters)
+        .def("eval",       &BatchNorm::eval)
+        .def("train",      &BatchNorm::train)
+        .def_readwrite("training",     &BatchNorm::training)
+        .def_readwrite("momentum",     &BatchNorm::momentum)
+        .def_readonly("running_mean",  &BatchNorm::running_mean)
+        .def_readonly("running_var",   &BatchNorm::running_var);
 
     py::class_<MultiHeadAttention, Module, std::shared_ptr<MultiHeadAttention>>(m, "MultiHeadAttention")
         .def(py::init<int, int, bool, bool>(),
