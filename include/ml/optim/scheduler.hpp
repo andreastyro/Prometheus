@@ -17,16 +17,20 @@
 class LRScheduler {
 public:
     float base_lr;      // the starting learning rate
+    float current_lr;   // lr produced by the most recent step()
     int   step_count;   // how many times step() has been called so far
 
-    LRScheduler(float base_lr) : base_lr(base_lr), step_count(0) {}
+    LRScheduler(float base_lr)
+        : base_lr(base_lr), current_lr(base_lr), step_count(0) {}
     virtual ~LRScheduler() {}
 
     // Advance one epoch and return the new learning rate
     virtual float step() = 0;
 
-    // Peek at the current learning rate without advancing
-    float get_lr() const { return base_lr; }
+    // Peek at the current learning rate without advancing. This used to return
+    // base_lr unconditionally, so it reported the starting rate forever no
+    // matter how many times step() had been called.
+    float get_lr() const { return current_lr; }
 };
 
 // StepLR — multiply lr by gamma every step_size epochs.
@@ -41,10 +45,9 @@ class StepLR : public LRScheduler {
 public:
     int   step_size;  // number of epochs between each decay
     float gamma;      // multiplicative decay factor (< 1 to reduce lr)
-    float current_lr; // lr after the most recent step
 
     StepLR(float base_lr, int step_size, float gamma = 0.1f)
-        : LRScheduler(base_lr), step_size(step_size), gamma(gamma), current_lr(base_lr) {}
+        : LRScheduler(base_lr), step_size(step_size), gamma(gamma) {}
 
     float step() override {
         step_count++;
@@ -61,14 +64,16 @@ public:
 class ExponentialLR : public LRScheduler {
 public:
     float gamma;      // per-epoch decay factor (typically 0.9 – 0.99)
-    float current_lr;
 
     ExponentialLR(float base_lr, float gamma = 0.95f)
-        : LRScheduler(base_lr), gamma(gamma), current_lr(base_lr) {}
+        : LRScheduler(base_lr), gamma(gamma) {}
 
+    // lr = base_lr * gamma^t, so the first call returns base_lr. Previously it
+    // decayed before returning, so the very first epoch never ran at base_lr
+    // and the schedule was one step ahead of StepLR and CosineAnnealingLR.
     float step() override {
+        current_lr = base_lr * std::pow(gamma, static_cast<float>(step_count));
         step_count++;
-        current_lr *= gamma;
         return current_lr;
     }
 };
@@ -93,6 +98,8 @@ public:
         // t cycles within [0, T_max) — restart every T_max epochs
         float t = static_cast<float>(step_count % T_max);
         step_count++;
-        return min_lr + 0.5f * (base_lr - min_lr) * (1.0f + std::cos(3.14159265f * t / T_max));
+        current_lr = min_lr + 0.5f * (base_lr - min_lr)
+                   * (1.0f + std::cos(3.14159265f * t / T_max));
+        return current_lr;
     }
 };

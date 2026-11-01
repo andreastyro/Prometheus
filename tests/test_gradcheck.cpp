@@ -310,5 +310,72 @@ int main() {
               [&]{ return gs.scale_loss(mean(multiply(l, l), -1)); }, {l});
     }
 
+    printf("\n=== wider shapes: batches, longer sequences, more heads ===\n");
+    {
+        GradCheckOptions few;
+        few.max_points = 3;
+
+        // A plain RNN composes tanh ten times, so the loss is strongly
+        // nonlinear in each parameter and the central difference picks up real
+        // truncation error at the default eps of 1e-2. The error falls as eps^2
+        // (4.8e-3 -> 4.7e-4 -> 1.2e-5 at eps 1e-2, 3e-3, 1e-3), which is the
+        // signature of a correct analytical gradient being compared against a
+        // too-coarse difference, so use a finer step for the deep sequences.
+        GradCheckOptions deep;
+        deep.max_points = 3;
+        deep.eps = 1e-3f;
+
+        // recurrent layers with batch > 1 and a longer sequence, so the
+        // backward-through-time path is exercised past a single step
+        RNN rnn2(4, 6);
+        auto xr2 = tin({10, 3, 4});
+        auto pr2 = rnn2.parameters();
+        check("RNN seq 10 batch 3", [&]{ return rnn2.forward(xr2); },
+              {pr2[0], pr2[1], pr2[2], xr2}, deep);
+
+        LSTM lstm2(4, 6);
+        auto xl2 = tin({10, 3, 4});
+        vector<TensorPtr> li2 = lstm2.parameters();
+        li2.push_back(xl2);
+        check("LSTM seq 10 batch 3", [&]{ return lstm2.forward(xl2); }, li2, deep);
+
+        GRU gru2(4, 6);
+        auto xu2 = tin({10, 3, 4});
+        vector<TensorPtr> ui2 = gru2.parameters();
+        ui2.push_back(xu2);
+        check("GRU seq 10 batch 3", [&]{ return gru2.forward(xu2); }, ui2, deep);
+
+        // Conv2D with a real batch, several channels, stride and padding
+        Conv2D cv2(3, 4, 3, 2, 1);
+        auto xc2 = tin({2, 3, 7, 7});
+        check("Conv2D batch 2 stride 2 pad 1", [&]{ return cv2.forward(xc2); },
+              {cv2.parameters()[0], cv2.parameters()[1], xc2}, few);
+
+        // attention with more heads over a longer sequence
+        MultiHeadAttention mha4(8, 4, true);
+        auto xa4 = tin({7, 8});
+        check("MultiHeadAttention 4 heads seq 7",
+              [&]{ return mha4.forward(xa4); },
+              {mha4.W_q, mha4.W_o, xa4}, few);
+
+        // BatchNorm and GroupNorm with more than one batch item
+        BatchNorm bn2(5);
+        auto xb2 = tin({6, 5});
+        check("BatchNorm batch 6", [&]{ return bn2.forward(xb2); },
+              {bn2.parameters()[0], bn2.parameters()[1], xb2}, few);
+
+        GroupNorm gn2(3, 6);
+        auto xg2 = tin({2, 6, 3, 3});
+        check("GroupNorm batch 2, 3 groups", [&]{ return gn2.forward(xg2); },
+              {gn2.parameters()[0], gn2.parameters()[1], xg2}, few);
+
+        // a deeper GPT than the single-layer smoke check
+        GPT gpt2(24, 12, 16, 4, 3);
+        auto ids2 = make_shared<Tensor>(vector<int>{6});
+        for (int i = 0; i < 6; i++) ids2->data[i] = (float)(i * 3 + 1);
+        check("GPT 3 layers 4 heads seq 6", [&]{ return gpt2.forward(ids2); },
+              {gpt2.tok_emb.weight, gpt2.ln_f.parameters()[0]}, few);
+    }
+
     return test_report();
 }

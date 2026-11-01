@@ -389,6 +389,194 @@ def test_optimizers():
     check("AdamW step (decoupled decay)", arr(w), adam_part - lr * wd * w0, atol=1e-5)
 
 
+def test_rmsprop_and_clip():
+    print("\n=== RMSprop, gradient clipping, schedulers ===\n")
+    g_np = spread(6).reshape(2, 3) * 0.3
+    w0 = spread(6)[::-1].reshape(2, 3)
+
+    def fresh(g=None):
+        w = tensor([2, 3], w0)
+        w.requires_grad = True
+        w.grad = [float(v) for v in (g if g is not None else g_np).ravel()]
+        return w
+
+    # RMSprop: v <- beta*v + (1-beta)*g^2 ;  w <- w - lr*g/(sqrt(v)+eps)
+    lr, beta, eps = 0.01, 0.9, 1e-8
+    w = fresh()
+    opt = p.RMSprop([w], lr, beta, eps)
+    opt.step()
+    v = (1 - beta) * g_np ** 2
+    check("RMSprop first step", arr(w), w0 - lr * g_np / (np.sqrt(v) + eps), atol=1e-5)
+
+    w = fresh()
+    opt = p.RMSprop([w], lr, beta, eps)
+    opt.step()
+    g2 = g_np * 0.5
+    w.grad = [float(x) for x in g2.ravel()]
+    opt.step()
+    v2 = beta * v + (1 - beta) * g2 ** 2
+    expect = w0 - lr * g_np / (np.sqrt(v) + eps) - lr * g2 / (np.sqrt(v2) + eps)
+    check("RMSprop second step", arr(w), expect, atol=1e-5)
+
+    # SGD with momentum: buf <- m*buf + g ;  w <- w - lr*buf
+    mom = 0.9
+    w = fresh()
+    opt = p.SGD([w], 0.1, mom)
+    opt.step()
+    buf = g_np.copy()
+    step1 = w0 - 0.1 * buf
+    w.grad = [float(x) for x in g2.ravel()]
+    opt.step()
+    buf = mom * buf + g2
+    check("SGD with momentum, two steps", arr(w), step1 - 0.1 * buf, atol=1e-5)
+
+    # clip_grad_norm scales gradients so the global L2 norm equals max_norm
+    big = g_np * 50.0
+    w = fresh(big)
+    total = np.sqrt(np.sum(big ** 2))
+    returned = p.clip_grad_norm([w], 1.0)
+    check("clip_grad_norm returns the pre-clip norm",
+          np.array([returned]), np.array([total]), atol=1e-3)
+    check("clipped gradients scaled to max_norm",
+          np.array(w.grad).reshape(2, 3), big / total, atol=1e-5)
+
+    # below the threshold nothing should change
+    w = fresh()
+    small = np.sqrt(np.sum(g_np ** 2))
+    p.clip_grad_norm([w], small * 10)
+    check("clip_grad_norm leaves small gradients alone",
+          np.array(w.grad).reshape(2, 3), g_np, atol=1e-6)
+
+    # schedulers: step() advances and get_lr() must agree with it
+    sl = p.StepLR(0.1, 3, 0.5)
+    got = [sl.step() for _ in range(7)]
+    check("StepLR schedule", np.array(got),
+          np.array([0.1, 0.1, 0.05, 0.05, 0.05, 0.025, 0.025]), atol=1e-6)
+
+    el = p.ExponentialLR(0.1, 0.9)
+    got = [el.step() for _ in range(5)]
+    check("ExponentialLR schedule", np.array(got),
+          np.array([0.1 * 0.9 ** i for i in range(5)]), atol=1e-6)
+    check("ExponentialLR get_lr tracks step",
+          np.array([el.get_lr()]), np.array([got[-1]]), atol=1e-9)
+
+    cl = p.CosineAnnealingLR(0.1, 6, 0.01)
+    got = [cl.step() for _ in range(6)]
+    ref = [0.01 + (0.1 - 0.01) * (1 + np.cos(np.pi * i / 6)) / 2 for i in range(6)]
+    check("CosineAnnealingLR schedule", np.array(got), np.array(ref), atol=1e-5)
+    check("CosineAnnealingLR get_lr tracks step",
+          np.array([cl.get_lr()]), np.array([got[-1]]), atol=1e-9)
+
+
+def test_metrics():
+    print("\n=== metrics ===\n")
+    # 8 samples, binary, threshold 0.5
+    pr = np.array([0.9, 0.2, 0.8, 0.4, 0.6, 0.1, 0.7, 0.3])
+    yt = np.array([1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0])
+    P = tensor([8, 1], pr)
+    Y = tensor([8, 1], yt)
+
+    pred = (pr >= 0.5).astype(float)
+
+    # confusion matrix, rows = true class, columns = predicted class
+    cm = np.zeros((2, 2))
+    for t, q in zip(yt.astype(int), pred.astype(int)):
+        cm[t, q] += 1
+    check("confusion_matrix", arr(p.confusion_matrix(P, Y)), cm, atol=0)
+
+    check("accuracy", np.array([p.accuracy(P, Y)]),
+          np.array([np.mean(pred == yt)]), atol=1e-6)
+
+    # precision and recall are macro-averaged over both classes, so the
+    # reference averages the per-class figures rather than taking the
+    # positive class alone.
+    prec_c, rec_c = [], []
+    for c in range(2):
+        tp_c = cm[c, c]
+        fp_c = cm[:, c].sum() - tp_c
+        fn_c = cm[c, :].sum() - tp_c
+        prec_c.append(tp_c / (tp_c + fp_c) if tp_c + fp_c else 0.0)
+        rec_c.append(tp_c / (tp_c + fn_c) if tp_c + fn_c else 0.0)
+    pm, rm = float(np.mean(prec_c)), float(np.mean(rec_c))
+
+    check("precision (macro)", np.array([p.precision(P, Y)]), np.array([pm]), atol=1e-6)
+    check("recall (macro)",    np.array([p.recall(P, Y)]),    np.array([rm]), atol=1e-6)
+    # f1 here is the harmonic mean of the macro averages, not the mean of the
+    # per-class F1 scores; see the note in metrics.hpp
+    check("f1_score (of the macro averages)", np.array([p.f1_score(P, Y)]),
+          np.array([2 * pm * rm / (pm + rm)]), atol=1e-6)
+
+    # r2 on a regression target
+    yp = np.array([2.1, 3.9, 6.2, 7.8, 10.1])
+    yy = np.array([2.0, 4.0, 6.0, 8.0, 10.0])
+    ss_res = np.sum((yy - yp) ** 2)
+    ss_tot = np.sum((yy - yy.mean()) ** 2)
+    check("r2_score", np.array([p.r2_score(tensor([5, 1], yp), tensor([5, 1], yy))]),
+          np.array([1 - ss_res / ss_tot]), atol=1e-5)
+
+
+def test_wider_shapes():
+    print("\n=== larger shapes and batches ===\n")
+    # Linear with a bigger batch
+    fc = p.Linear(7, 5)
+    W, b = arr(fc.weights), arr(fc.bias)
+    x = spread(16 * 7).reshape(16, 7)
+    check("Linear batch 16", arr(fc.forward(tensor([16, 7], x))), x @ W + b, atol=1e-4)
+
+    # Conv2D with a real batch and several channels
+    cv = p.Conv2D(3, 4, 3, 1, 1)
+    k, bias = arr(cv.parameters()[0]), arr(cv.parameters()[1])
+    xi = spread(4 * 3 * 8 * 8).reshape(4, 3, 8, 8)
+    check("Conv2D batch 4, 3->4 channels, 8x8",
+          arr(cv.forward(tensor([4, 3, 8, 8], xi))),
+          conv2d_ref(xi, k, bias, 1, 1), atol=1e-3)
+
+    # recurrent layers with batch > 1 and a longer sequence
+    sig = lambda v: 1 / (1 + np.exp(-v))
+    rnn = p.RNN(4, 6)
+    Wx, Wh, rb = (arr(t) for t in rnn.parameters())
+    xs = spread(12 * 3 * 4).reshape(12, 3, 4)
+    h = np.zeros((3, 6)); ref = []
+    for t in range(12):
+        h = np.tanh(xs[t] @ Wx + h @ Wh + rb)
+        ref.append(h.copy())
+    check("RNN seq 12, batch 3",
+          arr(rnn.forward(tensor([12, 3, 4], xs))), np.stack(ref), atol=1e-4)
+
+    lstm = p.LSTM(4, 6)
+    Wxi, Wxf, Wxo, Wxg, Whi, Whf, Who, Whg, bi, bf, bo, bg =         (arr(t) for t in lstm.parameters())
+    h = np.zeros((3, 6)); c = np.zeros((3, 6)); ref = []
+    for t in range(12):
+        xt = xs[t]
+        i = sig(xt @ Wxi + h @ Whi + bi)
+        f = sig(xt @ Wxf + h @ Whf + bf)
+        o = sig(xt @ Wxo + h @ Who + bo)
+        g = np.tanh(xt @ Wxg + h @ Whg + bg)
+        c = f * c + i * g
+        h = o * np.tanh(c)
+        ref.append(h.copy())
+    check("LSTM seq 12, batch 3",
+          arr(lstm.forward(tensor([12, 3, 4], xs))), np.stack(ref), atol=1e-4)
+
+    # attention with 4 heads over a longer sequence
+    embed, heads, seq = 8, 4, 7
+    mha = p.MultiHeadAttention(embed, heads, True)
+    Wq, Wk, Wv, Wo = (arr(t) for t in (mha.W_q, mha.W_k, mha.W_v, mha.W_o))
+    xa = spread(seq * embed).reshape(seq, embed)
+    hd = embed // heads
+    q, k, v = xa @ Wq, xa @ Wk, xa @ Wv
+    out = np.zeros((seq, embed))
+    for hh in range(heads):
+        sl = slice(hh * hd, (hh + 1) * hd)
+        sc = q[:, sl] @ k[:, sl].T / np.sqrt(hd)
+        sc = np.where(np.triu(np.ones((seq, seq)), 1) > 0, -np.inf, sc)
+        wt = np.exp(sc - sc.max(axis=-1, keepdims=True))
+        wt = wt / wt.sum(axis=-1, keepdims=True)
+        out[:, sl] = wt @ v[:, sl]
+    check("MultiHeadAttention 4 heads, seq 7, causal",
+          arr(mha.forward(tensor([seq, embed], xa))), out @ Wo, atol=1e-4)
+
+
 def main():
     print("Forward-pass verification against numpy reference implementations")
     test_ops()
@@ -401,6 +589,9 @@ def main():
     test_losses()
     test_attention()
     test_optimizers()
+    test_rmsprop_and_clip()
+    test_metrics()
+    test_wider_shapes()
 
     print("\n%d comparisons, %d failed" % (CHECKS[0], len(FAILURES)))
     if FAILURES:
