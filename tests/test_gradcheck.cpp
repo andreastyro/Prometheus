@@ -5,6 +5,11 @@
 #include "ml/ops.hpp"
 #include "ml/loss.hpp"
 #include "ml/nn/linear.hpp"
+#include "ml/nn/nlp/gpt.hpp"
+#include "ml/nn/dropout.hpp"
+#include "ml/nn/activations.hpp"
+#include "ml/nn/sequential.hpp"
+#include "ml/nn/flatten.hpp"
 #include "ml/nn/groupnorm.hpp"
 #include "ml/nn/batchnorm.hpp"
 #include "ml/nn/nlp/layernorm.hpp"
@@ -220,6 +225,52 @@ int main() {
         auto xb = tin({3, 4});
         check("TransformerBlock", [&]{ return blk.forward(xb); },
               {blk.attn.W_o, blk.ff2.weights, xb});
+    }
+
+    printf("\n=== containers, activations and whole models ===\n");
+    {
+        // Flatten reinterprets the shape; the gradient must pass straight
+        // through. When this was detached it silently froze every convolution
+        // in the usual Conv2D -> Flatten -> Linear arrangement.
+        Flatten fl;
+        auto xf = tin({2, 1, 3, 3});
+        check("Flatten", [&]{ return fl.forward(xf); }, {xf});
+
+        // the realistic CNN path, end to end
+        Conv2D cv(1, 2, 3);
+        Flatten f2;
+        Linear  head(2 * 3 * 3, 2);
+        auto xi = tin({1, 1, 5, 5});
+        check("Conv2D -> Flatten -> Linear",
+              [&]{ return head.forward(f2.forward(cv.forward(xi))); },
+              {cv.parameters()[0], head.weights, xi});
+
+        // the Module wrappers around the activation ops
+        ReLU relu_m; Sigmoid sig_m; Tanh tanh_m; Softmax soft_m;
+        auto xa = tin({3, 4});
+        check("ReLU (Module)",    [&]{ return relu_m.forward(xa); }, {xa});
+        check("Sigmoid (Module)", [&]{ return sig_m.forward(xa);  }, {xa});
+        check("Tanh (Module)",    [&]{ return tanh_m.forward(xa); }, {xa});
+        check("Softmax (Module)", [&]{ return soft_m.forward(xa); }, {xa});
+
+        // Sequential must chain gradients through every child
+        Sequential seq({ new Linear(4, 6), new ReLU(), new Linear(6, 2) });
+        auto xs = tin({2, 4});
+        check("Sequential", [&]{ return seq.forward(xs); },
+              {seq.parameters()[0], seq.parameters()[2], xs});
+
+        // Dropout with p = 0 is deterministic, so it can be checked
+        Dropout drop(0.0f);
+        auto xd = tin({3, 4});
+        check("Dropout (p=0)", [&]{ return drop.forward(xd); }, {xd});
+
+        // the whole GPT model, not just its pieces
+        GPT gpt(16, 8, 8, 2, 1);
+        auto ids = make_shared<Tensor>(vector<int>{3});
+        ids->data[0] = 1; ids->data[1] = 5; ids->data[2] = 2;
+        GradCheckOptions few; few.max_points = 3;
+        check("GPT (whole model)", [&]{ return gpt.forward(ids); },
+              {gpt.tok_emb.weight, gpt.ln_f.parameters()[0]}, few);
     }
 
     return test_report();

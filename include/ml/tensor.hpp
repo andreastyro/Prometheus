@@ -118,6 +118,10 @@ public:
     TensorPtr to_float() const;
 };
 
+/// The library-wide RNG, seeded by Tensor::manual_seed. Layers that need
+/// randomness (Dropout) draw from this so a run can be reproduced.
+std::mt19937& prometheus_rng();
+
 /// Wire a new result tensor into the computation graph.
 /// Sets requires_grad=true on result, creates a GradNode with the given inputs,
 /// and returns the node so the caller can attach a backward_fn.

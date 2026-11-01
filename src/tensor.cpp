@@ -30,6 +30,8 @@ static mt19937& global_rng() {
     return gen;
 }
 
+mt19937& prometheus_rng() { return global_rng(); }
+
 void Tensor::manual_seed(unsigned int seed) {
     global_rng().seed(seed);
 }
