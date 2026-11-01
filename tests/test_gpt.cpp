@@ -2,6 +2,7 @@
 #include "ml/loss.hpp"
 #include <stdio.h>
 #include <cmath>
+#include <algorithm>
 
 using namespace std;
 
@@ -73,6 +74,35 @@ int main() {
         printf("no exception (unexpected)\n");
     } catch (const exception& e) {
         printf("caught: %s\n", e.what());
+    }
+
+    // === forward() vs forward_cached() agreement ===
+    // These are two independent implementations of the same maths: forward()
+    // builds an autograd graph out of library layers, forward_cached() is a
+    // hand-written array kernel for KV-cached decoding. If they drift apart,
+    // generation silently stops matching training, so pin them together here.
+    printf("\n=== forward vs forward_cached ===\n");
+    {
+        GPT g(64, 32, 16, 2, 2);
+
+        vector<int> ids = {3, 14, 15, 9, 26};
+        int S = (int)ids.size();
+        int V = g.vocab_size_;
+
+        auto seq = make_shared<Tensor>(vector<int>{S});
+        for (int i = 0; i < S; i++) seq->data[i] = (float)ids[i];
+        auto full = g.forward(seq);              // [S, V]
+
+        auto cache = g.make_kv_cache();
+        TensorPtr step;
+        for (int id : ids) step = g.forward_cached(id, cache);   // [V], last position
+
+        float maxdiff = 0.0f;
+        for (int v = 0; v < V; v++)
+            maxdiff = std::max(maxdiff, std::fabs(full->data[(S - 1) * V + v] - step->data[v]));
+
+        printf("max |forward - forward_cached| at last position: %.3e\n", maxdiff);
+        printf("agreement: %s (expected PASS, tolerance 1e-3)\n", maxdiff < 1e-3f ? "PASS" : "FAIL");
     }
 
     return 0;
