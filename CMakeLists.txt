@@ -185,6 +185,9 @@ target_link_libraries(test_gpt prometheus)
 
 # Run tests with `ctest` from the build dir. WORKING_DIRECTORY is the source
 # tree because several tests open fixtures by relative path (tests/test.csv).
+add_executable(test_gradcheck   ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gradcheck.cpp)
+target_link_libraries(test_gradcheck prometheus)
+
 enable_testing()
 add_test(NAME test_tensor COMMAND test_tensor WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME test_model COMMAND test_model WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
@@ -211,3 +214,4 @@ add_test(NAME test_grad_clip COMMAND test_grad_clip WORKING_DIRECTORY ${CMAKE_CU
 add_test(NAME test_adamw COMMAND test_adamw WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME test_checkpoint COMMAND test_checkpoint WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME test_gpt COMMAND test_gpt WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME test_gradcheck COMMAND test_gradcheck WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
