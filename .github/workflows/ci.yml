@@ -69,8 +69,15 @@ jobs:
       - name: Install build and test dependencies
         run: python -m pip install --upgrade pip pybind11 numpy setuptools wheel
 
-      - name: Build the extension in place
-        run: python setup.py build_ext --inplace
+      # Install rather than build in place: setup.py build_ext --inplace put the
+      # .so where the test scripts could not import it, so every Python test
+      # failed with ModuleNotFoundError. Installing puts it on sys.path
+      # regardless of the working directory.
+      - name: Install the package
+        run: python -m pip install . --no-build-isolation -v
+
+      - name: Confirm the module imports
+        run: python -c "import prometheus; print(prometheus.__file__)"
 
       # Recomputes every layer, op and loss in numpy and compares. This is the
       # only check that can catch a wrong forward pass, since gradcheck only

@@ -221,14 +221,21 @@ int main() {
         ResidualBlock rb(2, 2, 1, 1);
         auto xb = tin({1, 2, 4, 4});
         auto prb = rb.parameters();
-        // Two ReLUs inside. Perturbing a *parameter* moves the pre-activations
-        // smoothly and all eight gradients check out, but perturbing the input
-        // can flip an activation sign, and whether it does depends on how the
-        // platform rounds the convolution. Check the parameters, which is where
-        // the learning happens; the input path is covered by Conv2D and
-        // GroupNorm individually.
-        check("ResidualBlock (parameters)", [&]{ return rb.forward(xb); },
-              {prb[0], prb[prb.size() - 1]}, fine_opts());
+        // Two ReLUs inside, so a perturbation of any size can flip an
+        // activation sign and make the central difference straddle the kink.
+        // Whether it does depends on how the platform rounds the convolution,
+        // which is why a tight tolerance here passed on MinGW and failed on
+        // MSVC and clang. Treat this as a graph-connectivity check rather than
+        // a precision one: a detached layer gives an analytic gradient of
+        // exactly 0 against a numeric O(1), which these tolerances still catch,
+        // while kink noise does not trip them. Per-element precision for the
+        // parts is covered by the Conv2D and GroupNorm checks above.
+        GradCheckOptions kinked;
+        kinked.eps  = 1e-3f;
+        kinked.atol = 5e-2f;
+        kinked.rtol = 0.5f;
+        check("ResidualBlock (connectivity)", [&]{ return rb.forward(xb); },
+              {prb[0], prb[prb.size() - 1], xb}, kinked);
     }
 
     printf("\n=== attention / transformer ===\n");

@@ -483,7 +483,16 @@ TensorPtr abs_op(TensorPtr a) {
 // Sum all elements (axis=-1) or along a given axis
 TensorPtr sum(TensorPtr a, int axis) {
 
-    int rows = a->shape[0], cols = a->shape[1];
+    // A 1-D tensor has no shape[1]. Reading it unconditionally was an
+    // out-of-bounds vector access: harmless-looking in release builds, where it
+    // returns whatever follows the shape vector, and caught immediately by a
+    // debug standard library. mean(x, -1) and sum(x, -1) are legitimate on a
+    // 1-D tensor and must not need a column count at all.
+    const int rows = a->shape[0];
+    const int cols = (a->shape.size() > 1) ? a->shape[1] : 1;
+    if (axis != -1 && a->shape.size() < 2)
+        throw runtime_error("axis " + to_string(axis) +
+                            " requires a 2-D tensor; this tensor is 1-D");
 
     // global sum — returns a single value
     if (axis == -1) {
@@ -542,7 +551,16 @@ TensorPtr sum(TensorPtr a, int axis) {
 // Mean of all elements (axis=-1) or along a given axis
 TensorPtr mean(TensorPtr a, int axis) {
 
-    int rows = a->shape[0], cols = a->shape[1];
+    // A 1-D tensor has no shape[1]. Reading it unconditionally was an
+    // out-of-bounds vector access: harmless-looking in release builds, where it
+    // returns whatever follows the shape vector, and caught immediately by a
+    // debug standard library. mean(x, -1) and sum(x, -1) are legitimate on a
+    // 1-D tensor and must not need a column count at all.
+    const int rows = a->shape[0];
+    const int cols = (a->shape.size() > 1) ? a->shape[1] : 1;
+    if (axis != -1 && a->shape.size() < 2)
+        throw runtime_error("axis " + to_string(axis) +
+                            " requires a 2-D tensor; this tensor is 1-D");
 
     float count;
     if      (axis == -1) count = (float)a->num_el();
