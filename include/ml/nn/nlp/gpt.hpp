@@ -43,7 +43,7 @@ struct KVCache {
 // forward() output: [seq_len, vocab_size] raw logits (feed to cross_entropy_sparse_seq)
 //
 // forward_cached() processes one token at a time using a KVCache for O(n) inference.
-class GPT {
+class GPT : public Module {
 public:
     int vocab_size_;
     int max_seq_len_;
@@ -63,7 +63,7 @@ public:
         int num_heads, int num_layers, int ff_dim = 0, bool rope = false);
 
     // Full-sequence training forward. Returns [seq_len, vocab_size] logits.
-    TensorPtr forward(TensorPtr token_ids);
+    TensorPtr forward(TensorPtr token_ids) override;
 
     // Incremental inference forward — processes one token, updates cache.
     // Returns [vocab_size] logits for the new position.
@@ -74,5 +74,5 @@ public:
     KVCache make_kv_cache() const { return KVCache(num_layers_); }
 
     // All parameters — tok_emb.weight appears once (shared with lm_head).
-    std::vector<TensorPtr> parameters();
+    std::vector<TensorPtr> parameters() override;
 };

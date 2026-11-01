@@ -298,7 +298,7 @@ PYBIND11_MODULE(prometheus, m) {
         .def("reset",    &KVCache::reset)
         .def_readonly("past_len", &KVCache::past_len);
 
-    py::class_<GPT>(m, "GPT")
+    py::class_<GPT, Module, std::shared_ptr<GPT>>(m, "GPT")
         .def(py::init<int, int, int, int, int, int, bool>(),
              py::arg("vocab_size"), py::arg("max_seq_len"), py::arg("embed_dim"),
              py::arg("num_heads"), py::arg("num_layers"),
