@@ -285,14 +285,23 @@ PYBIND11_MODULE(prometheus, m) {
              py::arg("embed_dim"), py::arg("num_heads"),
              py::arg("causal") = false, py::arg("rope") = false)
         .def("forward",    &MultiHeadAttention::forward)
-        .def("parameters", &MultiHeadAttention::parameters);
+        .def("parameters", &MultiHeadAttention::parameters)
+        .def_readonly("W_q", &MultiHeadAttention::W_q)
+        .def_readonly("W_k", &MultiHeadAttention::W_k)
+        .def_readonly("W_v", &MultiHeadAttention::W_v)
+        .def_readonly("W_o", &MultiHeadAttention::W_o);
 
     py::class_<TransformerBlock, Module, std::shared_ptr<TransformerBlock>>(m, "TransformerBlock")
         .def(py::init<int, int, int, bool, bool>(),
              py::arg("embed_dim"), py::arg("num_heads"), py::arg("ff_dim"),
              py::arg("causal") = false, py::arg("rope") = false)
         .def("forward",    &TransformerBlock::forward)
-        .def("parameters", &TransformerBlock::parameters);
+        .def("parameters", &TransformerBlock::parameters)
+        .def_readonly("attn",  &TransformerBlock::attn)
+        .def_readonly("norm1", &TransformerBlock::norm1)
+        .def_readonly("norm2", &TransformerBlock::norm2)
+        .def_readonly("ff1",   &TransformerBlock::ff1)
+        .def_readonly("ff2",   &TransformerBlock::ff2);
 
     py::class_<KVCache>(m, "KVCache")
         .def("reset",    &KVCache::reset)
