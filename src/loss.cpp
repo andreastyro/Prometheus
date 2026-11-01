@@ -50,6 +50,11 @@ TensorPtr cross_entropy_loss(TensorPtr pred, TensorPtr target){
     return result;
 }
 
+// Huber loss, mean over elements:
+//   |r| <= delta :  0.5 * r^2          d/dpred = r / n
+//   |r| >  delta :  delta*(|r| - d/2)  d/dpred = delta * sign(r) / n
+// with r = pred - target. Previously this looped over raw floats and returned a
+// detached scalar, so pred never received a gradient.
 TensorPtr huber_loss(TensorPtr pred, TensorPtr target, float delta) {
     int n = pred->num_el();
     auto out = Tensor::zeros({1});
@@ -62,6 +67,21 @@ TensorPtr huber_loss(TensorPtr pred, TensorPtr target, float delta) {
             total += delta * (diff - 0.5f * delta);
     }
     out->data[0] = total / n;
+
+    if (pred->requires_grad) {
+        auto node = make_node(out, {pred});
+        node->backward_fn = [pred, target, out, delta, n]() {
+            const float g = out->grad[0] / n;
+            for (int i = 0; i < n; i++) {
+                const float r = pred->data[i] - target->data[i];
+                if (std::abs(r) <= delta)
+                    pred->grad[i] += g * r;
+                else
+                    pred->grad[i] += g * delta * ((r > 0.0f) ? 1.0f : -1.0f);
+            }
+        };
+    }
+
     return out;
 }
 
@@ -87,8 +107,14 @@ TensorPtr reconstruction_loss(TensorPtr input, TensorPtr output) {
     return sum(multiply(diff, diff), -1);
 }
 
+// Triplet loss: max(0, d(a,p)^2 - d(a,n)^2 + margin).
+// Inside the active region the gradients are
+//   d/d anchor[i]   =  2*(dp - dn)   with dp = a-p, dn = a-n
+//   d/d positive[i] = -2*dp
+//   d/d negative[i] =  2*dn
+// and all three are zero once the hinge is satisfied. Previously this returned
+// a detached scalar, so none of the three inputs received a gradient.
 TensorPtr contrastive_loss(TensorPtr anchor, TensorPtr positive, TensorPtr negative, float margin) {
-    // triplet loss: max(0, d(a,p)^2 - d(a,n)^2 + margin)
     int n = anchor->num_el();
     float d_pos = 0.0f, d_neg = 0.0f;
     for (int i = 0; i < n; i++) {
@@ -98,10 +124,29 @@ TensorPtr contrastive_loss(TensorPtr anchor, TensorPtr positive, TensorPtr negat
         d_neg += dn * dn;
     }
     auto out = Tensor::zeros({1});
-    out->data[0] = std::max(0.0f, d_pos - d_neg + margin);
+    const float raw = d_pos - d_neg + margin;
+    out->data[0] = std::max(0.0f, raw);
+
+    if (anchor->requires_grad || positive->requires_grad || negative->requires_grad) {
+        auto node = make_node(out, {anchor, positive, negative});
+        node->backward_fn = [anchor, positive, negative, out, raw, n]() {
+            if (raw <= 0.0f) return;            // hinge inactive, no gradient
+            const float g = out->grad[0];
+            for (int i = 0; i < n; i++) {
+                const float dp = anchor->data[i] - positive->data[i];
+                const float dn = anchor->data[i] - negative->data[i];
+                if (anchor->requires_grad)   anchor->grad[i]   += g * 2.0f * (dp - dn);
+                if (positive->requires_grad) positive->grad[i] -= g * 2.0f * dp;
+                if (negative->requires_grad) negative->grad[i] += g * 2.0f * dn;
+            }
+        };
+    }
+
     return out;
 }
 
+// L1 penalty: lambda * sum(|w|).  d/dw = lambda * sign(w)
+// (sign(0) is taken as 0, the usual subgradient choice).
 TensorPtr l1_regularization(std::vector<TensorPtr> params, float lambda_) {
     auto out = Tensor::zeros({1});
     float total = 0.0f;
@@ -109,9 +154,29 @@ TensorPtr l1_regularization(std::vector<TensorPtr> params, float lambda_) {
         for (float v : p->data)
             total += std::abs(v);
     out->data[0] = lambda_ * total;
+
+    bool any_grad = false;
+    for (auto& p : params) if (p->requires_grad) any_grad = true;
+
+    if (any_grad) {
+        auto node = make_node(out, params);
+        node->backward_fn = [params, out, lambda_]() {
+            const float g = out->grad[0];
+            for (auto& p : params) {
+                if (!p->requires_grad) continue;
+                for (int i = 0; i < p->num_el(); i++) {
+                    const float v = p->data[i];
+                    const float sign = (v > 0.0f) ? 1.0f : ((v < 0.0f) ? -1.0f : 0.0f);
+                    p->grad[i] += g * lambda_ * sign;
+                }
+            }
+        };
+    }
+
     return out;
 }
 
+// L2 penalty: lambda * sum(w^2).  d/dw = 2 * lambda * w
 TensorPtr l2_regularization(std::vector<TensorPtr> params, float lambda_) {
     auto out = Tensor::zeros({1});
     float total = 0.0f;
@@ -119,6 +184,22 @@ TensorPtr l2_regularization(std::vector<TensorPtr> params, float lambda_) {
         for (float v : p->data)
             total += v * v;
     out->data[0] = lambda_ * total;
+
+    bool any_grad = false;
+    for (auto& p : params) if (p->requires_grad) any_grad = true;
+
+    if (any_grad) {
+        auto node = make_node(out, params);
+        node->backward_fn = [params, out, lambda_]() {
+            const float g = out->grad[0];
+            for (auto& p : params) {
+                if (!p->requires_grad) continue;
+                for (int i = 0; i < p->num_el(); i++)
+                    p->grad[i] += g * 2.0f * lambda_ * p->data[i];
+            }
+        };
+    }
+
     return out;
 }
 

@@ -598,22 +598,48 @@ TensorPtr mean(TensorPtr a, int axis) {
 }
 
 // Max element — returns a scalar tensor
+// Max element. The gradient reaches only the element that attained the
+// maximum; every other element has no influence on the result. Ties go to the
+// first occurrence, matching the forward scan.
 TensorPtr max_op(TensorPtr a) {
     auto result = make_shared<Tensor>(vector<int>{1});
     result->data[0] = a->data[0];
+    int arg = 0;
     for (int i = 1; i < a->num_el(); i++)
-        if (a->data[i] > result->data[0])
+        if (a->data[i] > result->data[0]) {
             result->data[0] = a->data[i];
+            arg = i;
+        }
+
+    if (a->requires_grad) {
+        auto node = make_node(result, {a});
+        node->backward_fn = [a, result, arg]() {
+            a->grad[arg] += result->grad[0];
+        };
+    }
+
     return result;
 }
 
 // Min element — returns a scalar tensor
+// Min element — mirror of max_op, gradient reaches only the arg-min.
 TensorPtr min_op(TensorPtr a) {
     auto result = make_shared<Tensor>(vector<int>{1});
     result->data[0] = a->data[0];
+    int arg = 0;
     for (int i = 1; i < a->num_el(); i++)
-        if (a->data[i] < result->data[0])
+        if (a->data[i] < result->data[0]) {
             result->data[0] = a->data[i];
+            arg = i;
+        }
+
+    if (a->requires_grad) {
+        auto node = make_node(result, {a});
+        node->backward_fn = [a, result, arg]() {
+            a->grad[arg] += result->grad[0];
+        };
+    }
+
     return result;
 }
 

@@ -4,6 +4,7 @@
 #include "ml/tensor.hpp"
 #include "ml/ops.hpp"
 #include "ml/loss.hpp"
+#include "ml/optim/grad_scaler.hpp"
 #include "ml/nn/linear.hpp"
 #include "ml/nn/nlp/gpt.hpp"
 #include "ml/nn/dropout.hpp"
@@ -91,8 +92,12 @@ int main() {
 
     printf("\n=== losses ===\n");
     {
+        // target must genuinely differ from pred: with pred == target the loss
+        // sits exactly at its minimum, the true gradient is zero, and a
+        // detached loss passes the check for the wrong reason.
         auto pred = tin({3, 2});
-        auto targ = tin({3, 2}, false);
+        auto targ = make_shared<Tensor>(vector<int>{3, 2});
+        for (int i = 0; i < targ->num_el(); i++) targ->data[i] = -0.4f + 0.3f * i;
         check("mse_loss",            [&]{ return mse_loss(pred, targ); },            {pred});
         check("mae_loss",            [&]{ return mae_loss(pred, targ); },            {pred});
         check("huber_loss",          [&]{ return huber_loss(pred, targ); },          {pred});
@@ -115,7 +120,11 @@ int main() {
         check("cross_entropy_sparse_seq",
               [&]{ return cross_entropy_sparse_seq(lg, {0, 2, 4}); }, {lg});
 
-        auto a = tin({1, 3}), pos = tin({1, 3}), neg = tin({1, 3});
+        // three distinct points, and far enough apart to keep the hinge active
+        auto a   = tin({1, 3});
+        auto pos = make_shared<Tensor>(vector<int>{1, 3});
+        auto neg = make_shared<Tensor>(vector<int>{1, 3});
+        for (int i = 0; i < 3; i++) { pos->data[i] = -0.1f + 0.2f * i; neg->data[i] = 0.7f - 0.2f * i; }
         check("contrastive_loss",
               [&]{ return contrastive_loss(a, pos, neg); }, {a, pos, neg});
     }
@@ -271,6 +280,34 @@ int main() {
         GradCheckOptions few; few.max_points = 3;
         check("GPT (whole model)", [&]{ return gpt.forward(ids); },
               {gpt.tok_emb.weight, gpt.ln_f.parameters()[0]}, few);
+    }
+
+    printf("\n=== regularisers, reductions and the mixed-precision path ===\n");
+    {
+        auto w = tin({3, 3});
+        check("l1_regularization", [&]{ return l1_regularization({w}, 0.1f); }, {w});
+        check("l2_regularization", [&]{ return l2_regularization({w}, 0.1f); }, {w});
+
+        // max_op and min_op are piecewise linear: the gradient goes entirely to
+        // the element that attained the extremum. A tie makes the subgradient
+        // ambiguous (the analytic form picks the first occurrence, the central
+        // difference averages the two sides), so use strictly increasing data
+        // where the extremum is unique.
+        auto u = make_shared<Tensor>(vector<int>{3, 4});
+        for (int i = 0; i < u->num_el(); i++) u->data[i] = -0.5f + 0.17f * i;
+        u->requires_grad = true;
+        u->grad.assign(u->num_el(), 0.0f);
+        GradCheckOptions all_pts;
+        all_pts.max_points = 0;
+        check("max_op", [&]{ return max_op(u); }, {u}, all_pts);
+        check("min_op", [&]{ return min_op(u); }, {u}, all_pts);
+
+        // Scaling a loss for mixed precision must stay in the graph, otherwise
+        // backward() reaches nothing and training silently stops.
+        GradScaler gs(8.0f);
+        auto l = tin({1});
+        check("GradScaler::scale_loss",
+              [&]{ return gs.scale_loss(mean(multiply(l, l), -1)); }, {l});
     }
 
     return test_report();
