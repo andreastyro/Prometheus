@@ -19,6 +19,12 @@ TensorPtr mae_loss(TensorPtr pred, TensorPtr target){
 }
 
 TensorPtr bce_loss(TensorPtr pred, TensorPtr target){
+    // A saturated sigmoid reaches exactly 0.0f or 1.0f in float, which makes
+    // log(p) or log(1 - p) undefined (log_op throws). Clamp into (0, 1) first:
+    // this is the standard numerically-safe BCE and costs nothing in accuracy.
+    const float eps = 1e-7f;
+    pred = clip(pred, eps, 1.0f - eps);
+
     // y * log(p)
     auto log_p = log_op(pred);
     auto term1 = multiply(target, log_p);
