@@ -1,4 +1,5 @@
 #include "ml/tensor.hpp"
+#include "ml/utils/testing.hpp"
 #include "ml/nn/rnn/rnn.hpp"
 #include <stdio.h>
 
@@ -17,10 +18,11 @@ int main(){
     RNN rnn1(3, 4);
     auto [out1, hn1] = rnn1.forward(x1, nullptr);
     printf("input:  [5, 2, 3]\n");
-    printf("output: [%d, %d, %d] (expected [5, 2, 4])\n",
-        out1->shape[0], out1->shape[1], out1->shape[2]);
-    printf("h_n:    [%d, %d] (expected [2, 4])\n",
-        hn1->shape[0], hn1->shape[1]);
+    CHECK_NEAR("output dim 0", (double)(out1->shape[0]), 5, 0.0);
+CHECK_NEAR("output dim 1", (double)(out1->shape[1]), 2, 0.0);
+CHECK_NEAR("output dim 2", (double)(out1->shape[2]), 4, 0.0);
+    CHECK_NEAR("h_n dim 0", (double)(hn1->shape[0]), 2, 0.0);
+CHECK_NEAR("h_n dim 1", (double)(hn1->shape[1]), 4, 0.0);
 
     // === Values are bounded by tanh ===
     printf("\noutput values (expected in range [-1, 1]):\n");
@@ -36,14 +38,16 @@ int main(){
     printf("\n=== RNN with custom h0 ===\n");
     auto h0 = Tensor::ones({2, 4});
     auto [out2, hn2] = rnn1.forward(x1, h0);
-    printf("output: [%d, %d, %d] (expected [5, 2, 4])\n",
-        out2->shape[0], out2->shape[1], out2->shape[2]);
+    CHECK_NEAR("output dim 0", (double)(out2->shape[0]), 5, 0.0);
+CHECK_NEAR("output dim 1", (double)(out2->shape[1]), 2, 0.0);
+CHECK_NEAR("output dim 2", (double)(out2->shape[2]), 4, 0.0);
 
     // === Module interface (single arg) ===
     printf("\n=== RNN as Module ===\n");
     auto out3 = rnn1.forward(x1);
-    printf("output: [%d, %d, %d] (expected [5, 2, 4])\n",
-        out3->shape[0], out3->shape[1], out3->shape[2]);
+    CHECK_NEAR("output dim 0", (double)(out3->shape[0]), 5, 0.0);
+CHECK_NEAR("output dim 1", (double)(out3->shape[1]), 2, 0.0);
+CHECK_NEAR("output dim 2", (double)(out3->shape[2]), 4, 0.0);
 
-    return 0;
+    return test_report();
 }

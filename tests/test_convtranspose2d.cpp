@@ -1,4 +1,5 @@
 #include "ml/tensor.hpp"
+#include "ml/utils/testing.hpp"
 #include "ml/nn/vision/convtranspose2d.hpp"
 #include <stdio.h>
 
@@ -17,8 +18,10 @@ int main(){
     ConvTranspose2D ct1(1, 1, 2, 2);
     auto out1 = ct1.forward(x1);
     printf("input:  [1, 1, 4, 4]\n");
-    printf("output: [%d, %d, %d, %d] (expected [1, 1, 8, 8])\n",
-        out1->shape[0], out1->shape[1], out1->shape[2], out1->shape[3]);
+    CHECK_NEAR("output dim 0", (double)(out1->shape[0]), 1, 0.0);
+CHECK_NEAR("output dim 1", (double)(out1->shape[1]), 1, 0.0);
+CHECK_NEAR("output dim 2", (double)(out1->shape[2]), 8, 0.0);
+CHECK_NEAR("output dim 3", (double)(out1->shape[3]), 8, 0.0);
 
     // === Shape test: stride=1 ===
     // input: [1, 4, 6, 6], kernel=2, stride=1
@@ -29,8 +32,10 @@ int main(){
     ConvTranspose2D ct2(4, 8, 2, 1);
     auto out2 = ct2.forward(x2);
     printf("input:  [1, 4, 6, 6]\n");
-    printf("output: [%d, %d, %d, %d] (expected [1, 8, 7, 7])\n",
-        out2->shape[0], out2->shape[1], out2->shape[2], out2->shape[3]);
+    CHECK_NEAR("output dim 0", (double)(out2->shape[0]), 1, 0.0);
+CHECK_NEAR("output dim 1", (double)(out2->shape[1]), 8, 0.0);
+CHECK_NEAR("output dim 2", (double)(out2->shape[2]), 7, 0.0);
+CHECK_NEAR("output dim 3", (double)(out2->shape[3]), 7, 0.0);
 
     // === Backward test ===
     printf("\n=== ConvTranspose2D backward test ===\n");
@@ -50,5 +55,5 @@ int main(){
     for (int i = 0; i < x3->num_el(); i++)
         printf("  [%d]: %.4f\n", i, x3->grad[i]);
 
-    return 0;
+    return test_report();
 }

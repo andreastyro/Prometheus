@@ -1,4 +1,5 @@
 #include "ml/tensor.hpp"
+#include "ml/utils/testing.hpp"
 #include "ml/nn/vision/maxpool2d.hpp"
 #include "ml/nn/vision/avgpool2d.hpp"
 #include "ml/nn/vision/conv2d.hpp"
@@ -26,10 +27,11 @@ int main(){
     MaxPool2D pool1(2);
     auto out1 = pool1.forward(x1);
     printf("input:  [1, 1, 4, 4]\n");
-    printf("output: [%d, %d, %d, %d] (expected [1, 1, 2, 2])\n",
-        out1->shape[0], out1->shape[1], out1->shape[2], out1->shape[3]);
-    printf("values: %.0f %.0f %.0f %.0f (expected 6 4 8 7)\n",
-        out1->data[0], out1->data[1], out1->data[2], out1->data[3]);
+    CHECK_NEAR("output dim 0", (double)(out1->shape[0]), 1, 0.0);
+CHECK_NEAR("output dim 1", (double)(out1->shape[1]), 1, 0.0);
+CHECK_NEAR("output dim 2", (double)(out1->shape[2]), 2, 0.0);
+CHECK_NEAR("output dim 3", (double)(out1->shape[3]), 2, 0.0);
+    printf("values: %.0f %.0f %.0f %.0f (expected 6 4 8 7)\n", out1->data[0], out1->data[1], out1->data[2], out1->data[3]);
 
     // === Batch + channels test ===
     // input: [2, 3, 4, 4], kernel=2, stride=2
@@ -41,8 +43,10 @@ int main(){
     MaxPool2D pool2(2);
     auto out2 = pool2.forward(x2);
     printf("input:  [2, 3, 4, 4]\n");
-    printf("output: [%d, %d, %d, %d] (expected [2, 3, 2, 2])\n",
-        out2->shape[0], out2->shape[1], out2->shape[2], out2->shape[3]);
+    CHECK_NEAR("output dim 0", (double)(out2->shape[0]), 2, 0.0);
+CHECK_NEAR("output dim 1", (double)(out2->shape[1]), 3, 0.0);
+CHECK_NEAR("output dim 2", (double)(out2->shape[2]), 2, 0.0);
+CHECK_NEAR("output dim 3", (double)(out2->shape[3]), 2, 0.0);
 
     // === Backward test ===
     printf("\n=== MaxPool2D backward test ===\n");
@@ -86,7 +90,8 @@ int main(){
     printf("input:   [1, 1, 8, 8]\n");
     printf("conv:    [%d, %d, %d, %d]\n", conv_out->shape[0], conv_out->shape[1], conv_out->shape[2], conv_out->shape[3]);
     printf("pool:    [%d, %d, %d, %d]\n", pool_out->shape[0], pool_out->shape[1], pool_out->shape[2], pool_out->shape[3]);
-    printf("flatten: [%d, %d] (expected [1, 36])\n", flat_out->shape[0], flat_out->shape[1]);
+    CHECK_NEAR("flatten dim 0", (double)(flat_out->shape[0]), 1, 0.0);
+CHECK_NEAR("flatten dim 1", (double)(flat_out->shape[1]), 36, 0.0);
 
     // === AvgPool2D ===
     printf("\n=== AvgPool2D shape test ===\n");
@@ -103,12 +108,13 @@ int main(){
     AvgPool2D avgpool(2);
     auto out5 = avgpool.forward(x5);
     printf("input:  [1, 1, 4, 4]\n");
-    printf("output: [%d, %d, %d, %d] (expected [1, 1, 2, 2])\n",
-        out5->shape[0], out5->shape[1], out5->shape[2], out5->shape[3]);
+    CHECK_NEAR("output dim 0", (double)(out5->shape[0]), 1, 0.0);
+CHECK_NEAR("output dim 1", (double)(out5->shape[1]), 1, 0.0);
+CHECK_NEAR("output dim 2", (double)(out5->shape[2]), 2, 0.0);
+CHECK_NEAR("output dim 3", (double)(out5->shape[3]), 2, 0.0);
     // top-left window: (1+3+5+6)/4=3.75, top-right: (2+4+1+2)/4=2.25
     // bot-left: (3+1+2+8)/4=3.5,         bot-right: (4+7+5+3)/4=4.75
-    printf("values: %.2f %.2f %.2f %.2f (expected 3.75 2.25 3.50 4.75)\n",
-        out5->data[0], out5->data[1], out5->data[2], out5->data[3]);
+    printf("values: %.2f %.2f %.2f %.2f (expected 3.75 2.25 3.50 4.75)\n", out5->data[0], out5->data[1], out5->data[2], out5->data[3]);
 
     // === AvgPool2D backward ===
     printf("\n=== AvgPool2D backward test ===\n");
@@ -130,5 +136,5 @@ int main(){
         printf("\n");
     }
 
-    return 0;
+    return test_report();
 }

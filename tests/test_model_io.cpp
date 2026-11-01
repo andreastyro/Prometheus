@@ -3,7 +3,9 @@
 #include "ml/nn/sequential.hpp"
 #include "ml/nn/activations.hpp"
 #include "ml/utils/model_io.hpp"
+#include "ml/utils/testing.hpp"
 #include <stdio.h>
+#include <cstdio>
 
 using namespace std;
 
@@ -29,11 +31,11 @@ int main(){
     }
 
     // save
-    save("tests/assets/model.bin", params);
+    save("_test_model_io.bin", params);
     printf("\nSaved to tests/assets/model.bin\n");
 
     // load
-    auto loaded = load("tests/assets/model.bin");
+    auto loaded = load("_test_model_io.bin");
     printf("\n=== Loaded weights ===\n");
     for (int i = 0; i < loaded.size(); i++){
         printf("Param %d shape: [", i);

@@ -1,98 +1,115 @@
 #include "ml/tensor.hpp"
 #include "ml/data/dataloader.hpp"
+#include "ml/utils/testing.hpp"
 #include <stdio.h>
+#include <vector>
+#include <algorithm>
 
 using namespace std;
 
+// Sum of a tensor's data, used to assert a shuffle is a permutation: a
+// reordering preserves the sum, a duplicated or dropped sample does not.
+static double sum_of(TensorPtr t) {
+    double s = 0; for (float v : t->data) s += v; return s;
+}
+
 int main() {
+    Tensor::manual_seed(7);
 
-    // 6 samples, 2 features each
-    auto x = make_shared<Tensor>(
-        vector<int>{6, 2},
-        vector<float>{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
-    );
+    // 6 samples, 2 features: values 1..12, labels alternating 0/1
+    auto x = make_shared<Tensor>(vector<int>{6, 2},
+        vector<float>{1,2, 3,4, 5,6, 7,8, 9,10, 11,12});
+    auto y = make_shared<Tensor>(vector<int>{6, 1},
+        vector<float>{0, 1, 0, 1, 0, 1});
+    const double X_SUM = 78.0;   // 1+2+...+12
+    const double Y_SUM = 3.0;
 
-    // 6 samples, 1 label each
-    auto y = make_shared<Tensor>(
-        vector<int>{6, 1},
-        vector<float>{0, 1, 0, 1, 0, 1}
-    );
+    printf("=== no shuffle, batch_size=2 ===\n");
+    {
+        DataLoader loader(x, y, 2, false);
+        int batches = 0; double seen = 0;
+        vector<float> first;
+        while (loader.has_next()) {
+            auto [bx, by] = loader.next_batch();
+            if (batches == 0) first = bx->data;
+            CHECK_NEAR("batch x cols", bx->shape[1], 2, 0.0);
+            CHECK_NEAR("batch y cols", by->shape[1], 1, 0.0);
+            seen += sum_of(bx);
+            batches++;
+        }
+        CHECK_NEAR("6 samples / batch 2 -> 3 batches", batches, 3, 0.0);
+        CHECK_NEAR("every sample seen exactly once", seen, X_SUM, 1e-4);
+        CHECK_NEAR("unshuffled first batch starts at 1", first[0], 1.0, 0.0);
+        CHECK_NEAR("unshuffled first batch second row", first[2], 3.0, 0.0);
+    }
 
-    printf("=== No shuffle, batch_size=2 ===\n");
-    DataLoader loader(x, y, 2, false);
-    int batch = 0;
-    while (loader.has_next()) {
+    printf("\n=== ragged last batch, batch_size=4 ===\n");
+    {
+        DataLoader loader(x, y, 4, false);
+        vector<int> rows;
+        while (loader.has_next()) { auto [bx, by] = loader.next_batch(); rows.push_back(bx->shape[0]); }
+        CHECK_NEAR("batch count", (double)rows.size(), 2, 0.0);
+        CHECK_NEAR("first batch rows", rows[0], 4, 0.0);
+        CHECK_NEAR("last batch rows (remainder)", rows[1], 2, 0.0);
+    }
+
+    printf("\n=== shuffle is a permutation, not a corruption ===\n");
+    {
+        DataLoader loader(x, y, 6, true);
         auto [bx, by] = loader.next_batch();
-        printf("Batch %d | x rows=%d cols=%d | y rows=%d cols=%d\n",
-            ++batch, bx->shape[0], bx->shape[1], by->shape[0], by->shape[1]);
-        printf("  x: ");
-        for (float v : bx->data) printf("%.0f ", v);
-        printf("\n  y: ");
-        for (float v : by->data) printf("%.0f ", v);
-        printf("\n");
+        CHECK_NEAR("all 6 rows returned", bx->shape[0], 6, 0.0);
+        CHECK_NEAR("shuffled x preserves sum", sum_of(bx), X_SUM, 1e-4);
+        CHECK_NEAR("shuffled y preserves sum", sum_of(by), Y_SUM, 1e-4);
+        // feature pairs must stay intact: every row is (odd, odd+1)
+        bool pairs_intact = true;
+        for (int r = 0; r < 6; r++)
+            if (bx->data[r * 2 + 1] != bx->data[r * 2] + 1.0f) pairs_intact = false;
+        CHECK_TRUE("shuffle keeps each row's features together", pairs_intact);
     }
 
-    printf("\n=== Last batch smaller than batch_size (batch_size=4) ===\n");
-    DataLoader loader2(x, y, 4, false);
-    batch = 0;
-    while (loader2.has_next()) {
-        auto [bx, by] = loader2.next_batch();
-        printf("Batch %d | x rows=%d | y rows=%d\n", ++batch, bx->shape[0], by->shape[0]);
+    printf("\n=== reset replays from the start ===\n");
+    {
+        DataLoader loader(x, y, 3, false);
+        auto [b1x, b1y] = loader.next_batch();
+        vector<float> before = b1x->data;
+        loader.reset();
+        auto [b2x, b2y] = loader.next_batch();
+        CHECK_TRUE("same first batch after reset", before == b2x->data);
+        CHECK_TRUE("has_next() true after reset", loader.has_next());
     }
 
-    printf("\n=== Shuffle enabled ===\n");
-    DataLoader loader3(x, y, 6, true);
-    auto [bx, by] = loader3.next_batch();
-    printf("Shuffled x: ");
-    for (float v : bx->data) printf("%.0f ", v);
-    printf("\nShuffled y: ");
-    for (float v : by->data) printf("%.0f ", v);
-    printf("\n");
+    printf("\n=== data_split 70/30 ===\n");
+    {
+        auto x2 = make_shared<Tensor>(vector<int>{10, 2},
+            vector<float>{1,2, 3,4, 5,6, 7,8, 9,10, 11,12, 13,14, 15,16, 17,18, 19,20});
+        auto y2 = make_shared<Tensor>(vector<int>{10, 1},
+            vector<float>{0,1,0,1,0,1,0,1,0,1});
+        const double ALL = 210.0;   // 1+2+...+20
 
-    printf("\n=== Reset test ===\n");
-    DataLoader loader4(x, y, 3, false);
-    auto [b1x, b1y] = loader4.next_batch();
-    printf("Before reset, first batch x: ");
-    for (float v : b1x->data) printf("%.0f ", v);
-    loader4.reset();
-    auto [b2x, b2y] = loader4.next_batch();
-    printf("\nAfter reset, first batch x:  ");
-    for (float v : b2x->data) printf("%.0f ", v);
-    printf("\n");
+        DataSplit s = data_split(x2, y2, 0.7f, 0.0f, 0.3f, false);
+        CHECK_NEAR("x_train rows", s.x_train->shape[0], 7, 0.0);
+        CHECK_NEAR("x_test rows",  s.x_test->shape[0],  3, 0.0);
+        CHECK_NEAR("y_train rows", s.y_train->shape[0], 7, 0.0);
+        CHECK_NEAR("no sample lost", sum_of(s.x_train) + sum_of(s.x_test), ALL, 1e-4);
+        CHECK_NEAR("unshuffled train starts at 1", s.x_train->data[0], 1.0, 0.0);
+        CHECK_NEAR("unshuffled test starts at 15", s.x_test->data[0], 15.0, 0.0);
 
-    // 10 samples, 2 features
-    auto x2 = make_shared<Tensor>(
-        vector<int>{10, 2},
-        vector<float>{1,2, 3,4, 5,6, 7,8, 9,10, 11,12, 13,14, 15,16, 17,18, 19,20}
-    );
-    auto y2 = make_shared<Tensor>(
-        vector<int>{10, 1},
-        vector<float>{0,1,0,1,0,1,0,1,0,1}
-    );
+        printf("\n=== data_split 60/20/20 ===\n");
+        DataSplit t = data_split(x2, y2, 0.6f, 0.2f, 0.2f, false);
+        CHECK_NEAR("x_train rows", t.x_train->shape[0], 6, 0.0);
+        CHECK_NEAR("x_val rows",   t.x_val->shape[0],   2, 0.0);
+        CHECK_NEAR("x_test rows",  t.x_test->shape[0],  2, 0.0);
+        CHECK_NEAR("three-way split loses nothing",
+                   sum_of(t.x_train) + sum_of(t.x_val) + sum_of(t.x_test), ALL, 1e-4);
 
-    printf("\n=== Train/Test split (70/30) ===\n");
-    DataSplit split = data_split(x2, y2, 0.7f, 0.0f, 0.3f, false);
-    printf("x_train rows=%d | x_test rows=%d\n", split.x_train->shape[0], split.x_test->shape[0]);
-    printf("x_train: ");
-    for (float v : split.x_train->data) printf("%.0f ", v);
-    printf("\nx_test:  ");
-    for (float v : split.x_test->data) printf("%.0f ", v);
-    printf("\n");
+        printf("\n=== shuffled 60/20/20 ===\n");
+        DataSplit u = data_split(x2, y2, 0.6f, 0.2f, 0.2f, true);
+        CHECK_NEAR("shuffled x_train rows", u.x_train->shape[0], 6, 0.0);
+        CHECK_NEAR("shuffled x_val rows",   u.x_val->shape[0],   2, 0.0);
+        CHECK_NEAR("shuffled x_test rows",  u.x_test->shape[0],  2, 0.0);
+        CHECK_NEAR("shuffled split loses nothing",
+                   sum_of(u.x_train) + sum_of(u.x_val) + sum_of(u.x_test), ALL, 1e-4);
+    }
 
-    printf("\n=== Train/Val/Test split (60/20/20) ===\n");
-    DataSplit split2 = data_split(x2, y2, 0.6f, 0.2f, 0.2f, false);
-    printf("x_train rows=%d | x_val rows=%d | x_test rows=%d\n",
-        split2.x_train->shape[0], split2.x_val->shape[0], split2.x_test->shape[0]);
-
-    printf("\n=== Shuffled Train/Val/Test split (60/20/20) ===\n");
-    DataSplit split3 = data_split(x2, y2, 0.6f, 0.2f, 0.2f, true);
-    printf("x_train rows=%d: ", split3.x_train->shape[0]);
-    for (float v : split3.x_train->data) printf("%.0f ", v);
-    printf("\nx_val   rows=%d: ", split3.x_val->shape[0]);
-    for (float v : split3.x_val->data) printf("%.0f ", v);
-    printf("\nx_test  rows=%d: ", split3.x_test->shape[0]);
-    for (float v : split3.x_test->data) printf("%.0f ", v);
-    printf("\n");
-
-    return 0;
+    return test_report();
 }

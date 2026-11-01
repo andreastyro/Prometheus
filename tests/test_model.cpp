@@ -6,6 +6,8 @@
 #include "ml/nn/sequential.hpp"
 #include "ml/optim/adam.hpp"
 #include <stdio.h>
+#include "ml/utils/testing.hpp"
+#include <cmath>
 
 using namespace std;
 
@@ -35,6 +37,7 @@ int main() {
     Adam optimizer(model.parameters(), 0.01f);
 
     // --- Training loop: 10 steps ---
+    float first_loss = 0.0f, last_loss = 0.0f;
     printf("Training...\n");
     for (int step = 0; step < 100; step++) {
         optimizer.zero_grad();
@@ -45,8 +48,13 @@ int main() {
         loss->backward();
         optimizer.step();
 
+        if (step == 0) first_loss = loss->data[0];
+        last_loss = loss->data[0];
         printf("Step %d | Loss: %.4f\n", step + 1, loss->data[0]);
     }
+
+    CHECK_TRUE("Sequential: loss finite", std::isfinite(last_loss));
+    CHECK_TRUE("Sequential: loss decreased over 100 steps", last_loss < first_loss);
 
     // --- Final prediction ---
     printf("\nFinal predictions:\n");
@@ -83,5 +91,10 @@ int main() {
     auto out = l2.forward(relu.forward(l1.forward(input)));
     out->print();
 
-    return 0;
+    bool finite = true;
+    for (float v : out->data) if (!std::isfinite(v)) finite = false;
+    CHECK_TRUE("manual model: predictions finite", finite);
+    CHECK_NEAR("manual model: output rows", out->shape[0], input->shape[0], 0.0);
+
+    return test_report();
 }

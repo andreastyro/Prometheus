@@ -1,4 +1,5 @@
 #include "ml/tensor.hpp"
+#include "ml/utils/testing.hpp"
 #include "ml/nn/nlp/attention.hpp"
 #include <stdio.h>
 #include <cmath>
@@ -24,7 +25,8 @@ int main() {
     MultiHeadAttention mha(4, 2);
     auto out = mha.forward(x);
     printf("input:  [3, 4]\n");
-    printf("output: [%d, %d] (expected [3, 4])\n", out->shape[0], out->shape[1]);
+    CHECK_NEAR("output dim 0", (double)(out->shape[0]), 3, 0.0);
+CHECK_NEAR("output dim 1", (double)(out->shape[1]), 4, 0.0);
 
     printf("\n=== Output values are finite ===\n");
     printf("all finite: %s (expected true)\n", all_finite(out->data) ? "true" : "false");
@@ -33,7 +35,8 @@ int main() {
     auto x2 = make_shared<Tensor>(vector<int>{10, 4});
     for (int i = 0; i < x2->num_el(); i++) x2->data[i] = 0.01f * i;
     auto out2 = mha.forward(x2);
-    printf("output: [%d, %d] (expected [10, 4])\n", out2->shape[0], out2->shape[1]);
+    CHECK_NEAR("output dim 0", (double)(out2->shape[0]), 10, 0.0);
+CHECK_NEAR("output dim 1", (double)(out2->shape[1]), 4, 0.0);
 
     printf("\n=== Invalid num_heads throws ===\n");
     try {
@@ -63,10 +66,7 @@ int main() {
     printf("W_v has grad: %s (expected true)\n", has_nonzero_grad(mha2.W_v) ? "true" : "false");
     printf("W_o has grad: %s (expected true)\n", has_nonzero_grad(mha2.W_o) ? "true" : "false");
     printf("x  has grad: %s (expected true)\n",  has_nonzero_grad(x3)       ? "true" : "false");
-    printf("grads finite: %s (expected true)\n",
-        (all_finite(mha2.W_q->grad) && all_finite(mha2.W_k->grad) &&
-         all_finite(mha2.W_v->grad) && all_finite(mha2.W_o->grad) &&
-         all_finite(x3->grad)) ? "true" : "false");
+    printf("grads finite: %s (expected true)\n", (all_finite(mha2.W_q->grad) && all_finite(mha2.W_k->grad) && all_finite(mha2.W_v->grad) && all_finite(mha2.W_o->grad) && all_finite(x3->grad)) ? "true" : "false");
 
     // ── Causal mask backward ──────────────────────────────────────────────────
     printf("\n=== Causal attention backward ===\n");
@@ -80,10 +80,7 @@ int main() {
     outc->backward();
 
     printf("W_q has grad: %s (expected true)\n", has_nonzero_grad(causal.W_q) ? "true" : "false");
-    printf("grads finite: %s (expected true)\n",
-        (all_finite(causal.W_q->grad) && all_finite(causal.W_k->grad) &&
-         all_finite(causal.W_v->grad) && all_finite(causal.W_o->grad) &&
-         all_finite(xc->grad)) ? "true" : "false");
+    printf("grads finite: %s (expected true)\n", (all_finite(causal.W_q->grad) && all_finite(causal.W_k->grad) && all_finite(causal.W_v->grad) && all_finite(causal.W_o->grad) && all_finite(xc->grad)) ? "true" : "false");
 
-    return 0;
+    return test_report();
 }

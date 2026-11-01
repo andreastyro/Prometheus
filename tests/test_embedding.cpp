@@ -1,4 +1,5 @@
 #include "ml/tensor.hpp"
+#include "ml/utils/testing.hpp"
 #include "ml/nn/nlp/embedding.hpp"
 #include <stdio.h>
 
@@ -17,8 +18,9 @@ int main() {
 
     auto out = emb.forward(ids);
     printf("input:  [2, 3]\n");
-    printf("output: [%d, %d, %d] (expected [2, 3, 4])\n",
-        out->shape[0], out->shape[1], out->shape[2]);
+    CHECK_NEAR("output dim 0", (double)(out->shape[0]), 2, 0.0);
+CHECK_NEAR("output dim 1", (double)(out->shape[1]), 3, 0.0);
+CHECK_NEAR("output dim 2", (double)(out->shape[2]), 4, 0.0);
 
     // === Same token id produces same vector ===
     printf("\n=== Same id same vector ===\n");
@@ -29,15 +31,15 @@ int main() {
         float v2 = out->data[(1 * 3 + 2) * 4 + d]; // batch 1, token 2 (id=0)
         if (v1 != v2) { same = false; break; }
     }
-    printf("token id 0 gives same vector in both positions: %s (expected true)\n",
-        same ? "true" : "false");
+    printf("token id 0 gives same vector in both positions: %s (expected true)\n", same ? "true" : "false");
 
     // === Parameters ===
     printf("\n=== Parameters ===\n");
     auto params = emb.parameters();
     printf("param count: %zu (expected 1)\n", params.size());
     auto& w = params[0];
-    printf("weight shape: [%d, %d] (expected [5, 4])\n", w->shape[0], w->shape[1]);
+    CHECK_NEAR("weight shape dim 0", (double)(w->shape[0]), 5, 0.0);
+CHECK_NEAR("weight shape dim 1", (double)(w->shape[1]), 4, 0.0);
 
     // === Out of range throws ===
     printf("\n=== Out of range id ===\n");
@@ -50,5 +52,5 @@ int main() {
         printf("caught exception: %s\n", e.what());
     }
 
-    return 0;
+    return test_report();
 }

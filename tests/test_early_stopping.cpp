@@ -8,10 +8,13 @@
 #include "ml/utils/early_stopping.hpp"
 #include "ml/metrics/metrics.hpp"
 #include <stdio.h>
+#include "ml/utils/testing.hpp"
+#include <cmath>
 
 using namespace std;
 
 int main(){
+    Tensor::manual_seed(11);
 
     // 10 train samples
     auto x_train = make_shared<Tensor>(
@@ -47,6 +50,10 @@ int main(){
 
     printf("Training with early stopping (patience=5)...\n");
 
+    int    epochs_run = 0;
+    bool   stopped    = false;
+    float  last_val   = 0.0f;
+
     for (int epoch = 0; epoch < 100; epoch++){
         train_loader.reset();
 
@@ -68,11 +75,35 @@ int main(){
 
         printf("Epoch %d | Val Loss: %.4f\n", epoch + 1, val_loss->data[0]);
 
+        epochs_run = epoch + 1;
+        last_val   = val_loss->data[0];
+
         if (es.step(val_loss->data[0])){
             printf("Early stopping triggered at epoch %d\n", epoch + 1);
+            stopped = true;
             break;
         }
     }
 
-    return 0;
+    CHECK_TRUE("early stopping fired before the 100-epoch cap", stopped);
+    CHECK_TRUE("ran more epochs than the patience of 5", epochs_run > 5);
+    CHECK_TRUE("stopped before the cap", epochs_run < 100);
+    CHECK_TRUE("validation loss is finite", std::isfinite(last_val));
+
+    // patience semantics: a monotonically worsening loss must stop in
+    // exactly patience+1 steps, and an improving one must never stop.
+    {
+        EarlyStopping worse(3, 0.0f);
+        int n = 0; bool fired = false;
+        for (float v = 1.0f; n < 20; v += 1.0f) { n++; if (worse.step(v)) { fired = true; break; } }
+        CHECK_TRUE("worsening loss triggers stop", fired);
+        CHECK_NEAR("stops after patience+1 worsening steps", n, 4, 0.0);
+
+        EarlyStopping better(3, 0.0f);
+        bool fired2 = false;
+        for (float v = 10.0f; v > 0.0f; v -= 1.0f) if (better.step(v)) fired2 = true;
+        CHECK_TRUE("improving loss never triggers stop", !fired2);
+    }
+
+    return test_report();
 }

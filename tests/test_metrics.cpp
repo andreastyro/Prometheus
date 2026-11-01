@@ -1,4 +1,5 @@
 #include "ml/tensor.hpp"
+#include "ml/utils/testing.hpp"
 #include "ml/metrics/metrics.hpp"
 #include "ml/nn/linear.hpp"
 #include "ml/nn/activations.hpp"
@@ -21,7 +22,7 @@ int main(){
     );
 
     printf("=== Binary Classification ===\n");
-    printf("accuracy:  %.4f (expected ~0.8)\n", accuracy(bin_pred, bin_target));
+    CHECK_NEAR("accuracy", (double)(accuracy(bin_pred, bin_target)), 0.8, 5e-2);
     printf("precision: %.4f\n", precision(bin_pred, bin_target));
     printf("recall:    %.4f\n", recall(bin_pred, bin_target));
     printf("f1:        %.4f\n", f1_score(bin_pred, bin_target));
@@ -53,7 +54,7 @@ int main(){
     );
 
     printf("\n=== Multi-class Classification ===\n");
-    printf("accuracy:  %.4f (expected 0.75)\n", accuracy(mc_pred, mc_target));
+    CHECK_NEAR("accuracy", (double)(accuracy(mc_pred, mc_target)), 0.75, 1e-3);
     printf("precision: %.4f\n", precision(mc_pred, mc_target));
     printf("recall:    %.4f\n", recall(mc_pred, mc_target));
     printf("f1:        %.4f\n", f1_score(mc_pred, mc_target));
@@ -100,5 +101,5 @@ int main(){
         printf("%.0f ", labels->data[i]);
     printf("\n");
 
-    return 0;
+    return test_report();
 }

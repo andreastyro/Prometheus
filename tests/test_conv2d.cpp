@@ -1,4 +1,5 @@
 #include "ml/tensor.hpp"
+#include "ml/utils/testing.hpp"
 #include "ml/nn/vision/conv2d.hpp"
 #include "ml/nn/flatten.hpp"
 #include "ml/autograd.hpp"
@@ -19,8 +20,10 @@ int main(){
     Conv2D conv1(1, 2, 3);
     auto out1 = conv1.forward(x1);
     printf("input:  [1, 1, 5, 5]\n");
-    printf("output: [%d, %d, %d, %d] (expected [1, 2, 3, 3])\n",
-        out1->shape[0], out1->shape[1], out1->shape[2], out1->shape[3]);
+    CHECK_NEAR("output dim 0", (double)(out1->shape[0]), 1, 0.0);
+CHECK_NEAR("output dim 1", (double)(out1->shape[1]), 2, 0.0);
+CHECK_NEAR("output dim 2", (double)(out1->shape[2]), 3, 0.0);
+CHECK_NEAR("output dim 3", (double)(out1->shape[3]), 3, 0.0);
 
     // === Conv2D with padding ===
     // input: [1, 1, 5, 5], kernel=3, padding=1
@@ -29,8 +32,10 @@ int main(){
     Conv2D conv2(1, 2, 3, 1, 1);
     auto out2 = conv2.forward(x1);
     printf("input:  [1, 1, 5, 5]\n");
-    printf("output: [%d, %d, %d, %d] (expected [1, 2, 5, 5])\n",
-        out2->shape[0], out2->shape[1], out2->shape[2], out2->shape[3]);
+    CHECK_NEAR("output dim 0", (double)(out2->shape[0]), 1, 0.0);
+CHECK_NEAR("output dim 1", (double)(out2->shape[1]), 2, 0.0);
+CHECK_NEAR("output dim 2", (double)(out2->shape[2]), 5, 0.0);
+CHECK_NEAR("output dim 3", (double)(out2->shape[3]), 5, 0.0);
 
     // === Conv2D with stride=2 ===
     // input: [1, 1, 5, 5], kernel=3, stride=2
@@ -39,8 +44,10 @@ int main(){
     Conv2D conv3(1, 2, 3, 2, 0);
     auto out3 = conv3.forward(x1);
     printf("input:  [1, 1, 5, 5]\n");
-    printf("output: [%d, %d, %d, %d] (expected [1, 2, 2, 2])\n",
-        out3->shape[0], out3->shape[1], out3->shape[2], out3->shape[3]);
+    CHECK_NEAR("output dim 0", (double)(out3->shape[0]), 1, 0.0);
+CHECK_NEAR("output dim 1", (double)(out3->shape[1]), 2, 0.0);
+CHECK_NEAR("output dim 2", (double)(out3->shape[2]), 2, 0.0);
+CHECK_NEAR("output dim 3", (double)(out3->shape[3]), 2, 0.0);
 
     // === Batch test ===
     // input: [4, 3, 8, 8] — 4 samples, 3 channels (RGB), 8x8
@@ -51,16 +58,18 @@ int main(){
     Conv2D conv4(3, 16, 3);
     auto out4 = conv4.forward(x2);
     printf("input:  [4, 3, 8, 8]\n");
-    printf("output: [%d, %d, %d, %d] (expected [4, 16, 6, 6])\n",
-        out4->shape[0], out4->shape[1], out4->shape[2], out4->shape[3]);
+    CHECK_NEAR("output dim 0", (double)(out4->shape[0]), 4, 0.0);
+CHECK_NEAR("output dim 1", (double)(out4->shape[1]), 16, 0.0);
+CHECK_NEAR("output dim 2", (double)(out4->shape[2]), 6, 0.0);
+CHECK_NEAR("output dim 3", (double)(out4->shape[3]), 6, 0.0);
 
     // === Conv2D + Flatten ===
     // output of conv4 is [4, 16, 6, 6] -> flatten to [4, 576]
     printf("\n=== Conv2D + Flatten ===\n");
     Flatten flatten;
     auto flat = flatten.forward(out4);
-    printf("after flatten: [%d, %d] (expected [4, 576])\n",
-        flat->shape[0], flat->shape[1]);
+    CHECK_NEAR("after flatten dim 0", (double)(flat->shape[0]), 4, 0.0);
+CHECK_NEAR("after flatten dim 1", (double)(flat->shape[1]), 576, 0.0);
 
     // === Backward test ===
     // input: [1, 1, 3, 3], 1 filter, kernel=2
@@ -92,5 +101,5 @@ int main(){
     for (int i = 0; i < x3->num_el(); i++)
         printf("  [%d]: %.4f\n", i, x3->grad[i]);
 
-    return 0;
+    return test_report();
 }

@@ -1,4 +1,5 @@
 #include "ml/tensor.hpp"
+#include "ml/utils/testing.hpp"
 #include "ml/nn/groupnorm.hpp"
 #include <stdio.h>
 #include <cmath>
@@ -15,8 +16,9 @@ int main() {
     GroupNorm gn(2, 4);
     auto out = gn.forward(x);
     printf("input:  [2, 4, 3]\n");
-    printf("output: [%d, %d, %d] (expected [2, 4, 3])\n",
-        out->shape[0], out->shape[1], out->shape[2]);
+    CHECK_NEAR("output dim 0", (double)(out->shape[0]), 2, 0.0);
+CHECK_NEAR("output dim 1", (double)(out->shape[1]), 4, 0.0);
+CHECK_NEAR("output dim 2", (double)(out->shape[2]), 3, 0.0);
 
     // === Each group in each batch should have mean~0 ===
     // group 0 of batch 0: channels 0-1, 3 spatial = 6 values
@@ -41,7 +43,7 @@ int main() {
     printf("\n=== Parameters ===\n");
     auto params = gn.parameters();
     printf("param count: %zu (expected 2)\n", params.size());
-    printf("gamma shape: [%d] (expected [4])\n", params[0]->shape[0]);
+    CHECK_NEAR("gamma shape dim 0", (double)(params[0]->shape[0]), 4, 0.0);
 
-    return 0;
+    return test_report();
 }
