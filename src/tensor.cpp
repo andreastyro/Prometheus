@@ -22,13 +22,23 @@ void Tensor::print() const {
 }
 
 // Random normal values (mean=0, std=1)
+// One generator for the whole library, so results are reproducible after
+// manual_seed(). Previously randn() built a fresh mt19937 from random_device on
+// every call, which made every run differ and every weight init unrepeatable.
+static mt19937& global_rng() {
+    static mt19937 gen(random_device{}());
+    return gen;
+}
+
+void Tensor::manual_seed(unsigned int seed) {
+    global_rng().seed(seed);
+}
+
 TensorPtr Tensor::randn(vector<int> shape) {
     auto t = make_shared<Tensor>(shape);
-    random_device rd;                        // seed from hardware
-    mt19937 gen(rd());                       // mersenne twister generator
     normal_distribution<float> dist(0.0f, 1.0f); // mean=0, std=1
     for (float& x : t->data)
-        x = dist(gen);
+        x = dist(global_rng());
     return t;
 }
 

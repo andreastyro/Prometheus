@@ -83,6 +83,7 @@ PYBIND11_MODULE(prometheus, m) {
         .def_static("zeros", &Tensor::zeros)
         .def_static("ones",  &Tensor::ones)
         .def_static("randn", &Tensor::randn)
+        .def_static("manual_seed", &Tensor::manual_seed, py::arg("seed"))
         // numpy interop
         .def("numpy", [](TensorPtr t) {
             std::vector<py::ssize_t> shape(t->shape.begin(), t->shape.end());

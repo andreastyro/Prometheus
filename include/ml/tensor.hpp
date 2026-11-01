@@ -92,6 +92,10 @@ public:
     /// Used to initialise weights — random breaks symmetry so neurons learn different things.
     static TensorPtr randn(std::vector<int> shape);
 
+    /// Seed the library-wide RNG so randn() (and therefore weight init)
+    /// is reproducible across runs.
+    static void manual_seed(unsigned int seed);
+
     /// Swap rows and columns — shape {3, 2} becomes {2, 3}. 2D only.
     TensorPtr transpose() const;
 
