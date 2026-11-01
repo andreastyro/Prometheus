@@ -754,3 +754,28 @@ TensorPtr reshape_op(TensorPtr a, std::vector<int> new_shape) {
 
     return result;
 }
+
+TensorPtr transpose_op(TensorPtr a) {
+    if (a->shape.size() != 2)
+        throw runtime_error("transpose_op: only supported for 2D tensors");
+
+    int rows = a->shape[0], cols = a->shape[1];
+    auto result = make_shared<Tensor>(vector<int>{cols, rows});
+
+    for (int i = 0; i < rows; i++)
+        for (int j = 0; j < cols; j++)
+            result->data[j * rows + i] = a->data[i * cols + j];
+
+    if (a->requires_grad) {
+        auto node = make_node(result, {a});
+
+        // grad_a[i, j] += grad_result[j, i]
+        node->backward_fn = [a, result, rows, cols]() {
+            for (int i = 0; i < rows; i++)
+                for (int j = 0; j < cols; j++)
+                    a->grad[i * cols + j] += result->grad[j * rows + i];
+        };
+    }
+
+    return result;
+}

@@ -88,3 +88,8 @@ TensorPtr gelu(TensorPtr a);
 /// Gradient-tracking reshape. Returns a new tensor with the given shape
 /// but the same element count; gradients flow back through the reshape.
 TensorPtr reshape_op(TensorPtr a, std::vector<int> new_shape);
+
+/// Gradient-tracking 2D transpose. Returns a new [cols, rows] tensor.
+/// Tensor::transpose() is the non-differentiable equivalent: it detaches,
+/// so it cannot be used inside a forward pass you intend to backprop through.
+TensorPtr transpose_op(TensorPtr a);

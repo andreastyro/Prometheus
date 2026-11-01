@@ -115,6 +115,7 @@ PYBIND11_MODULE(prometheus, m) {
     m.def("tanh_op",       &tanh_op);
     m.def("softmax",       &softmax);
     m.def("reshape_op",    &reshape_op, py::arg("a"), py::arg("new_shape"));
+    m.def("transpose_op",  &transpose_op, py::arg("a"));
     m.def("log_op",        &log_op);
     m.def("exp_op",        &exp_op);
     m.def("pow_op",        &pow_op);
