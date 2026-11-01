@@ -15,3 +15,6 @@ test_viz.html
 # cmake at it with -DOPENBLAS_ROOT=/path/to/openblas
 openblas/
 openblas.zip
+
+# scratch files written by the test binaries
+_test_*.bin

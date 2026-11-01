@@ -32,7 +32,7 @@ int main(){
 
     // save
     save("_test_model_io.bin", params);
-    printf("\nSaved to tests/assets/model.bin\n");
+    printf("\nSaved to _test_model_io.bin\n");
 
     // load
     auto loaded = load("_test_model_io.bin");
