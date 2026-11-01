@@ -88,4 +88,9 @@ setup(
     name="prometheus",
     version="0.1.0",
     ext_modules=[ext],
+    # prometheus_onnx.py sits beside setup.py and provides save_onnx(). It was
+    # not listed here, so pip install gave users the extension but not the
+    # exporter, and `import prometheus_onnx` failed anywhere outside the
+    # source tree.
+    py_modules=["prometheus_onnx"],
 )
