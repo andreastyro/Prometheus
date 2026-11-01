@@ -11,8 +11,8 @@ cl100k_base tokenizer is still used for encoding / decoding, preserving
 compatibility with the GPT-4 token space.
 
 Architecture:
-    text → cl100k_base → token_ids → remap → Embedding(local_vocab, EMBED)
-         → LSTM(EMBED, HIDDEN) → Linear(HIDDEN, local_vocab) → next-token
+    text -> cl100k_base -> token_ids -> remap -> Embedding(local_vocab, EMBED)
+         -> LSTM(EMBED, HIDDEN) -> Linear(HIDDEN, local_vocab) -> next-token
 
 Demonstrates:
     - cl100k_base tokenizer (GPT-4 tokenizer, 100,277 tokens)
@@ -62,16 +62,16 @@ CORPUS_TEXT = (
 raw_ids = enc.encode(CORPUS_TEXT)
 
 # ── Dense vocab remap ──────────────────────────────────────────────────────────
-# Only keep the tokens that actually appear. Maps cl100k IDs → local 0..N-1.
+# Only keep the tokens that actually appear. Maps cl100k IDs -> local 0..N-1.
 # This keeps the embedding table and output head small without changing the
 # tokenizer — nanoGPT uses the same trick.
 unique_ids   = sorted(set(raw_ids))
-local_to_gpt = unique_ids                          # local_id → cl100k id
+local_to_gpt = unique_ids                          # local_id -> cl100k id
 gpt_to_local = {g: l for l, g in enumerate(local_to_gpt)}
 token_ids    = [gpt_to_local[i] for i in raw_ids]
 VOCAB        = len(unique_ids)
 
-print(f"corpus: {len(CORPUS_TEXT)} chars → {len(token_ids)} tokens")
+print(f"corpus: {len(CORPUS_TEXT)} chars -> {len(token_ids)} tokens")
 print(f"cl100k vocab: {enc.n_vocab:,}  |  corpus vocab: {VOCAB} unique tokens")
 
 def decode_local(local_ids):
@@ -87,11 +87,11 @@ print(f"chunks: {len(chunks)} × {CHUNK} tokens")
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def token_tensor(tid):
-    """Single local token ID → [1, 1] tensor for Embedding lookup."""
+    """Single local token ID -> [1, 1] tensor for Embedding lookup."""
     return p.Tensor([1, 1], [float(tid)])
 
 def target_onehot(tid):
-    """Single local token ID → one-hot [1, VOCAB]."""
+    """Single local token ID -> one-hot [1, VOCAB]."""
     flat = [0.0] * VOCAB
     flat[tid] = 1.0
     return p.Tensor([1, VOCAB], flat)

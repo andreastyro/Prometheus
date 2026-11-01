@@ -373,7 +373,9 @@ PYBIND11_MODULE(prometheus, m) {
     py::class_<PySequential>(m, "Sequential")
         .def(py::init<py::list>())
         .def("forward",    &PySequential::forward)
-        .def("parameters", &PySequential::parameters);
+        .def("parameters", &PySequential::parameters)
+        .def_readonly("layers", &PySequential::held,
+                      "The child Modules in order, so model.layers can be passed to model_summary or the ONNX exporter without keeping a parallel list.");
 
     // -------------------------------------------------------------------------
     // Optimizers

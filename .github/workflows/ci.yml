@@ -109,3 +109,73 @@ jobs:
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: ctest --test-dir build-san --output-on-failure
 
+  # ── Every matmul backend compared against naive reference loops ───────────
+  # The BLAS calls pass explicit leading dimensions and transpose flags; a
+  # mistake there is correct for square matrices and silently wrong for
+  # rectangular ones. Nothing exercised these paths before.
+  backends:
+    name: matmul backend (${{ matrix.backend }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [tiled, openmp, openblas]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OpenBLAS
+        if: matrix.backend == 'openblas'
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+
+      - name: Configure
+        run: |
+          case "${{ matrix.backend }}" in
+            tiled)    FLAGS="" ;;
+            openmp)   FLAGS="-DUSE_OPENMP=ON" ;;
+            openblas) FLAGS="-DUSE_OPENBLAS=ON" ;;
+          esac
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release $FLAGS
+
+      - name: Build
+        run: cmake --build build
+
+      # the whole suite, not just the backend test: a wrong gemm corrupts
+      # every layer that multiplies matrices
+      - name: Run tests
+        run: ctest --test-dir build --output-on-failure
+
+  # ── Examples, so they cannot rot silently ────────────────────────────────
+  examples:
+    name: Examples and ONNX export
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip pybind11 numpy setuptools wheel onnx
+          python -m pip install . --no-build-isolation
+
+      - name: Run the self-contained examples
+        run: |
+          for f in xor_example regression binary_classifier sentiment_rnn mnist_linear demo; do
+            echo "--- $f ---"
+            python "examples/$f.py" > /dev/null
+          done
+
+      - name: Export to ONNX and validate with the onnx checker
+        run: |
+          python - <<'PY'
+          import onnx, prometheus as p
+          from prometheus_onnx import save_onnx
+          m = p.Sequential([p.Linear(2, 8), p.ReLU(), p.Linear(8, 1), p.Sigmoid()])
+          save_onnx(m.layers, input_shape=[1, 2], path="ci.onnx")
+          onnx.checker.check_model(onnx.load("ci.onnx"))
+          print("onnx model is valid")
+          PY

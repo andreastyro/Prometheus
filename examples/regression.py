@@ -53,8 +53,8 @@ y_train = make_tensor([y_norm[i] for i in train_idx])
 X_val   = make_tensor([X_raw[i]  for i in val_idx])
 y_val   = make_tensor([y_norm[i] for i in val_idx])
 
-print(f"dataset: {n_train} train  {len(val_idx)} val  |  5 features → 1 target")
-print(f"noise floor R² ≈ {1 - (0.3/y_std)**2:.3f}  (limit set by noise in data)")
+print(f"dataset: {n_train} train  {len(val_idx)} val  |  5 features -> 1 target")
+print(f"noise floor R² ~= {1 - (0.3/y_std)**2:.3f}  (limit set by noise in data)")
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 layers = [
