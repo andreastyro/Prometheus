@@ -1,5 +1,6 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <pybind11/functional.h>
 #include <pybind11/numpy.h>
 
 #include "ml/tensor.hpp"
@@ -23,6 +24,8 @@
 #include "ml/nn/nlp/embedding.hpp"
 #include "ml/nn/nlp/layernorm.hpp"
 #include "ml/nn/groupnorm.hpp"
+#include "ml/nn/batchnorm.hpp"
+#include "ml/utils/gradcheck.hpp"
 #include "ml/nn/nlp/attention.hpp"
 #include "ml/nn/nlp/transformer.hpp"
 #include "ml/nn/nlp/positional_encoding.hpp"
@@ -117,6 +120,31 @@ PYBIND11_MODULE(prometheus, m) {
     m.def("softmax",       &softmax);
     m.def("reshape_op",    &reshape_op, py::arg("a"), py::arg("new_shape"));
     m.def("transpose_op",  &transpose_op, py::arg("a"));
+
+    // gradcheck: numeric gradient verification, in the spirit of
+    // torch.autograd.gradcheck. Returns a dict so a failing check can report
+    // which element disagreed and by how much.
+    m.def("gradcheck",
+          [](std::function<TensorPtr()> forward, std::vector<TensorPtr> inputs,
+             float eps, float atol, float rtol, int max_points, bool verbose) {
+              GradCheckOptions o;
+              o.eps = eps; o.atol = atol; o.rtol = rtol;
+              o.max_points = max_points; o.verbose = verbose;
+              GradCheckResult r = gradcheck(forward, inputs, o);
+              py::dict d;
+              d["passed"]      = r.passed;
+              d["checked"]     = r.checked;
+              d["failed"]      = r.failed;
+              d["max_abs_err"] = r.max_abs_err;
+              d["report"]      = r.report;
+              return d;
+          },
+          py::arg("forward"), py::arg("inputs"),
+          py::arg("eps") = 1e-2f, py::arg("atol") = 1e-5f, py::arg("rtol") = 2e-2f,
+          py::arg("max_points") = 4, py::arg("verbose") = false,
+          "Compare analytical gradients against central finite differences. "
+          "forward: callable returning a Tensor; inputs: list of Tensors to check. "
+          "Returns {passed, checked, failed, max_abs_err, report}.");
     m.def("log_op",        &log_op);
     m.def("exp_op",        &exp_op);
     m.def("pow_op",        &pow_op);
@@ -280,6 +308,13 @@ PYBIND11_MODULE(prometheus, m) {
              py::arg("num_groups"), py::arg("num_channels"), py::arg("eps") = 1e-5f)
         .def("forward",    &GroupNorm::forward)
         .def("parameters", &GroupNorm::parameters);
+
+    py::class_<BatchNorm, Module, std::shared_ptr<BatchNorm>>(m, "BatchNorm")
+        .def(py::init<int, float, bool>(),
+             py::arg("num_features"), py::arg("eps") = 1e-5f,
+             py::arg("training") = true)
+        .def("forward",    &BatchNorm::forward)
+        .def("parameters", &BatchNorm::parameters);
 
     py::class_<MultiHeadAttention, Module, std::shared_ptr<MultiHeadAttention>>(m, "MultiHeadAttention")
         .def(py::init<int, int, bool, bool>(),

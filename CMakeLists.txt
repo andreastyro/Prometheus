@@ -44,12 +44,14 @@ set(SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/nlp/embedding.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/nlp/layernorm.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/groupnorm.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/batchnorm.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/nlp/attention.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/nlp/positional_encoding.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/nlp/transformer.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/nlp/gpt.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/optim/adamw.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/utils/grad_clip.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/utils/gradcheck.cpp
 )
 
 # ── Build the library ─────────────────────────────────────────────────────────
