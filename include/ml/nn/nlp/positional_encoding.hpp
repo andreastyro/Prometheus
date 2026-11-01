@@ -17,8 +17,10 @@
 // Together, every position gets a unique combination of values — like binary
 // digits, but smooth and differentiable.
 //
-// This is NOT a Module — it has no learnable parameters and is not in the
-// computation graph. Call forward() to add the encoding to your embeddings.
+// This is NOT a Module — it has no learnable parameters. It IS part of the
+// computation graph: the encoding is a constant, so forward() passes gradients
+// straight through to its input. Call forward() to add the encoding to your
+// embeddings.
 //
 // Input:  [seq_len, embed_dim]
 // Output: [seq_len, embed_dim]  (input + positional signal)
@@ -29,6 +31,7 @@ public:
 
     PositionalEncoding(int max_len, int embed_dim);
 
-    // Add positional encoding to input. Does not affect the gradient graph.
+    // Add positional encoding to input. The encoding is constant, so the
+    // gradient passes through unchanged to `input`.
     TensorPtr forward(TensorPtr input);
 };

@@ -1,4 +1,5 @@
 #include "ml/nn/nlp/positional_encoding.hpp"
+#include "ml/tensor.hpp"
 #include <cmath>
 
 using namespace std;
@@ -23,6 +24,18 @@ TensorPtr PositionalEncoding::forward(TensorPtr input) {
             if (i + 1 < embed_dim)
                 output->data[pos * embed_dim + i + 1] += std::cos(pos * freq);
         }
+    }
+
+    // y = x + const, so dy/dx = 1: pass the gradient straight through.
+    // Without this node the graph is severed here and anything upstream
+    // (typically the embedding table) would silently receive no gradient.
+    if (input->requires_grad) {
+        auto node = make_node(output, {input});
+
+        node->backward_fn = [input, output]() {
+            for (int i = 0; i < output->num_el(); i++)
+                input->grad[i] += output->grad[i];
+        };
     }
 
     return output;

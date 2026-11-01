@@ -1,5 +1,6 @@
 #include "ml/tensor.hpp"
 #include "ml/nn/nlp/positional_encoding.hpp"
+#include "ml/nn/nlp/embedding.hpp"
 #include "ml/nn/nlp/transformer.hpp"
 #include <stdio.h>
 #include <cmath>
@@ -28,6 +29,24 @@ int main() {
     printf("pos 0 dim 0 (expected 0.0000): %.4f\n", pe_out->data[0]);
     // position 1 dim 0 should be sin(1) = 0.8415
     printf("pos 1 dim 0 (expected 0.8415): %.4f\n", pe_out->data[4]);
+
+    // The encoding is a constant, so the gradient must pass straight through.
+    // Regression test: this previously returned a tensor with no grad_fn, which
+    // silently severed the graph and left upstream embeddings untrained.
+    {
+        Embedding emb(10, 4);
+        auto ids = make_shared<Tensor>(vector<int>{1, 3});
+        ids->data[0] = 1; ids->data[1] = 5; ids->data[2] = 7;
+
+        PositionalEncoding pe_g(16, 4);
+        auto y = pe_g.forward(emb.forward(ids));
+        y->backward();
+
+        float total = 0.0f;
+        for (float g : emb.weight->grad) total += g;
+        // 3 tokens x 4 dims, each seeded with dL/dy = 1
+        printf("gradient reaches embedding: %.4f (expected 12.0000)\n", total);
+    }
 
     // === TransformerBlock ===
     printf("\n=== TransformerBlock ===\n");
