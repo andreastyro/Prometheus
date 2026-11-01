@@ -163,12 +163,30 @@ Prebuilt wheels for Windows, Linux, and macOS are produced by
 Requires CMake and a C++17 compiler.
 
 ```bash
-cmake -B build -DUSE_OPENBLAS=ON   # or -DUSE_MKL=ON / -DUSE_OPENMP=ON
+cmake -B build                     # tiled matmul, no external BLAS (default)
 cmake --build build
+ctest --test-dir build             # 25 test binaries
 ```
 
 Each component has its own test executable (`test_tensor`, `test_gpt`, `test_attention`, …),
-built alongside the library.
+built alongside the library. `ctest` runs them all with the correct working
+directory, which some tests need in order to find their fixtures.
+
+#### Optional BLAS backend
+
+OpenBLAS is **not** vendored in this repository — install it and point CMake at it:
+
+```bash
+# Linux / macOS: auto-detected once installed
+sudo apt install libopenblas-dev        # or: brew install openblas
+cmake -B build -DUSE_OPENBLAS=ON
+
+# Windows: extract a pre-built release, then pass its path
+cmake -B build -DUSE_OPENBLAS=ON -DOPENBLAS_ROOT=C:/path/to/openblas
+```
+
+`OPENBLAS_ROOT` must contain `include/cblas.h` and `lib/libopenblas.dll.a`.
+Intel MKL (`-DUSE_MKL=ON`) and plain OpenMP (`-DUSE_OPENMP=ON`) work the same way.
 
 ---
 
