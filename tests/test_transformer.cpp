@@ -1,6 +1,7 @@
 #include "ml/tensor.hpp"
 #include "ml/nn/nlp/positional_encoding.hpp"
 #include "ml/nn/nlp/embedding.hpp"
+#include "ml/utils/testing.hpp"
 #include "ml/nn/nlp/transformer.hpp"
 #include <stdio.h>
 #include <cmath>
@@ -22,13 +23,12 @@ int main() {
     for (int d = 0; d < 4; d++)
         if (pe_out->data[0 * 4 + d] == pe_out->data[1 * 4 + d])
             { all_different = false; break; }
-    printf("positions produce different encodings: %s (expected true)\n",
-        all_different ? "true" : "false");
+    CHECK_TRUE("positions produce different encodings", all_different);
 
     // position 0 dim 0 should be sin(0) = 0
-    printf("pos 0 dim 0 (expected 0.0000): %.4f\n", pe_out->data[0]);
+    CHECK_NEAR("pos 0 dim 0", pe_out->data[0], 0.0f, 1e-4f);
     // position 1 dim 0 should be sin(1) = 0.8415
-    printf("pos 1 dim 0 (expected 0.8415): %.4f\n", pe_out->data[4]);
+    CHECK_NEAR("pos 1 dim 0", pe_out->data[4], 0.8415f, 1e-4f);
 
     // The encoding is a constant, so the gradient must pass straight through.
     // Regression test: this previously returned a tensor with no grad_fn, which
@@ -45,7 +45,7 @@ int main() {
         float total = 0.0f;
         for (float g : emb.weight->grad) total += g;
         // 3 tokens x 4 dims, each seeded with dL/dy = 1
-        printf("gradient reaches embedding: %.4f (expected 12.0000)\n", total);
+        CHECK_NEAR("gradient reaches embedding", total, 12.0f, 1e-4f);
     }
 
     // === TransformerBlock ===
@@ -62,11 +62,11 @@ int main() {
     bool finite = true;
     for (float v : out->data)
         if (std::isnan(v) || std::isinf(v)) { finite = false; break; }
-    printf("output is finite: %s (expected true)\n", finite ? "true" : "false");
+    CHECK_TRUE("output is finite", finite);
 
     // === Parameter count ===
     // attn: 4, norm1: 2, norm2: 2, ff1: 2, ff2: 2 = 12 total
-    printf("\nparam count: %zu (expected 12)\n", block.parameters().size());
+    CHECK_NEAR("param count", (double)block.parameters().size(), 12.0, 0.0);
 
-    return 0;
+    return test_report();
 }

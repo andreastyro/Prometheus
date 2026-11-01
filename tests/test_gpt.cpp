@@ -1,5 +1,6 @@
 #include "ml/nn/nlp/gpt.hpp"
 #include "ml/loss.hpp"
+#include "ml/utils/testing.hpp"
 #include <stdio.h>
 #include <cmath>
 #include <algorithm>
@@ -101,9 +102,8 @@ int main() {
         for (int v = 0; v < V; v++)
             maxdiff = std::max(maxdiff, std::fabs(full->data[(S - 1) * V + v] - step->data[v]));
 
-        printf("max |forward - forward_cached| at last position: %.3e\n", maxdiff);
-        printf("agreement: %s (expected PASS, tolerance 1e-3)\n", maxdiff < 1e-3f ? "PASS" : "FAIL");
+        CHECK_NEAR("forward vs forward_cached (last position)", maxdiff, 0.0f, 1e-3f);
     }
 
-    return 0;
+    return test_report();
 }
