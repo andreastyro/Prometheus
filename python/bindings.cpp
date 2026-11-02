@@ -120,6 +120,7 @@ PYBIND11_MODULE(prometheus, m) {
     m.def("softmax",       &softmax);
     m.def("reshape_op",    &reshape_op, py::arg("a"), py::arg("new_shape"));
     m.def("transpose_op",  &transpose_op, py::arg("a"));
+    m.def("concat_op",     &concat_op, py::arg("inputs"), py::arg("axis") = 0);
 
     // gradcheck: numeric gradient verification, in the spirit of
     // torch.autograd.gradcheck. Returns a dict so a failing check can report

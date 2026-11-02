@@ -823,3 +823,70 @@ TensorPtr transpose_op(TensorPtr a) {
 
     return result;
 }
+
+TensorPtr concat_op(vector<TensorPtr> inputs, int axis) {
+    if (inputs.empty())
+        throw runtime_error("concat_op: no inputs");
+
+    const vector<int> shape0 = inputs[0]->shape;
+    const int ndim = (int)shape0.size();
+    if (axis < 0) axis += ndim;
+    if (axis < 0 || axis >= ndim)
+        throw runtime_error("concat_op: axis out of range");
+
+    // every input must match on all axes except the concatenation one
+    int concat_total = 0;
+    for (auto& t : inputs) {
+        if ((int)t->shape.size() != ndim)
+            throw runtime_error("concat_op: inputs differ in rank");
+        for (int d = 0; d < ndim; d++)
+            if (d != axis && t->shape[d] != shape0[d])
+                throw runtime_error("concat_op: inputs differ on axis " + to_string(d));
+        concat_total += t->shape[axis];
+    }
+
+    vector<int> out_shape = shape0;
+    out_shape[axis] = concat_total;
+    auto result = make_shared<Tensor>(out_shape);
+
+    // Treat the tensor as [outer, axis_dim, inner]: copying a contiguous
+    // inner-sized run per outer index per input is all that is needed.
+    int outer = 1;
+    for (int d = 0; d < axis; d++) outer *= shape0[d];
+    int inner = 1;
+    for (int d = axis + 1; d < ndim; d++) inner *= shape0[d];
+
+    bool any_grad = false;
+    for (auto& t : inputs) if (t->requires_grad) any_grad = true;
+
+    for (int o = 0; o < outer; o++) {
+        int written = 0;
+        for (auto& t : inputs) {
+            const int span = t->shape[axis] * inner;
+            const float* src = t->data.data() + o * span;
+            float* dst = result->data.data() + o * concat_total * inner + written;
+            for (int i = 0; i < span; i++) dst[i] = src[i];
+            written += span;
+        }
+    }
+
+    if (any_grad) {
+        auto node = make_node(result, inputs);
+        node->backward_fn = [inputs, result, outer, inner, concat_total, axis]() {
+            for (int o = 0; o < outer; o++) {
+                int read = 0;
+                for (auto& t : inputs) {
+                    const int span = t->shape[axis] * inner;
+                    if (t->requires_grad) {
+                        const float* src = result->grad.data() + o * concat_total * inner + read;
+                        float* dst = t->grad.data() + o * span;
+                        for (int i = 0; i < span; i++) dst[i] += src[i];
+                    }
+                    read += span;
+                }
+            }
+        };
+    }
+
+    return result;
+}

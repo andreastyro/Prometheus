@@ -88,6 +88,11 @@ jobs:
       - name: Python API and binding checks
         run: python tests/test_python_api.py
 
+      # Every Prometheus Model: shapes, parameter bookkeeping, and that
+      # gradients actually reach every parameter.
+      - name: Prometheus Models
+        run: python tests/test_models.py
+
   # ── ASAN + UBSAN: catches uninitialised reads, overflows, bad frees ───────
   sanitizers:
     name: Address and UB sanitizers

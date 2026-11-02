@@ -93,3 +93,11 @@ TensorPtr reshape_op(TensorPtr a, std::vector<int> new_shape);
 /// Tensor::transpose() is the non-differentiable equivalent: it detaches,
 /// so it cannot be used inside a forward pass you intend to backprop through.
 TensorPtr transpose_op(TensorPtr a);
+
+/// Concatenate tensors along `axis`. All inputs must agree on every dimension
+/// except that one. Gradient-tracking: the backward splits the output gradient
+/// back into the matching slice of each input.
+///
+/// Needed for UNet-style skip connections, which join an encoder feature map to
+/// a decoder one along the channel axis. Not expressible from the other ops.
+TensorPtr concat_op(std::vector<TensorPtr> inputs, int axis = 0);
