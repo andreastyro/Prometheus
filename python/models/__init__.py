@@ -21,6 +21,7 @@ the same contract and is the reference implementation for the C++ p.GPT.
 """
 
 from .base import Model
+from .visualiser import build_dashboard, visualise
 from .gan import GAN, Discriminator, Generator
 from .mlp import CNN, MLP
 from .resnet import ResNet
@@ -29,6 +30,8 @@ from .vae import VAE
 
 __all__ = [
     "Model",
+    "visualise",
+    "build_dashboard",
     "MLP",
     "CNN",
     "ResNet",

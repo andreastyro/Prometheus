@@ -76,6 +76,31 @@ class VAE(Model):
         return self.out_act.forward(self.fc_out.forward(z))
 
     # ----------------------------------------------------------------- forward
+    def trace(self, x):
+        """Encoder path, the latent pieces, then the decoder path."""
+        out = []
+        h = x
+        for i, layer in enumerate(self.encoder):
+            h = layer.forward(h)
+            out.append(("enc%d" % (i + 1), h))
+
+        mu = self.fc_mu.forward(h)
+        logvar = self.fc_logvar.forward(h)
+        out.append(("mu", mu))
+        out.append(("logvar", logvar))
+
+        z = self.reparameterise(mu, logvar)
+        out.append(("z", z))
+
+        d = z
+        for i, layer in enumerate(self.decoder):
+            d = layer.forward(d)
+            out.append(("dec%d" % (i + 1), d))
+
+        rec = self.out_act.forward(self.fc_out.forward(d))
+        out.append(("output", rec))
+        return out
+
     def forward(self, x):
         mu, logvar = self.encode(x)
         z = self.reparameterise(mu, logvar)

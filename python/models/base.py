@@ -24,6 +24,8 @@ class Model:
     def __init__(self):
         # ordered (name, layer) pairs; name is what the visualiser will label
         self._layers = []
+        # losses collected by record_loss(), drawn by the dashboard
+        self._loss_history = []
 
     # ------------------------------------------------------------------ layers
     def add(self, name, layer):
@@ -69,6 +71,19 @@ class Model:
     def num_parameters(self):
         return sum(t.num_el() for t in self.parameters())
 
+    # ----------------------------------------------------------------- trace
+    # The visualiser needs the intermediate activations, not just the output.
+    # The layers are pybind11 objects, so their forward cannot be wrapped from
+    # Python; each model therefore declares how to walk itself. The default
+    # covers any model that just runs its layers in order.
+    def trace(self, x):
+        """Run forward, returning [(layer_name, output_tensor), ...]."""
+        out = []
+        for name, layer in self._layers:
+            x = layer.forward(x)
+            out.append((name, x))
+        return out
+
     # ------------------------------------------------------- train / eval mode
     # BatchNorm and Dropout behave differently during training and inference,
     # and a user should not have to know where they are. PyTorch solves this by
@@ -111,6 +126,40 @@ class Model:
                 layer.eval()
             else:
                 layer.training = mode
+
+    # ------------------------------------------------------------- visualiser
+    def visualise(self, x=None, history=None, filename=None,
+                  open_browser=True, **kwargs):
+        """Write a self-contained HTML dashboard and open it in a browser.
+
+        x        a sample batch; unlocks activations, feature maps, shape
+                 annotations and the model-specific panel
+        history  per-epoch losses for the loss curve, or omit it to use
+                 whatever record_loss() has collected
+        kwargs   real=, labels=, token_ids=, attention_layer=, live_seconds=
+
+        Returns the path written.
+        """
+        from .visualiser import visualise as _vis
+        if history is None and self._loss_history:
+            history = self._loss_history
+        return _vis(self, x=x, history=history, filename=filename,
+                    open_browser=open_browser, **kwargs)
+
+    def record_loss(self, value):
+        """Append one epoch's loss, for the dashboard curve.
+
+        Accepts a float or a scalar Tensor, so it drops straight into a
+        training loop:  model.record_loss(loss)
+        """
+        if hasattr(value, "data"):
+            value = value.data[0]
+        self._loss_history.append(float(value))
+        return value
+
+    @property
+    def loss_history(self):
+        return list(self._loss_history)
 
     # ------------------------------------------------------------------ report
     def summary(self):

@@ -103,6 +103,38 @@ class UNet(Model):
         self.add("output", p.Conv2D(prev, num_classes, 1))
         self.head = self._layers[-1][1]
 
+    def trace(self, x):
+        """Encoder levels, bottleneck, then decoder levels, in execution order."""
+        out, skips = [], []
+        for i, (blk, pool) in enumerate(zip(self.encoders, self.pools)):
+            x = blk.forward(x)
+            out.append(("enc%d" % (i + 1), x))
+            skips.append(x)
+            x = pool.forward(x)
+            out.append(("pool%d" % (i + 1), x))
+
+        x = self.bottleneck.forward(x)
+        out.append(("bottleneck", x))
+
+        depth = len(self.encoders)
+        for j, (up, blk, skip) in enumerate(
+                zip(self.ups, self.decoders, reversed(skips))):
+            x = up.forward(x)
+            out.append(("up%d" % (depth - j), x))
+            x = p.concat_op([x, skip], 1)
+            out.append(("concat%d" % (depth - j), x))
+            x = blk.forward(x)
+            out.append(("dec%d" % (depth - j), x))
+
+        x = self.head.forward(x)
+        out.append(("output", x))
+        return out
+
+    def skip_pairs(self):
+        """(encoder_name, decoder_name) for the skip-connection diagram."""
+        depth = len(self.encoders)
+        return [("enc%d" % (d + 1), "dec%d" % (d + 1)) for d in range(depth)]
+
     def forward(self, x):
         skips = []
         for blk, pool in zip(self.encoders, self.pools):

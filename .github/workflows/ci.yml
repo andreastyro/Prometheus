@@ -93,6 +93,11 @@ jobs:
       - name: Prometheus Models
         run: python tests/test_models.py
 
+      # The dashboard: panel structure, that the numbers match the model, and
+      # that the HTML reaches for nothing external so it works offline.
+      - name: Model dashboard
+        run: python tests/test_visualiser.py
+
   # ── ASAN + UBSAN: catches uninitialised reads, overflows, bad frees ───────
   sanitizers:
     name: Address and UB sanitizers

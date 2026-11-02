@@ -62,6 +62,22 @@ class Generator(Model):
         self.to_image = self.add("to_image", p.Conv2D(prev, img_channels, 3, 1, 1))
         self.out_act = self.add("tanh", p.Tanh())
 
+    def trace(self, z):
+        out = []
+        x = self.project.forward(z)
+        out.append(("project", x))
+        x = p.relu(x)
+        batch = z.shape[0]
+        x = p.reshape_op(x, [batch, self.proj_channels,
+                             self.start_size, self.start_size])
+        out.append(("reshape", x))
+        for i, (up, norm, relu) in enumerate(self.ups):
+            x = relu.forward(norm.forward(up.forward(x)))
+            out.append(("up%d" % (i + 1), x))
+        x = self.out_act.forward(self.to_image.forward(x))
+        out.append(("output", x))
+        return out
+
     def forward(self, z):
         x = self.project.forward(z)
         x = p.relu(x)
@@ -138,6 +154,10 @@ class GAN(Model):
     def forward(self, z):
         """Generate images from latent vectors."""
         return self.generator.forward(z)
+
+    def trace(self, z):
+        """Generator path only -- the discriminator is a separate network."""
+        return self.generator.trace(z)
 
     def sample_latent(self, batch):
         return p.Tensor.randn([batch, self.latent_dim])
