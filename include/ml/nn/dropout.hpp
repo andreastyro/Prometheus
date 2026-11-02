@@ -19,6 +19,12 @@ public:
     /// @param training whether dropout is active (disable for inference)
     Dropout(float rate, bool training = true);
 
+    /// Switch to inference: stop dropping and stop rescaling.
+    void eval()  { training = false; }
+    /// Switch back to training: resume dropping.
+    void train() { training = true; }
+
+
     TensorPtr forward(TensorPtr input) override;
     std::vector<TensorPtr> parameters() override; ///< No learnable parameters
 };

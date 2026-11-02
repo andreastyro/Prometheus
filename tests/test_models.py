@@ -249,6 +249,123 @@ def test_summary_and_repr():
           all(hasattr(l, "forward") for l in m.layers))
 
 
+def test_norm_options():
+    print("\n=== norm options ===")
+    for kind in ("batch", "group", "none"):
+        m = CNN(1, 4, channels=(8,), image_size=8, norm=kind, groups=4)
+        out = m.forward(tensor([3, 1, 8, 8], grad=True))
+        check_shape("CNN norm=%s" % kind, out.shape, [3, 4])
+        all_params_get_gradient("CNN norm=%s" % kind, m,
+                                p.mean(p.multiply(out, out), -1))
+
+    # defaults follow the conventional choice per architecture
+    check("CNN defaults to BatchNorm",
+          type(CNN(1, 2, (8,), 8).layers[1]).__name__ == "BatchNorm")
+    check("ResNet defaults to BatchNorm",
+          type(ResNet(2, 18, 1, 8, 32).layers[1]).__name__ == "BatchNorm")
+    check("UNet defaults to GroupNorm",
+          type(UNet(1, 2, 8, 2, 16).encoders[0].norm1).__name__ == "GroupNorm")
+    g = GAN(4, img_size=16, img_channels=1, base_channels=8)
+    check("GAN discriminator defaults to GroupNorm",
+          type(g.discriminator.layers[1]).__name__ == "GroupNorm")
+
+    threw = False
+    try:
+        CNN(1, 2, (8,), 8, norm="bogus")
+    except ValueError:
+        threw = True
+    check("an unknown norm name raises", threw)
+
+
+def test_train_eval_cascade():
+    print("\n=== train / eval cascade ===")
+    m = CNN(1, 4, channels=(8, 8), image_size=16, norm="batch", groups=4)
+
+    norms = [l for l in m.layers if type(l).__name__ == "BatchNorm"]
+    check("CNN has BatchNorm layers to switch", len(norms) == 2)
+    check("starts in training mode", m.training)
+
+    m.eval()
+    check("eval() reaches every BatchNorm",
+          all(not n.training for n in norms))
+    check("model reports not training", not m.training)
+
+    m.train()
+    check("train() restores every BatchNorm",
+          all(n.training for n in norms))
+    check("eval() returns self for chaining", m.eval() is m)
+
+    # the bug the cascade prevents: BatchNorm in train mode normalises a single
+    # sample by its own statistics, which makes every output identical
+    m.train()
+    x = tensor([1, 1, 16, 16])
+    m.eval()
+    eval_out = list(m.forward(x).data)
+    m.train()
+    train_out = list(m.forward(x).data)
+    check("batch-of-one differs between train and eval mode",
+          eval_out != train_out)
+
+    # Dropout must be reached too, including inside an MLP
+    md = MLP(4, 2, hidden_dims=(8,), dropout=0.5)
+    drops = [l for l in md.layers if type(l).__name__ == "Dropout"]
+    check("MLP exposes its Dropout", len(drops) == 1)
+    md.eval()
+    check("eval() reaches Dropout", not drops[0].training)
+    xd = tensor([2, 4])
+    a = list(md.forward(xd).data)
+    b = list(md.forward(xd).data)
+    check("Dropout is deterministic once in eval mode", a == b)
+    md.train()
+    p.Tensor.manual_seed(1)
+    c = list(md.forward(xd).data)
+    p.Tensor.manual_seed(2)
+    d = list(md.forward(xd).data)
+    check("Dropout is stochastic again after train()", c != d)
+
+    # the cascade must recurse into nested holders and nested Models
+    u = UNet(1, 2, base_channels=8, depth=2, image_size=16,
+             norm="batch", groups=4)
+    u.eval()
+    inner = [u.encoders[0].norm1, u.bottleneck.norm2, u.decoders[0].norm1]
+    check("cascade reaches norms inside UNet conv blocks",
+          all(not n.training for n in inner))
+
+    gan = GAN(4, img_size=16, img_channels=1, base_channels=8, norm="batch")
+    gan.eval()
+    gnorms = [l for l in gan.layers if type(l).__name__ == "BatchNorm"]
+    check("cascade reaches both halves of a GAN",
+          len(gnorms) > 0 and all(not n.training for n in gnorms))
+
+
+def test_batchnorm_conv_semantics():
+    print("\n=== BatchNorm on conv input ===")
+    # statistics must be per channel over batch and spatial positions, not the
+    # 2D interpretation that silently normalised the wrong groups
+    bn = p.BatchNorm(3)
+    x = tensor([2, 3, 2, 2], grad=True)
+    out = bn.forward(x)
+    check_shape("BatchNorm 4D", out.shape, [2, 3, 2, 2])
+
+    vals = list(out.data)
+    # with gamma=1, beta=0 each channel should come out zero-mean
+    for c in range(3):
+        idx = [(n * 3 + c) * 4 + s for n in range(2) for s in range(4)]
+        mean = sum(vals[i] for i in idx) / len(idx)
+        check("channel %d is zero-mean after BatchNorm" % c, abs(mean) < 1e-4,
+              "mean %.3e" % mean)
+
+    r = p.gradcheck(lambda: bn.forward(x), bn.parameters() + [x])
+    check("BatchNorm 4D gradients", r["passed"], r["report"][:100])
+
+    threw = False
+    try:
+        bn.forward(tensor([5]))
+    except Exception:
+        threw = True
+    check("a 1D input raises rather than reading past the shape", threw)
+
+
 def main():
     p.Tensor.manual_seed(1234)
     print("Prometheus Models")
@@ -258,6 +375,9 @@ def main():
     test_unet()
     test_vae()
     test_gan()
+    test_norm_options()
+    test_train_eval_cascade()
+    test_batchnorm_conv_semantics()
     test_summary_and_repr()
 
     print("\n%d checks, %d failed" % (CHECKS[0], len(FAILURES)))

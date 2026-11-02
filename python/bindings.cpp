@@ -231,7 +231,9 @@ PYBIND11_MODULE(prometheus, m) {
         .def(py::init<float, bool>(), py::arg("rate"), py::arg("training") = true)
         .def("forward",    &Dropout::forward)
         .def("parameters", &Dropout::parameters)
-        .def_readwrite("training", &Dropout::training);
+        .def_readwrite("training", &Dropout::training)
+        .def("eval",  &Dropout::eval)
+        .def("train", &Dropout::train);
 
     py::class_<Flatten, Module, std::shared_ptr<Flatten>>(m, "Flatten")
         .def(py::init<>())

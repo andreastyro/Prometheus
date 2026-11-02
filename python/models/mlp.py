@@ -2,7 +2,7 @@
 
 import prometheus as p
 
-from .base import Model, activation
+from .base import Model, activation, norm_layer
 
 
 class MLP(Model):
@@ -43,31 +43,33 @@ class CNN(Model):
 
         CNN(in_channels, num_classes, channels=[16, 32], image_size=28)
 
-    Each stage is Conv(3x3, pad 1) -> BatchNorm-free GroupNorm -> ReLU ->
-    MaxPool(2), halving the spatial size, then a Flatten and a Linear head.
-    GroupNorm rather than BatchNorm so a batch of one behaves the same as a
-    batch of many.
+    Each stage is Conv(3x3, pad 1) -> norm -> ReLU -> MaxPool(2), halving the
+    spatial size, then a Flatten and a Linear head.
+
+    norm defaults to "batch", which is what CNN architectures are tuned for.
+    Call model.eval() before inference so BatchNorm uses its running estimate
+    instead of the statistics of whatever batch it is handed. Pass norm="group"
+    for batch-size independence, or norm="none".
 
     Input  [batch, in_channels, image_size, image_size]
     Output [batch, num_classes]
     """
 
     def __init__(self, in_channels, num_classes, channels=(16, 32),
-                 image_size=28, groups=4):
+                 image_size=28, norm="batch", groups=4):
         super().__init__()
         self.in_channels = in_channels
         self.num_classes = num_classes
         self.channels = list(channels)
         self.image_size = image_size
 
+        self.norm = norm
+
         size = image_size
         prev = in_channels
         for i, c in enumerate(self.channels):
-            if c % groups != 0:
-                raise ValueError("channel count %d must be divisible by groups %d"
-                                 % (c, groups))
             self.add("conv%d" % (i + 1), p.Conv2D(prev, c, 3, 1, 1))
-            self.add("norm%d" % (i + 1), p.GroupNorm(groups, c))
+            self.add("norm%d" % (i + 1), norm_layer(norm, c, groups))
             self.add("relu%d" % (i + 1), p.ReLU())
             self.add("pool%d" % (i + 1), p.MaxPool2D(2))
             prev = c

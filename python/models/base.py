@@ -69,6 +69,49 @@ class Model:
     def num_parameters(self):
         return sum(t.num_el() for t in self.parameters())
 
+    # ------------------------------------------------------- train / eval mode
+    # BatchNorm and Dropout behave differently during training and inference,
+    # and a user should not have to know where they are. PyTorch solves this by
+    # having Module.train(mode) recurse over its children; these do the same.
+    # Without the cascade, forgetting to switch one BatchNorm gives predictions
+    # that are wrong but still plausible, which is the worst kind of bug.
+    def train(self, mode=True):
+        """Put every layer into training mode. Returns self for chaining."""
+        self._set_mode(mode)
+        return self
+
+    def eval(self):
+        """Put every layer into inference mode. Returns self for chaining."""
+        self._set_mode(False)
+        return self
+
+    @property
+    def training(self):
+        """True if no layer has been switched to inference mode."""
+        return all(getattr(l, "training", True) for l in self._iter_mode_layers())
+
+    def _iter_mode_layers(self):
+        """Every layer that carries a training flag, recursing into holders."""
+        for _, layer in self._layers:
+            if hasattr(layer, "_layers"):          # a nested Model
+                yield from layer._iter_mode_layers()
+            elif hasattr(layer, "sublayers"):      # a plain composite holder
+                for sub in layer.sublayers():
+                    if hasattr(sub, "training"):
+                        yield sub
+            elif hasattr(layer, "training"):
+                yield layer
+
+    def _set_mode(self, mode):
+        for layer in self._iter_mode_layers():
+            # prefer the explicit methods, fall back to the flag
+            if mode and hasattr(layer, "train"):
+                layer.train()
+            elif not mode and hasattr(layer, "eval"):
+                layer.eval()
+            else:
+                layer.training = mode
+
     # ------------------------------------------------------------------ report
     def summary(self):
         """Layer names, parameter counts and the total."""
@@ -98,3 +141,37 @@ def activation(name):
         raise ValueError("unknown activation %r; expected one of %s"
                          % (name, ", ".join(sorted(table))))
     return table[key]()
+
+def norm_layer(kind, channels, groups=4):
+    """Build a normalisation layer by name.
+
+    "batch" — BatchNorm over the batch (and spatial positions, for conv input).
+              The conventional choice for CNNs and ResNets, and what their
+              published results assume. Requires eval() before inference.
+    "group"  — GroupNorm within each sample. Independent of batch size, so a
+              batch of one behaves like a batch of many. The usual choice for
+              diffusion UNets and for GAN discriminators, where sharing
+              statistics across a batch leaks information between samples.
+    "none"   — identity, for ablations.
+    """
+    kind = (kind or "none").lower()
+    if kind == "batch":
+        return p.BatchNorm(channels)
+    if kind == "group":
+        if channels % groups != 0:
+            raise ValueError("channels %d must be divisible by groups %d for "
+                             "GroupNorm; pass a different groups=" % (channels, groups))
+        return p.GroupNorm(groups, channels)
+    if kind == "none":
+        return Identity()
+    raise ValueError('norm must be "batch", "group" or "none", got %r' % kind)
+
+
+class Identity:
+    """No-op layer, so norm="none" needs no branching at the call sites."""
+
+    def forward(self, x):
+        return x
+
+    def parameters(self):
+        return []

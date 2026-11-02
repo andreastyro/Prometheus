@@ -1,6 +1,8 @@
 #include "ml/nn/batchnorm.hpp"
 #include "ml/tensor.hpp"
 #include <cmath>
+#include <stdexcept>
+#include <string>   // to_string; MSVC does not get it transitively
 #include <vector>
 
 using namespace std;
@@ -14,59 +16,83 @@ BatchNorm::BatchNorm(int num_features, float eps, bool training, float momentum)
     beta->requires_grad  = true;
 }
 
-// Same normalisation backward as LayerNorm and GroupNorm, except the statistics
-// are taken down the batch axis for each feature independently. With N = batch
-// and g[b] = gamma[f] * dL/dy[b, f]:
+// Statistics are per feature/channel, taken over the batch and, for conv input,
+// over the spatial positions too. Viewing the tensor as [N, C, S]:
 //
-//     dL/dx[b, f] = (1/std) * ( g[b] - mean(g) - x_hat[b, f] * mean(g * x_hat) )
+//   2D [batch, features]          -> S = 1,    the BatchNorm1d case
+//   4D [batch, channels, H, W]    -> S = H*W,  the BatchNorm2d case
 //
-// In eval mode the statistics are constants from the running estimate, so the
-// mean and variance no longer depend on x and the gradient is the simple
-// elementwise gamma/std.
+// A 4D input used to be read as if it were 2D: shape[1] was taken as the
+// feature count and elements indexed b * features + f, which normalised the
+// wrong groups and returned silently wrong numbers rather than erroring. Any
+// CNN using BatchNorm was affected.
+//
+// Backward is the usual normalisation gradient, over N*S elements per channel:
+//
+//   dL/dx[i] = (1/std) * ( g[i] - mean(g) - x_hat[i] * mean(g * x_hat) )
+//
+// with g[i] = gamma[c] * dL/dy[i]. In eval mode the statistics come from the
+// running estimate and are constants, so the last two terms vanish.
 TensorPtr BatchNorm::forward(TensorPtr input) {
-    // input: [batch, num_features]
-    int batch        = input->shape[0];
-    int num_features = input->shape[1];
-    auto output      = make_shared<Tensor>(input->shape);
+    const int ndim = (int)input->shape.size();
+    if (ndim < 2)
+        throw runtime_error("BatchNorm: expected at least 2 dimensions "
+                            "[batch, features, ...]");
+
+    const int N = input->shape[0];
+    const int C = input->shape[1];
+    if (C != (int)running_mean.size())
+        throw runtime_error("BatchNorm: input has " + to_string(C) +
+                            " channels but the layer was built for " +
+                            to_string(running_mean.size()));
+
+    int S = 1;
+    for (int d = 2; d < ndim; d++) S *= input->shape[d];
+
+    auto output = make_shared<Tensor>(input->shape);
 
     // saved for the backward pass
     vector<float> x_hat(input->num_el());
-    vector<float> inv_std_all(num_features);
+    vector<float> inv_std_all(C);
 
-    for (int f = 0; f < num_features; f++) {
+    const int count = N * S;
+
+    for (int c = 0; c < C; c++) {
         float mean, var;
 
         if (training) {
             mean = 0.0f;
-            for (int b = 0; b < batch; b++)
-                mean += input->data[b * num_features + f];
-            mean /= batch;
+            for (int n = 0; n < N; n++)
+                for (int s = 0; s < S; s++)
+                    mean += input->data[(n * C + c) * S + s];
+            mean /= count;
 
             var = 0.0f;
-            for (int b = 0; b < batch; b++) {
-                float diff = input->data[b * num_features + f] - mean;
-                var += diff * diff;
-            }
-            var /= batch;
+            for (int n = 0; n < N; n++)
+                for (int s = 0; s < S; s++) {
+                    float diff = input->data[(n * C + c) * S + s] - mean;
+                    var += diff * diff;
+                }
+            var /= count;
 
-            // Fold the batch statistics into the running estimate, the same
-            // exponential moving average PyTorch uses.
-            running_mean[f] = (1.0f - momentum) * running_mean[f] + momentum * mean;
-            running_var[f]  = (1.0f - momentum) * running_var[f]  + momentum * var;
+            // exponential moving average, as PyTorch does
+            running_mean[c] = (1.0f - momentum) * running_mean[c] + momentum * mean;
+            running_var[c]  = (1.0f - momentum) * running_var[c]  + momentum * var;
         } else {
-            mean = running_mean[f];
-            var  = running_var[f];
+            mean = running_mean[c];
+            var  = running_var[c];
         }
 
-        float inv_std = 1.0f / std::sqrt(var + eps);
-        inv_std_all[f] = inv_std;
+        const float inv_std = 1.0f / std::sqrt(var + eps);
+        inv_std_all[c] = inv_std;
 
-        for (int b = 0; b < batch; b++) {
-            int idx = b * num_features + f;
-            float norm = (input->data[idx] - mean) * inv_std;
-            x_hat[idx] = norm;
-            output->data[idx] = gamma->data[f] * norm + beta->data[f];
-        }
+        for (int n = 0; n < N; n++)
+            for (int s = 0; s < S; s++) {
+                const int idx = (n * C + c) * S + s;
+                const float norm = (input->data[idx] - mean) * inv_std;
+                x_hat[idx] = norm;
+                output->data[idx] = gamma->data[c] * norm + beta->data[c];
+            }
     }
 
     if (input->requires_grad || gamma->requires_grad || beta->requires_grad) {
@@ -74,46 +100,45 @@ TensorPtr BatchNorm::forward(TensorPtr input) {
 
         auto gamma_ = gamma;
         auto beta_  = beta;
-        bool was_training = training;
+        const bool was_training = training;
 
         node->backward_fn = [input, output, gamma_, beta_, x_hat, inv_std_all,
-                             batch, num_features, was_training]() {
-            const int N = batch;
-
-            for (int f = 0; f < num_features; f++) {
-                const float inv_std = inv_std_all[f];
+                             N, C, S, count, was_training]() {
+            for (int c = 0; c < C; c++) {
+                const float inv_std = inv_std_all[c];
 
                 float sum_g = 0.0f, sum_g_xhat = 0.0f;
                 if (was_training) {
-                    for (int b = 0; b < batch; b++) {
-                        const int idx = b * num_features + f;
-                        const float gi = gamma_->data[f] * output->grad[idx];
-                        sum_g      += gi;
-                        sum_g_xhat += gi * x_hat[idx];
-                    }
+                    for (int n = 0; n < N; n++)
+                        for (int s = 0; s < S; s++) {
+                            const int idx = (n * C + c) * S + s;
+                            const float gi = gamma_->data[c] * output->grad[idx];
+                            sum_g      += gi;
+                            sum_g_xhat += gi * x_hat[idx];
+                        }
                 }
 
-                const float mean_g      = was_training ? sum_g / N : 0.0f;
-                const float mean_g_xhat = was_training ? sum_g_xhat / N : 0.0f;
+                const float mean_g      = was_training ? sum_g / count : 0.0f;
+                const float mean_g_xhat = was_training ? sum_g_xhat / count : 0.0f;
 
-                for (int b = 0; b < batch; b++) {
-                    const int idx = b * num_features + f;
-                    const float gi = gamma_->data[f] * output->grad[idx];
+                for (int n = 0; n < N; n++)
+                    for (int s = 0; s < S; s++) {
+                        const int idx = (n * C + c) * S + s;
+                        const float gi = gamma_->data[c] * output->grad[idx];
 
-                    if (input->requires_grad) {
-                        if (was_training)
-                            input->grad[idx] +=
-                                inv_std * (gi - mean_g - x_hat[idx] * mean_g_xhat);
-                        else
-                            // running statistics are constants here
-                            input->grad[idx] += inv_std * gi;
+                        if (input->requires_grad) {
+                            if (was_training)
+                                input->grad[idx] +=
+                                    inv_std * (gi - mean_g - x_hat[idx] * mean_g_xhat);
+                            else
+                                input->grad[idx] += inv_std * gi;
+                        }
+
+                        if (gamma_->requires_grad)
+                            gamma_->grad[c] += output->grad[idx] * x_hat[idx];
+                        if (beta_->requires_grad)
+                            beta_->grad[c] += output->grad[idx];
                     }
-
-                    if (gamma_->requires_grad)
-                        gamma_->grad[f] += output->grad[idx] * x_hat[idx];
-                    if (beta_->requires_grad)
-                        beta_->grad[f] += output->grad[idx];
-                }
             }
         };
     }

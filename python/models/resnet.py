@@ -2,7 +2,7 @@
 
 import prometheus as p
 
-from .base import Model
+from .base import Model, norm_layer
 
 # depth -> blocks per stage, following the original paper for the
 # basic-block variants
@@ -27,12 +27,15 @@ class ResNet(Model):
     raises rather than silently building a basic-block network of the wrong
     shape.
 
+    norm defaults to "batch", matching the paper. It applies to the stem;
+    ResidualBlock uses GroupNorm internally, which this cannot change.
+
     Input  [batch, in_channels, size, size]
     Output [batch, num_classes]
     """
 
     def __init__(self, num_classes, depth=18, in_channels=3,
-                 base_channels=16, image_size=32, groups=4):
+                 base_channels=16, image_size=32, norm="batch", groups=4):
         super().__init__()
         if depth not in _STAGES:
             if depth == 50:
@@ -45,21 +48,19 @@ class ResNet(Model):
         self.num_classes = num_classes
         self.depth = depth
         self.base_channels = base_channels
+        self.norm = norm
 
         blocks_per_stage = _STAGES[depth]
 
         # stem: keeps the spatial size, lifts channels to base_channels
         self.add("stem_conv", p.Conv2D(in_channels, base_channels, 3, 1, 1))
-        self.add("stem_norm", p.GroupNorm(groups, base_channels))
+        self.add("stem_norm", norm_layer(norm, base_channels, groups))
         self.add("stem_relu", p.ReLU())
 
         size = image_size
         prev = base_channels
         for stage, n_blocks in enumerate(blocks_per_stage):
             out_c = base_channels * (2 ** stage)
-            if out_c % groups != 0:
-                raise ValueError("stage channel count %d not divisible by groups %d"
-                                 % (out_c, groups))
             for b in range(n_blocks):
                 # downsample on the first block of every stage but the first
                 stride = 2 if (b == 0 and stage > 0) else 1

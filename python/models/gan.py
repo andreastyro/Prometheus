@@ -2,7 +2,7 @@
 
 import prometheus as p
 
-from .base import Model
+from .base import Model, norm_layer
 
 
 class Generator(Model):
@@ -18,7 +18,7 @@ class Generator(Model):
     """
 
     def __init__(self, latent_dim, img_size=32, img_channels=1,
-                 base_channels=32, groups=4):
+                 base_channels=32, norm="group", groups=4):
         super().__init__()
         if img_size % 4 != 0:
             raise ValueError("img_size must be divisible by 4, got %d" % img_size)
@@ -54,9 +54,9 @@ class Generator(Model):
                 out_c = groups * max(1, out_c // groups)
             up = self.add("up%d" % (i + 1),
                           p.ConvTranspose2D(prev, out_c, 4, 2, 1))
-            norm = self.add("up_norm%d" % (i + 1), p.GroupNorm(groups, out_c))
+            nl = self.add("up_norm%d" % (i + 1), norm_layer(norm, out_c, groups))
             relu = self.add("up_relu%d" % (i + 1), p.ReLU())
-            self.ups.append((up, norm, relu))
+            self.ups.append((up, nl, relu))
             prev = out_c
 
         self.to_image = self.add("to_image", p.Conv2D(prev, img_channels, 3, 1, 1))
@@ -76,6 +76,10 @@ class Generator(Model):
 class Discriminator(Model):
     """Scores an image as real or generated.
 
+    norm defaults to "group": BatchNorm in a discriminator shares statistics
+    across the samples of a batch, which leaks information between real and
+    generated examples and is a known way to get a GAN that never converges.
+
     Conv stride-2 stages halve the spatial size, then Flatten and a Linear to a
     single logit. No output activation: pair it with bce_loss after a Sigmoid,
     or use the logit directly.
@@ -84,7 +88,8 @@ class Discriminator(Model):
     Output [batch, 1]
     """
 
-    def __init__(self, img_size=32, img_channels=1, base_channels=32, groups=4):
+    def __init__(self, img_size=32, img_channels=1, base_channels=32,
+                 norm="group", groups=4):
         super().__init__()
         self.img_size = img_size
 
@@ -93,11 +98,8 @@ class Discriminator(Model):
         i = 0
         while size > 4:
             out_c = base_channels * (2 ** i)
-            if out_c % groups != 0:
-                raise ValueError("channels %d not divisible by groups %d"
-                                 % (out_c, groups))
             self.add("conv%d" % (i + 1), p.Conv2D(prev, out_c, 4, 2, 1))
-            self.add("norm%d" % (i + 1), p.GroupNorm(groups, out_c))
+            self.add("norm%d" % (i + 1), norm_layer(norm, out_c, groups))
             self.add("relu%d" % (i + 1), p.ReLU())
             prev = out_c
             size //= 2
@@ -121,13 +123,13 @@ class GAN(Model):
     """
 
     def __init__(self, latent_dim, img_size=32, img_channels=1,
-                 base_channels=32, groups=4):
+                 base_channels=32, norm="group", groups=4):
         super().__init__()
         self.latent_dim = latent_dim
         self.generator = Generator(latent_dim, img_size, img_channels,
-                                   base_channels, groups)
+                                   base_channels, norm, groups)
         self.discriminator = Discriminator(img_size, img_channels,
-                                           base_channels, groups)
+                                           base_channels, norm, groups)
         self._layers = ([("generator." + n, l)
                          for n, l in self.generator._layers] +
                         [("discriminator." + n, l)
