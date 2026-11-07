@@ -5,6 +5,16 @@ import prometheus as p
 from .base import Model, activation
 
 
+# exp(logvar) is the unstable step in a VAE. If logvar drifts positive the
+# variance and its gradient explode -- measured here, logvar reached +16, so
+# exp(logvar) was about 9e6 and the gradient on fc_logvar reached 9e5, taking
+# the loss to 89045. Every practical implementation clamps it; the bound below
+# covers a standard deviation from about 7e-3 to about 150, which is wider than
+# any useful latent scale.
+LOGVAR_MIN = -10.0
+LOGVAR_MAX = 10.0
+
+
 class VAE(Model):
     """Variational autoencoder over flat vectors.
 
@@ -66,6 +76,7 @@ class VAE(Model):
 
     def reparameterise(self, mu, logvar):
         """z = mu + exp(0.5 * logvar) * eps,  eps ~ N(0, 1)"""
+        logvar = p.clip(logvar, LOGVAR_MIN, LOGVAR_MAX)
         std = p.exp_op(p.multiply(0.5, logvar))
         eps = p.Tensor.randn(mu.shape)        # constant: no requires_grad
         return p.add(mu, p.multiply(std, eps))
@@ -107,7 +118,12 @@ class VAE(Model):
         return self.decode(z), mu, logvar
 
     def kl_loss(self, mu, logvar):
-        """-0.5 * mean(1 + logvar - mu^2 - exp(logvar)), built from ops."""
+        """-0.5 * mean(1 + logvar - mu^2 - exp(logvar)), built from ops.
+
+        logvar is clamped first, for the same reason as in reparameterise:
+        exp() of an unbounded logvar is what makes a VAE diverge.
+        """
+        logvar = p.clip(logvar, LOGVAR_MIN, LOGVAR_MAX)
         mu_sq = p.multiply(mu, mu)
         var = p.exp_op(logvar)
         inner = p.subtract(p.subtract(p.add(1.0, logvar), mu_sq), var)

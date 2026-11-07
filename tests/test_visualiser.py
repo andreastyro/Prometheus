@@ -298,7 +298,10 @@ def test_diagnostics():
     print("\n=== diagnostics ===")
     p.Tensor.manual_seed(4)
     m = CNN(1, 4, (8,), image_size=8)
-    x = tensor([2, 1, 8, 8])
+    # batch of 8: the dead-unit measure needs enough samples to be meaningful
+    # and reports None below MIN_DEAD_BATCH, since with a batch of 2 a healthy
+    # ReLU is zero in both samples a quarter of the time by luck
+    x = tensor([8, 1, 8, 8])
     out = m.forward(x)
     p.mean(p.multiply(out, out), -1).backward()
     tr = m.trace(x)
@@ -316,9 +319,16 @@ def test_diagnostics():
     check("ReLU zeroes roughly half its values",
           relu_stats and all(0.2 < st["zeros"] < 0.8 for st in relu_stats),
           str([round(st["zeros"], 2) for st in relu_stats]))
+    check("dead-unit measure is available at this batch size",
+          relu_stats and all(st["dead_units"] is not None for st in relu_stats))
     check("but almost no units are dead across the batch",
           relu_stats and all(st["dead_units"] < 0.25 for st in relu_stats),
           str([round(st["dead_units"], 2) for st in relu_stats]))
+
+    # and it must refuse to answer on a batch too small to mean anything
+    small = activation_stats(m.trace(tensor([2, 1, 8, 8])), m)
+    check("dead-unit measure withheld below the minimum batch",
+          all(st["dead_units"] is None for st in small))
     check("a healthy ReLU is therefore not flagged",
           not [i for i in diagnose(m, tr, None) if "units are zero" in i[2]])
 
@@ -336,11 +346,20 @@ def test_diagnostics():
           all(st["dead_units"] is None or st["dead_units"] <= st["zeros"] + 1e-9
               for st in stats))
 
-    # update ratio must scale with the learning rate
+    # update ratio must scale with the learning rate. Layers whose only
+    # parameters are a bias or a normalisation scale report None: the heuristic
+    # divides by the weight norm, and those start at zero.
     r_small = dict((n, v) for n, v, _, _ in update_ratios(m, 1e-5))
     r_big = dict((n, v) for n, v, _, _ in update_ratios(m, 1e-1))
+    comparable = [k for k in r_small
+                  if r_small[k] is not None and r_small[k] > 0
+                  and r_big.get(k) is not None]
+    check("some layers have a comparable ratio", comparable, "none")
     check("update ratio scales with lr",
-          all(r_big[k] > r_small[k] * 100 for k in r_small if r_small[k] > 0))
+          all(r_big[k] > r_small[k] * 100 for k in comparable))
+    check("layers with only bias or scale report no ratio",
+          any(v is None for v in r_small.values()),
+          "every layer reported a ratio")
 
     # and a large lr must produce warnings a small one does not
     issues_big = diagnose(m, tr, 1e-1)

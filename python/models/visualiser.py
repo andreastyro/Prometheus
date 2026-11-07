@@ -388,6 +388,7 @@ def _gradient_flow(norms):
 # That is what DEAD_UNITS measures, and the threshold is set where it starts to
 # mean something rather than where ReLU normally sits.
 DEAD_UNITS = 0.25        # fraction of units zero across the whole batch
+MIN_DEAD_BATCH = 4       # below this, "zero for every sample" is mostly luck
 SATURATED = 0.99         # |tanh| or sigmoid distance from its asymptote
 SATURATED_FRACTION = 0.5
 RATIO_HIGH = 1e-2        # lr*|grad|/|w| above this: the step is large
@@ -434,12 +435,16 @@ def activation_stats(trace, model=None):
         sat = (sum(1 for v in vals if abs(v) >= SATURATED) / n
                if bounded else None)
 
-        # a unit is dead only if it is zero for every sample in the batch
+        # A unit is dead only if it is zero for every sample in the batch --
+        # and that needs enough samples to mean anything. With a batch of 2 a
+        # healthy ReLU has a 1 in 4 chance of being zero in both by luck, which
+        # is the threshold itself, so the measure is skipped below MIN_BATCH and
+        # compared against the chance level above it.
         shape = _shape_of(t)
         batch = shape[0] if shape else 1
         per = n // batch if batch else n
         dead_units = None
-        if batch > 1 and per:
+        if batch >= MIN_DEAD_BATCH and per:
             count = 0
             for u in range(per):
                 for b in range(batch):
@@ -453,6 +458,7 @@ def activation_stats(trace, model=None):
             "name": name,
             "kind": kind,
             "n": n,
+            "batch": batch,
             "zeros": zeros / n,
             "dead_units": dead_units,
             "saturated": sat,
@@ -463,22 +469,29 @@ def activation_stats(trace, model=None):
 
 
 def update_ratios(model, lr):
-    """lr * ||grad|| / ||weight|| per parameterised layer.
+    """lr * ||grad|| / ||weight|| per layer, over its weight matrices only.
 
     The ratio of the step an optimizer is about to take to the size of the
-    weight it is taking it on. Around 1e-3 is healthy; much larger and the
-    learning rate is too high for that layer, much smaller and the layer is
-    frozen. This diagnoses more training failures than the loss curve does,
-    and it is invisible in every other panel here.
+    weight it takes it on. Around 1e-3 is healthy; much larger and the learning
+    rate is high for that layer, much smaller and the layer is frozen.
+
+    Restricted to tensors of rank 2 or more, which is what the heuristic is for.
+    Biases and the shift terms of a normalisation layer start at zero, so
+    dividing by their norm produces an enormous number that means nothing: on a
+    healthy CNN this reported 4.3e-1 and 6.1e-1 for two BatchNorm betas whose
+    weight norms were 0.076 and 0.107. Those are now excluded, and a layer with
+    no weight matrix at all reports None rather than a fabricated ratio.
     """
     out = []
     for name, layer in model._layers:
-        ts = layer.parameters()
+        ts = [t for t in layer.parameters() if len(t.shape) >= 2]
         if not ts:
+            if layer.parameters():
+                out.append((name, None, 0.0, 0.0))   # bias/scale only
             continue
         gn = _l2([g for t in ts for g in t.grad])
         wn = _l2([w for t in ts for w in t.data])
-        out.append((name, (lr * gn / wn) if wn else 0.0, gn, wn))
+        out.append((name, (lr * gn / wn) if wn else None, gn, wn))
     return out
 
 
@@ -491,11 +504,14 @@ def diagnose(model, trace=None, lr=None):
             if st["nonfinite"]:
                 issues.append(("error", st["name"],
                                "%d non-finite activations" % st["nonfinite"]))
-            if st["dead_units"] is not None and st["dead_units"] >= DEAD_UNITS:
-                issues.append(("warn", st["name"],
-                               "%.0f%% of units are zero for every sample in "
-                               "the batch and receive no gradient"
-                               % (100 * st["dead_units"])))
+            if st["dead_units"] is not None:
+                chance = 0.5 ** st["batch"]
+                if (st["dead_units"] >= DEAD_UNITS
+                        and st["dead_units"] > 3.0 * chance):
+                    issues.append(("warn", st["name"],
+                                   "%.0f%% of units are zero across all %d "
+                                   "samples and receive no gradient"
+                                   % (100 * st["dead_units"], st["batch"])))
             if st["saturated"] is not None and st["saturated"] >= SATURATED_FRACTION:
                 issues.append(("warn", st["name"],
                                "%.0f%% saturated: %s has stopped passing "
@@ -521,7 +537,7 @@ def diagnose(model, trace=None, lr=None):
 
     if lr:
         for name, ratio, gn, wn in update_ratios(model, lr):
-            if gn == 0.0:
+            if ratio is None or gn == 0.0:
                 continue
             if ratio > RATIO_HIGH:
                 issues.append(("warn", name,
@@ -530,7 +546,9 @@ def diagnose(model, trace=None, lr=None):
                                "with Adam, a problem if it persists)" % ratio))
             elif ratio < RATIO_LOW:
                 issues.append(("warn", name,
-                               "update/weight ratio %.1e: barely moving"
+                               "update/weight ratio %.1e: barely moving, "
+                               "which is a frozen layer if the loss is still "
+                               "high and simply convergence if it is not"
                                % ratio))
 
     order = {"error": 0, "warn": 1}
@@ -596,12 +614,17 @@ def _diagnostics(model, trace, lr):
 
     if lr:
         urows = "".join(
-            '<tr><td class="n">%s</td><td class="s">%.2e</td>'
+            '<tr><td class="n">%s</td><td class="s">%s</td>'
             '<td class="t">%.3g</td><td class="t">%.3g</td></tr>'
-            % (_esc(n), r, gn, wn) for n, r, gn, wn in update_ratios(model, lr))
+            % (_esc(n), ("%.2e" % r) if r is not None else "n/a", gn, wn)
+            for n, r, gn, wn in update_ratios(model, lr))
         body += ('<table class="shapes" style="margin-top:14px"><thead><tr>'
                  '<th>layer</th><th>lr*|g|/|w|</th><th>|grad|</th>'
                  '<th>|weight|</th></tr></thead><tbody>%s</tbody></table>'
+                 '<p class="hint">Computed over weight matrices only. Biases '
+                 'and normalisation shift terms start at zero, so dividing by '
+                 'their norm gives a large number that means nothing; layers '
+                 'that have only those report n/a.</p>'
                  % urows)
     elif trace:
         body += ('<p class="hint">Pass lr=&lt;your learning rate&gt; for the '
