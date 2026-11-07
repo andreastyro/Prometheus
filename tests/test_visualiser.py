@@ -20,8 +20,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from python.gpt import GPT                                     # noqa: E402
 from python.models import CNN, GAN, MLP, VAE, ResNet, UNet      # noqa: E402
-from python.models.visualiser import (build_dashboard,          # noqa: E402
-                                      gradient_norms)
+from python.models.visualiser import (                          # noqa: E402
+    activation_stats, build_dashboard, diagnose, gradient_norms,
+    run_gradcheck, update_ratios)
 
 FAILURES = []
 CHECKS = [0]
@@ -293,6 +294,110 @@ def test_architecture_toggle():
     check("still renders without a sample", "Architecture" in html2)
 
 
+def test_diagnostics():
+    print("\n=== diagnostics ===")
+    p.Tensor.manual_seed(4)
+    m = CNN(1, 4, (8,), image_size=8)
+    x = tensor([2, 1, 8, 8])
+    out = m.forward(x)
+    p.mean(p.multiply(out, out), -1).backward()
+    tr = m.trace(x)
+
+    stats = activation_stats(tr, m)
+    check("one stat row per traced layer", len(stats) == len(tr))
+    check("dead fraction is a proportion",
+          all(0.0 <= st["dead"] <= 1.0 for st in stats))
+
+    # saturation only applies where the activation is bounded -- reporting a
+    # conv output above 0.99 as saturated flagged every healthy conv layer in
+    # the first version of this panel
+    unbounded = [st for st in stats if st["kind"] not in ("Sigmoid", "Tanh",
+                                                          "Softmax")]
+    check("saturation is not reported for unbounded layers",
+          all(st["saturated"] is None for st in unbounded),
+          str([st["name"] for st in unbounded if st["saturated"] is not None]))
+
+    # ReLU should have some exact zeros, and that is where "dead" is meaningful
+    relus = [st for st in stats if st["kind"] == "ReLU"]
+    check("ReLU layers report a dead fraction",
+          relus and all(st["dead"] > 0 for st in relus))
+
+    # update ratio must scale with the learning rate
+    r_small = dict((n, v) for n, v, _, _ in update_ratios(m, 1e-5))
+    r_big = dict((n, v) for n, v, _, _ in update_ratios(m, 1e-1))
+    check("update ratio scales with lr",
+          all(r_big[k] > r_small[k] * 100 for k in r_small if r_small[k] > 0))
+
+    # and a large lr must produce warnings a small one does not
+    issues_big = diagnose(m, tr, 1e-1)
+    issues_small = diagnose(m, tr, 1e-6)
+    big_ratio = [i for i in issues_big if "ratio" in i[2]]
+    check("a large lr is flagged", big_ratio, "none flagged")
+    check("a tiny lr is not flagged for being too large",
+          not [i for i in issues_small if "step is large" in i[2]])
+
+    # non-finite values must be reported as errors, not warnings
+    bad = m.parameters()[0]
+    saved = list(bad.data)
+    d = list(bad.data)
+    d[0] = float("nan")
+    bad.data = d
+    errs = [i for i in diagnose(m, None, None) if i[0] == "error"]
+    check("a NaN weight is an error", errs, "not reported")
+    bad.data = saved
+
+    html = build_dashboard(m, x=x, lr=1e-3)
+    check("diagnostics panel present", "Diagnostics" in panels(html))
+    check("panel states a verdict",
+          "no problems detected" in html or "warning" in html
+          or "error" in html)
+
+
+def test_gradient_connectivity():
+    print("\n=== gradient connectivity ===")
+    p.Tensor.manual_seed(4)
+
+    # a correctly trained model must come back clean: a panel that cries wolf
+    # on a healthy model is worse than no panel
+    m = CNN(1, 4, (8,), image_size=8)
+    x = tensor([2, 1, 8, 8])
+    opt = p.Adam(m.parameters(), 0.01)
+    for _ in range(4):
+        opt.zero_grad()
+        o = m.forward(x)
+        p.mean(p.multiply(o, o), -1).backward()
+        opt.step()
+
+    res = run_gradcheck(m, x)
+    check("every parameter reported", len(res) > 0)
+    check("no false DETACHED on a trained model",
+          not [r for r in res if r[1] is False],
+          str([r for r in res if r[1] is False][:2]))
+    check("no false DEAD on a trained model",
+          not [r for r in res if r[1] is None and "no effect" in (r[2] or "")])
+
+    # a parameter genuinely left out of forward() must be caught. gradcheck
+    # alone cannot: both its analytical and numeric gradients are zero, so they
+    # agree. The influence probe is what notices.
+    class Skipped(MLP):
+        def forward(self, xx):
+            for _, layer in self._layers[2:]:
+                xx = layer.forward(xx)
+            return xx
+
+    b = Skipped(4, 2, (4,))
+    rb = run_gradcheck(b, tensor([3, 4]))
+    dead = [r for r in rb if r[1] is None and "no effect" in (r[2] or "")]
+    check("a skipped layer is reported as dead weight", len(dead) == 2,
+          "%d flagged" % len(dead))
+
+    html = build_dashboard(b, x=tensor([3, 4]))
+    check("panel names the condition", "no effect on the output" in html
+          or "DEAD WEIGHT" in html)
+    check("panel says it is a connectivity check, not precision",
+          "connectivity check, not a precision one" in html)
+
+
 def main():
     print("Model dashboard")
     test_self_contained()
@@ -301,6 +406,8 @@ def main():
     test_graceful_without_input()
     test_gradient_norms()
     test_model_specific_panels()
+    test_diagnostics()
+    test_gradient_connectivity()
     test_gpt_attention()
     test_live_refresh()
     test_writes_a_file()

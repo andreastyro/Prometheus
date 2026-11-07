@@ -374,6 +374,356 @@ def _gradient_flow(norms):
     return _svg(width, height, "".join(out))
 
 
+# ── diagnostics ──────────────────────────────────────────────────────────────
+# These are the numbers that explain a model which trains but trains badly.
+# Each one is a specific, nameable failure rather than a picture to interpret.
+
+DEAD_FRACTION = 0.5      # a layer this dead is worth flagging
+SATURATED = 0.99         # |tanh| or sigmoid distance from its asymptote
+RATIO_HIGH = 1e-2        # lr*|grad|/|w| above this: the step is too large
+RATIO_LOW = 1e-5         # below this: the layer is effectively frozen
+
+
+def _l2(values):
+    total = 0.0
+    for v in values:
+        total += v * v
+    return math.sqrt(total)
+
+
+def _nonfinite(values):
+    n = 0
+    for v in values:
+        if v != v or v in (float("inf"), float("-inf")):
+            n += 1
+    return n
+
+
+# Saturation is only meaningful where the activation is bounded. A conv or
+# linear output above 0.99 is simply a large number; reporting it as saturated
+# flagged every healthy conv layer in the first version of this panel.
+BOUNDED = {"Sigmoid", "Tanh", "Softmax"}
+BIG_ACTIVATION = 1e3     # unbounded layers: large enough to be worth saying
+
+
+def activation_stats(trace, model=None):
+    """Per-layer dead and saturated fractions, from one forward pass."""
+    kinds = {}
+    if model is not None:
+        kinds = {name: type(layer).__name__ for name, layer in model._layers}
+
+    out = []
+    for name, t in trace:
+        vals = _flat(t)
+        if not vals:
+            continue
+        n = len(vals)
+        kind = kinds.get(name, "")
+        bounded = kind in BOUNDED
+        zeros = sum(1 for v in vals if v == 0.0)
+        sat = (sum(1 for v in vals if abs(v) >= SATURATED) / n
+               if bounded else None)
+        out.append({
+            "name": name,
+            "kind": kind,
+            "n": n,
+            "dead": zeros / n,
+            "saturated": sat,
+            "nonfinite": _nonfinite(vals),
+            "absmax": max((abs(v) for v in vals), default=0.0),
+        })
+    return out
+
+
+def update_ratios(model, lr):
+    """lr * ||grad|| / ||weight|| per parameterised layer.
+
+    The ratio of the step an optimizer is about to take to the size of the
+    weight it is taking it on. Around 1e-3 is healthy; much larger and the
+    learning rate is too high for that layer, much smaller and the layer is
+    frozen. This diagnoses more training failures than the loss curve does,
+    and it is invisible in every other panel here.
+    """
+    out = []
+    for name, layer in model._layers:
+        ts = layer.parameters()
+        if not ts:
+            continue
+        gn = _l2([g for t in ts for g in t.grad])
+        wn = _l2([w for t in ts for w in t.data])
+        out.append((name, (lr * gn / wn) if wn else 0.0, gn, wn))
+    return out
+
+
+def diagnose(model, trace=None, lr=None):
+    """Collect every warning worth showing, worst first."""
+    issues = []
+
+    if trace:
+        for st in activation_stats(trace, model):
+            if st["nonfinite"]:
+                issues.append(("error", st["name"],
+                               "%d non-finite activations" % st["nonfinite"]))
+            if st["dead"] >= DEAD_FRACTION:
+                issues.append(("warn", st["name"],
+                               "%.0f%% of activations are exactly zero"
+                               % (100 * st["dead"])))
+            if st["saturated"] is not None and st["saturated"] >= DEAD_FRACTION:
+                issues.append(("warn", st["name"],
+                               "%.0f%% saturated: %s has stopped passing "
+                               "gradient there"
+                               % (100 * st["saturated"], st["kind"])))
+            if st["saturated"] is None and st["absmax"] > BIG_ACTIVATION:
+                issues.append(("warn", st["name"],
+                               "activations reach %.3g, which will dominate "
+                               "whatever follows" % st["absmax"]))
+
+    for t in model.parameters():
+        bad = _nonfinite(t.data)
+        if bad:
+            issues.append(("error", "parameters",
+                           "%d non-finite weights" % bad))
+            break
+    for t in model.parameters():
+        bad = _nonfinite(t.grad)
+        if bad:
+            issues.append(("error", "gradients",
+                           "%d non-finite gradients" % bad))
+            break
+
+    if lr:
+        for name, ratio, gn, wn in update_ratios(model, lr):
+            if gn == 0.0:
+                continue
+            if ratio > RATIO_HIGH:
+                issues.append(("warn", name,
+                               "update/weight ratio %.1e: the step is large "
+                               "relative to the weights" % ratio))
+            elif ratio < RATIO_LOW:
+                issues.append(("warn", name,
+                               "update/weight ratio %.1e: barely moving"
+                               % ratio))
+
+    order = {"error": 0, "warn": 1}
+    issues.sort(key=lambda i: order.get(i[0], 2))
+    return issues
+
+
+def _diagnostics(model, trace, lr):
+    issues = diagnose(model, trace, lr)
+
+    pad, row_h, width = 16, 22, 760
+    head = 26
+    rows = issues or [("ok", "", "no problems detected")]
+    height = pad * 2 + head + len(rows) * row_h
+
+    colour = {"error": BAD, "warn": WARN, "ok": GOOD}
+    out = []
+    if issues:
+        n_err = sum(1 for k, _, _ in issues if k == "error")
+        n_warn = len(issues) - n_err
+        summary = ("%d error%s, %d warning%s"
+                   % (n_err, "" if n_err == 1 else "s",
+                      n_warn, "" if n_warn == 1 else "s"))
+        out.append(_text(pad, pad + 10, summary, 11,
+                         BAD if n_err else WARN, weight="600"))
+    else:
+        out.append(_text(pad, pad + 10, "no problems detected", 11, GOOD,
+                         weight="600"))
+
+    for i, (kind, where, msg) in enumerate(rows):
+        y = pad + head + i * row_h
+        col = colour.get(kind, DIM)
+        out.append(_rect(pad, y, 3, row_h - 6, col))
+        if where:
+            out.append(_text(pad + 12, y + 11, where, 10, TEXT))
+        out.append(_text(pad + 12 + (150 if where else 0), y + 11, msg, 10, DIM))
+
+    body = _svg(width, height, "".join(out))
+
+    # the supporting numbers, so a warning can be checked rather than trusted
+    if trace:
+        stats = activation_stats(trace, model)
+        srows = "".join(
+            '<tr><td class="n">%s</td><td class="t">%.0f%%</td>'
+            '<td class="t">%s</td><td class="s">%.3g</td></tr>'
+            % (_esc(st["name"]), 100 * st["dead"],
+               ("%.0f%%" % (100 * st["saturated"]))
+               if st["saturated"] is not None else "n/a",
+               st["absmax"])
+            for st in stats)
+        body += ('<table class="shapes"><thead><tr><th>layer</th>'
+                 '<th>zero</th><th>saturated</th><th>max |activation|</th>'
+                 '</tr></thead><tbody>%s</tbody></table>' % srows)
+
+    if lr:
+        urows = "".join(
+            '<tr><td class="n">%s</td><td class="s">%.2e</td>'
+            '<td class="t">%.3g</td><td class="t">%.3g</td></tr>'
+            % (_esc(n), r, gn, wn) for n, r, gn, wn in update_ratios(model, lr))
+        body += ('<table class="shapes" style="margin-top:14px"><thead><tr>'
+                 '<th>layer</th><th>lr*|g|/|w|</th><th>|grad|</th>'
+                 '<th>|weight|</th></tr></thead><tbody>%s</tbody></table>'
+                 % urows)
+    elif trace:
+        body += ('<p class="hint">Pass lr=&lt;your learning rate&gt; for the '
+                 'update-to-weight ratio of each layer.</p>')
+
+    return body
+
+
+# ── gradcheck panel ──────────────────────────────────────────────────────────
+# This panel answers "is every parameter actually connected to the loss", not
+# "is every gradient numerically exact". The distinction matters.
+#
+# A finite difference taken on a trained model is a poor precision instrument:
+# the gradients are small by then, and any ReLU in the network puts kinks in the
+# way, so a tight tolerance reports failures on a perfectly correct model. The
+# first version of this panel did exactly that -- it flagged three parameter
+# tensors of a healthy CNN.
+#
+# So the tolerances here are deliberately loose. What survives them is the
+# failure that actually bit this library sixteen times: a layer whose result was
+# written into a raw buffer, leaving the analytical gradient exactly zero while
+# the numeric one is plainly not. Per-element precision is covered properly by
+# tests/test_gradcheck.cpp, on inputs chosen to avoid kinks.
+CONNECT_ATOL = 1e-3
+CONNECT_RTOL = 0.5
+
+
+def run_gradcheck(model, x, max_tensors=8, max_points=1, eps=1e-3):
+    """Check that each parameter is connected to the loss. Budgeted on purpose.
+
+    gradcheck re-runs the forward pass twice per probed element, which on a
+    ResNet is not something to do unconditionally on every render, so this
+    probes one element of each of the first few tensors.
+    """
+    forward = _scalar_forward(model, x)
+    if forward is None:
+        return None
+
+    results = []
+    for i, t in enumerate(model.parameters()[:max_tensors]):
+        if not t.requires_grad:
+            results.append((i, None, "requires_grad is false"))
+            continue
+        try:
+            # First: does this parameter influence the output at all? If the
+            # numeric gradient is zero then so is the analytical one, and
+            # gradcheck would call that agreement. It is not -- it means the
+            # tensor is dead weight the optimizer will never move. pos_emb
+            # under rope=True is the benign version; a layer accidentally left
+            # out of forward() is the bug version.
+            if _numeric_influence(forward, t, eps) == 0.0:
+                results.append((i, None,
+                                "no effect on the output; nothing to learn"))
+                continue
+
+            r = p.gradcheck(forward, [t], eps=eps, max_points=max_points,
+                            atol=CONNECT_ATOL, rtol=CONNECT_RTOL)
+            note = ""
+            if not r["passed"]:
+                line = r["report"].strip().splitlines()
+                note = line[-1].strip() if line else ""
+            results.append((i, r["passed"], note))
+        except Exception as exc:
+            results.append((i, None, "%s: %s" % (type(exc).__name__,
+                                                 str(exc)[:60])))
+    return results
+
+
+def _numeric_influence(forward, t, eps, probes=3):
+    """Largest |central difference| over a few elements of t. Zero means the
+    parameter does not reach the output on this input at all."""
+    n = t.num_el()
+    step = max(1, n // probes)
+    worst = 0.0
+    for idx in range(0, n, step):
+        data = list(t.data)
+        orig = data[idx]
+
+        data[idx] = orig + eps
+        t.data = data
+        hi = p.mean(forward(), -1).data[0]
+
+        data[idx] = orig - eps
+        t.data = data
+        lo = p.mean(forward(), -1).data[0]
+
+        data[idx] = orig
+        t.data = data
+
+        worst = max(worst, abs(hi - lo) / (2.0 * eps))
+    return worst
+
+
+def _scalar_forward(model, x):
+    """A re-runnable callable returning one Tensor, whatever the model returns."""
+    if x is None:
+        return None
+
+    def call():
+        out = model.forward(x)
+        # VAE returns (reconstruction, mu, logvar)
+        return out[0] if isinstance(out, tuple) else out
+
+    try:
+        call()
+    except Exception:
+        return None
+    return call
+
+
+def _gradcheck_panel(model, x):
+    results = run_gradcheck(model, x)
+    if results is None:
+        return ('<p class="hint">Pass x=&lt;a sample batch&gt; to check that '
+                'every parameter is connected to the loss.</p>')
+
+    pad, row_h, width = 16, 22, 760
+    height = pad * 2 + 26 + len(results) * row_h
+
+    n_pass = sum(1 for _, ok, _ in results if ok)
+    n_fail = sum(1 for _, ok, _ in results if ok is False)
+    n_dead = sum(1 for _, ok, note in results
+                 if ok is None and "no effect" in (note or ""))
+    extra = ""
+    if n_fail:
+        extra += ", %d DETACHED" % n_fail
+    if n_dead:
+        extra += ", %d with no effect on the output" % n_dead
+    out = [_text(pad, pad + 10,
+                 "%d of %d parameter tensors connected to the loss%s"
+                 % (n_pass, len(results), extra),
+                 11, BAD if n_fail else (WARN if n_dead else GOOD),
+                 weight="600")]
+
+    for i, (idx, ok, note) in enumerate(results):
+        y = pad + 26 + i * row_h
+        col = GOOD if ok else (BAD if ok is False else DIM)
+        out.append(_rect(pad, y, 3, row_h - 6, col))
+        out.append(_text(pad + 12, y + 11, "parameter %d" % idx, 10, TEXT))
+        label = ("connected" if ok
+                 else ("DETACHED - receives no gradient" if ok is False
+                       else ("DEAD WEIGHT" if "no effect" in (note or "")
+                             else "skipped")))
+        if ok is None and "no effect" in (note or ""):
+            col = WARN
+            out.append(_rect(pad, y, 3, row_h - 6, col))
+        out.append(_text(pad + 120, y + 11, label, 10, col))
+        if note:
+            out.append(_text(pad + 320, y + 11, note[:66], 9, DIM))
+
+    body = _svg(width, height, "".join(out))
+    return body + (
+        '<p class="hint">A connectivity check, not a precision one: finite '
+        'differences on a trained network with ReLU kinks are too noisy to '
+        'certify exact values, so the tolerances are loose. What they still '
+        'catch is a parameter whose analytical gradient is zero while the '
+        'numeric one is not. For per-element precision see '
+        'tests/test_gradcheck.cpp.</p>')
+
+
 # ── model-specific panels ────────────────────────────────────────────────────
 def _activation_heatmap(trace, limit=6):
     """MLP: one row per neuron-vector activation, colour-coded by value."""
@@ -720,7 +1070,7 @@ table.shapes td.s{color:%(accent)s}
 
 def build_dashboard(model, x=None, history=None, real=None, labels=None,
                     token_ids=None, attention_layer=0, live_seconds=None,
-                    theme="default"):
+                    theme="default", lr=None, gradcheck=True):
     """Return the dashboard as one self-contained HTML string."""
     kind = type(model).__name__
 
@@ -741,6 +1091,14 @@ def build_dashboard(model, x=None, history=None, real=None, labels=None,
     parts.append(_panel("Gradient flow", _gradient_flow(gradient_norms(model)),
                         "L2 norm of each layer's parameter gradients after the "
                         "last backward pass"))
+    parts.append(_panel("Diagnostics", _diagnostics(model, trace, lr),
+                        "dead and saturated activations, non-finite values, "
+                        "and how large each update is relative to its weights"))
+    if gradcheck:
+        parts.append(_panel("Gradient connectivity",
+                            _gradcheck_panel(model, x),
+                            "every parameter should receive a gradient; a "
+                            "detached one trains at zero and never says so"))
 
     # ---- the model-specific panel ----
     if trace:
@@ -800,7 +1158,8 @@ dependencies</footer>
 
 def visualise(model, x=None, history=None, filename=None, open_browser=True,
               real=None, labels=None, token_ids=None, attention_layer=0,
-              live_seconds=None, theme="default", standalone_3d=False):
+              live_seconds=None, theme="default", standalone_3d=False,
+              lr=None, gradcheck=True):
     """Write the dashboard to disk and open it. Returns the path.
 
     The isometric diagram is embedded in the Architecture panel, so one file
@@ -825,7 +1184,8 @@ def visualise(model, x=None, history=None, filename=None, open_browser=True,
     html = build_dashboard(model, x=x, history=history, real=real,
                            labels=labels, token_ids=token_ids,
                            attention_layer=attention_layer,
-                           live_seconds=live_seconds, theme=theme)
+                           live_seconds=live_seconds, theme=theme,
+                           lr=lr, gradcheck=gradcheck)
 
     with open(filename, "w", encoding="utf-8") as fh:
         fh.write(html)
