@@ -56,7 +56,9 @@ if use_openblas:
     if openblas_root:
         include_dirs.append(os.path.join(openblas_root, "include"))
         library_dirs.append(os.path.join(openblas_root, "lib"))
-    libraries.append("openblas")
+    # The official Windows build ships its import library as libopenblas.lib,
+    # so MSVC needs the "lib" kept; everywhere else -lopenblas is correct.
+    libraries.append("libopenblas" if sys.platform == "win32" else "openblas")
 
 elif use_mkl:
     define_macros.append(("PROMETHEUS_USE_MKL", None))

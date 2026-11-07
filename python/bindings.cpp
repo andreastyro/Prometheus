@@ -5,6 +5,7 @@
 
 #include "ml/tensor.hpp"
 #include "ml/ops.hpp"
+#include "ml/matmul_backend.hpp"
 #include "ml/loss.hpp"
 #include "ml/metrics/metrics.hpp"
 
@@ -137,6 +138,12 @@ PYBIND11_MODULE(prometheus, m) {
           "O(1) reshape sharing storage.");
     m.def("contiguous",     &contiguous, py::arg("a"),
           "Materialise a view; returns the input unchanged if it owns its data.");
+    m.def("backend", []() {
+        py::dict d;
+        d["matmul"]  = matmul_backend_name();
+        d["threads"] = matmul_max_threads();
+        return d;
+    }, "Which matmul backend this build compiled in, and its thread count.");
     m.def("matmul_bt",     &matmul_bt, py::arg("a"), py::arg("b"),
           "a @ b^T without building b^T. a is [m, k], b is [n, k].");
 

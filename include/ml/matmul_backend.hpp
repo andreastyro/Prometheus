@@ -8,6 +8,16 @@
 
 /// Forward pass: C = A @ B
 /// A [m, k],  B [k, n],  C [m, n]  — C is zeroed before accumulation
+/// Which matmul backend this build actually compiled in, and whether it can
+/// use more than one core. Worth having: the backend is chosen by compile-time
+/// macros with every option defaulting to off, so a build that silently fell
+/// back to the portable kernel looks identical from the outside. Reading a
+/// benchmark without checking this produced a phantom 4x regression once.
+const char* matmul_backend_name();
+
+/// Threads OpenMP will actually use, or 1 when built without it.
+int matmul_max_threads();
+
 void matmul_forward(int m, int n, int k,
                     const float* a, const float* b, float* c);
 

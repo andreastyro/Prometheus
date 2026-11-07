@@ -1,5 +1,8 @@
 #include "ml/matmul_backend.hpp"
 #include <algorithm>
+#ifdef PROMETHEUS_USE_OPENMP
+    #include <omp.h>
+#endif
 
 #if defined(PROMETHEUS_USE_OPENBLAS)
     #include <cblas.h>
@@ -111,6 +114,24 @@ static void matmul_at_tiled(int m, int inner, int ncols,
                             oi[j] += a_ki * gk[j];
                     }
             }
+}
+
+const char* matmul_backend_name() {
+#if defined(PROMETHEUS_USE_OPENBLAS)
+    return "openblas";
+#elif defined(PROMETHEUS_USE_MKL)
+    return "mkl";
+#else
+    return "tiled";
+#endif
+}
+
+int matmul_max_threads() {
+#ifdef PROMETHEUS_USE_OPENMP
+    return omp_get_max_threads();
+#else
+    return 1;
+#endif
 }
 
 void matmul_forward(int m, int n, int k,

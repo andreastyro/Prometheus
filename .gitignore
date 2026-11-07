@@ -42,3 +42,6 @@ _tmp_*.bin
 _opt_state.bin
 *_state.bin
 tests/assets/model.bin
+
+# OpenBLAS runtime copied next to the built module
+libopenblas.dll

@@ -134,8 +134,42 @@ Adam and AdamW persist their momentum buffers through `save_state()` / `load_sta
 | **Tiled + OpenMP** | Cache-friendly `ikj` tiling, parallel outer loop |
 | **Tiled** | Fallback, no external dependency |
 
-CMake auto-detects what's available and falls back cleanly. Benchmark with
+Every backend defaults to **off**, so a build with no flags uses the portable
+tiled kernel on one thread. Nothing is auto-detected. Ask the library what it
+actually got, rather than assuming:
+
+```python
+>>> prometheus.backend()
+{'matmul': 'openblas', 'threads': 16}
+```
+
+Measured on a 16.8M-parameter GPT, batch 8, sequence 128, 16 threads, one
+training step including the backward pass and the optimiser:
+
+| Build | tok/s |
+|---|---|
+| Tiled, 1 thread | 48 |
+| Tiled + OpenMP | 120-190 |
+| OpenBLAS + OpenMP | 323-362 |
+
+The spread on the tiled rows is real run-to-run variance on a desktop, not a
+range of configurations. Benchmark with
 [tests/benchmark_matmul.cpp](tests/benchmark_matmul.cpp).
+
+#### Windows: OpenBLAS in three steps
+
+The official release ships its import library as `libopenblas.lib`, and the
+headers are in a separate directory from the `.a` files, so it needs pointing at:
+
+```bash
+# 1. unpack https://github.com/OpenMathLib/OpenBLAS/releases -> OpenBLAS-<ver>-x64.zip
+# 2. build against it
+OPENBLAS_ROOT=/path/to/openblas PROMETHEUS_USE_OPENBLAS=1 PROMETHEUS_USE_OPENMP=1     pip install -e . --no-build-isolation
+# 3. put libopenblas.dll next to the built module, or on PATH
+```
+
+Then check `prometheus.backend()` says `openblas`. If it says `tiled`, the
+build fell back and the numbers above do not apply.
 
 ---
 
