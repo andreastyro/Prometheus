@@ -89,7 +89,10 @@ public:
 
     /// Zero out all gradients. Call this before each forward pass.
     void reset_grad() {
-        grad.assign(data.size(), 0.0f);
+        // num_el() rather than data.size(): they agree for an owned tensor,
+        // but sizing from the element count is the correct rule and is what a
+        // tensor that does not own its storage would need.
+        grad.assign((std::size_t)num_el(), 0.0f);
     }
 
     /// Allocate the gradient buffer if it has not been allocated yet.
@@ -99,13 +102,13 @@ public:
     /// input, which covers everything that takes part in a graph; anything
     /// else never needs one.
     void ensure_grad() {
-        if (grad.size() != data.size())
-            grad.assign(data.size(), 0.0f);
+        if (grad.size() != (std::size_t)num_el())
+            grad.assign((std::size_t)num_el(), 0.0f);
     }
 
     /// True once a gradient buffer exists. Useful for asserting that a tensor
     /// actually took part in a backward pass.
-    bool has_grad() const { return grad.size() == data.size(); }
+    bool has_grad() const { return grad.size() == (std::size_t)num_el(); }
 
     /// Create a tensor filled with random values from N(0, 1).
     /// Used to initialise weights — random breaks symmetry so neurons learn different things.
