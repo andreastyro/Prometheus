@@ -144,6 +144,9 @@ PYBIND11_MODULE(prometheus, m) {
         d["threads"] = matmul_max_threads();
         return d;
     }, "Which matmul backend this build compiled in, and its thread count.");
+    m.def("linear_op",     &linear_op, py::arg("x"), py::arg("W"),
+          py::arg("bias") = nullptr, py::arg("residual") = nullptr,
+          "residual + x @ W + bias as one op.");
     m.def("matmul_bt",     &matmul_bt, py::arg("a"), py::arg("b"),
           "a @ b^T without building b^T. a is [m, k], b is [n, k].");
 

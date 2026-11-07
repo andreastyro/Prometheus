@@ -13,38 +13,38 @@ using namespace std;
 
 // RoPE: rotate each consecutive pair of dims by angle pos * θ_i,  θ_i = 10000^(-2i/D).
 // v is [S, D], modified in-place. pos_offset shifts all position indices (for KV cache).
-static void apply_rope_at(float* v, int S, int D, int pos_offset) {
+static void apply_rope_at(float* v, int S, int D, int pos_offset, int ld) {
     for (int t = 0; t < S; t++) {
         for (int i = 0; i < D / 2; i++) {
             float theta = powf(10000.0f, -2.0f * i / D);
             float angle = (t + pos_offset) * theta;
             float c = cosf(angle), s = sinf(angle);
-            float v0 = v[t*D + 2*i], v1 = v[t*D + 2*i + 1];
-            v[t*D + 2*i]     = v0*c - v1*s;
-            v[t*D + 2*i + 1] = v0*s + v1*c;
+            float v0 = v[t*ld + 2*i], v1 = v[t*ld + 2*i + 1];
+            v[t*ld + 2*i]     = v0*c - v1*s;
+            v[t*ld + 2*i + 1] = v0*s + v1*c;
         }
     }
 }
 
 // Backward through RoPE: applies the transpose (= inverse) rotation R(-θ) to the gradient.
-static void apply_rope_backward_at(float* grad, int S, int D, int pos_offset) {
+static void apply_rope_backward_at(float* grad, int S, int D, int pos_offset, int ld) {
     for (int t = 0; t < S; t++) {
         for (int i = 0; i < D / 2; i++) {
             float theta = powf(10000.0f, -2.0f * i / D);
             float angle = (t + pos_offset) * theta;
             float c = cosf(angle), s = sinf(angle);
-            float g0 = grad[t*D + 2*i], g1 = grad[t*D + 2*i + 1];
-            grad[t*D + 2*i]     =  g0*c + g1*s;
-            grad[t*D + 2*i + 1] = -g0*s + g1*c;
+            float g0 = grad[t*ld + 2*i], g1 = grad[t*ld + 2*i + 1];
+            grad[t*ld + 2*i]     =  g0*c + g1*s;
+            grad[t*ld + 2*i + 1] = -g0*s + g1*c;
         }
     }
 }
 
 static inline void apply_rope(vector<float>& v, int S, int D, int off) {
-    apply_rope_at(v.data(), S, D, off);
+    apply_rope_at(v.data(), S, D, off, D);
 }
 static inline void apply_rope_backward(vector<float>& g, int S, int D, int off) {
-    apply_rope_backward_at(g.data(), S, D, off);
+    apply_rope_backward_at(g.data(), S, D, off, D);
 }
 
 MultiHeadAttention::MultiHeadAttention(int embed_dim, int num_heads, bool causal, bool rope)
@@ -99,43 +99,27 @@ TensorPtr MultiHeadAttention::forward(TensorPtr input, int batch) {
     vector<float> QKV((size_t)rows * E3);
     matmul_forward(rows, E3, E, input->data.data(), W_qkv.data(), QKV.data());
 
-    // Per-head slices and softmax weights saved for backward
-    vector<vector<float>> Q_heads(H, vector<float>(rows * D));
-    vector<vector<float>> K_heads(H, vector<float>(rows * D));
-    vector<vector<float>> V_heads(H, vector<float>(rows * D));
-    // one [S, S] attention matrix per head per sequence
-    vector<vector<float>> A_heads(H, vector<float>(B * S * S));
+    // Heads are read straight out of the fused QKV buffer: head h of row t
+    // starts at QKV[t*E3 + h*D], so every gemm below takes a row stride of E3
+    // rather than a dense [S, D] copy. This used to copy Q, K and V into
+    // per-head buffers and every head's output back into concat_all; both
+    // copies, and the three per-head buffers, are gone.
+    //
+    // softmax weights, one [S, S] matrix per head per sequence, for backward
+    vector<vector<float>> A_heads(H, vector<float>((size_t)B * S * S));
+    vector<float> concat_all((size_t)rows * E, 0.0f);
 
-    vector<float> concat_all(rows * E, 0.0f);
-
-    // Slicing and rotation are per head, and each head owns its own buffer,
-    // so this splits across threads with no sharing.
-    #pragma omp parallel for schedule(static) if(H > 1)
-    for (int h = 0; h < H; h++) {
-        const int start = h * D;
-
-        // Slice Q_h, K_h, V_h for every row  [rows, D]
-        for (int t = 0; t < rows; t++)
-            for (int d = 0; d < D; d++) {
-                Q_heads[h][t*D + d] = QKV[t*E3 + start + d];
-                K_heads[h][t*D + d] = QKV[t*E3 + E + start + d];
-                V_heads[h][t*D + d] = QKV[t*E3 + 2*E + start + d];
-            }
-
-        // RoPE positions restart at every sequence, so rotate each slice
-        // separately rather than letting position run across the batch.
-        if (rope_)
+    // RoPE rotates Q and K in place, per sequence so positions restart at 0
+    if (rope_) {
+        #pragma omp parallel for schedule(static) if(H > 1)
+        for (int h = 0; h < H; h++)
             for (int b = 0; b < B; b++) {
-                apply_rope_at(Q_heads[h].data() + b*S*D, S, D, 0);
-                apply_rope_at(K_heads[h].data() + b*S*D, S, D, 0);
+                float* q = QKV.data() + (size_t)b*S*E3 + h*D;
+                apply_rope_at(q,     S, D, 0, E3);
+                apply_rope_at(q + E, S, D, 0, E3);
             }
     }
 
-    // Scores, softmax and the value product are independent for every
-    // (head, sequence) pair -- 48 of them at 6 heads and batch 8, every bit
-    // of it scalar work that was running on a single core while the matmuls
-    // around it used all 16. Flattened into one loop because MSVC's OpenMP
-    // 2.0 has no collapse(2).
     {
     // BLAS pinned to one thread for the per-head gemms only; the projections
     // either side are large and want every core
@@ -144,52 +128,40 @@ TensorPtr MultiHeadAttention::forward(TensorPtr input, int batch) {
     #pragma omp parallel for schedule(static) if(HB > 1)
     for (int hb = 0; hb < HB; hb++) {
         const int h = hb / B, b = hb % B;
-        const int start = h * D;
-        {
-            const float* Q_b = Q_heads[h].data() + b*S*D;
-            const float* K_b = K_heads[h].data() + b*S*D;
-            const float* V_b = V_heads[h].data() + b*S*D;
-            float* A_b = A_heads[h].data() + b*S*S;
+        const float* Q_b = QKV.data() + (size_t)b*S*E3 + h*D;
+        const float* K_b = Q_b + E;
+        const float* V_b = Q_b + 2*E;
+        float* A_b = A_heads[h].data() + (size_t)b*S*S;
 
-            // scores = Q_b @ K_b^T  [S, S], with the transpose handed to the
-            // kernel as a flag. Building K_b^T explicitly ran once per head per
-            // sequence per layer - 288 copies and 9.4 MB per forward pass at
-            // batch 8, for a matrix that is only read.
-            vector<float> scores(S * S, 0.0f);
-            matmul_forward_bt_serial(S, S, D, Q_b, K_b, scores.data());
-            for (float& v : scores) v *= attn_scale;
+        // scores = Q_b @ K_b^T  [S, S]
+        vector<float> scores((size_t)S * S);
+        gemm_serial(false, true, S, S, D, Q_b, E3, K_b, E3, 0.0f, scores.data(), S);
+        for (float& v : scores) v *= attn_scale;
 
-            // Causal mask: future positions get ~0 weight after softmax
-            if (causal_)
-                for (int i = 0; i < S; i++)
-                    for (int j = i + 1; j < S; j++)
-                        scores[i*S + j] = -1e9f;
+        // Causal mask: future positions get ~0 weight after softmax
+        if (causal_)
+            for (int i = 0; i < S; i++)
+                for (int j = i + 1; j < S; j++)
+                    scores[i*S + j] = -1e9f;
 
-            // Row-wise softmax → A_b [S, S]
-            // exp, sum and scale as three separate loops: a float sum in the
-            // same loop as the exp is a reduction the compiler will not
-            // reorder, and it would hold the exp back to one lane too
-            for (int i = 0; i < S; i++) {
-                const float max_v = *max_element(scores.data() + i*S, scores.data() + (i+1)*S);
-                float* row = A_b + i*S;
-                const float* sc = scores.data() + i*S;
-                for (int j = 0; j < S; j++) row[j] = fastmath::exp(sc[j] - max_v);
-                float sum = 0.0f;
-                for (int j = 0; j < S; j++) sum += row[j];
-                const float inv = 1.0f / sum;
-                for (int j = 0; j < S; j++) row[j] *= inv;
-            }
-
-            // O_b = A_b @ V_b  [S, D]
-            vector<float> O_b(S * D, 0.0f);
-            matmul_forward_serial(S, D, S, A_b, V_b, O_b.data());
-
-            for (int t = 0; t < S; t++)
-                for (int d = 0; d < D; d++)
-                    concat_all[(b*S + t)*E + start + d] = O_b[t*D + d];
+        // exp, sum and scale as three separate loops: a float sum in the
+        // same loop as the exp is a reduction the compiler will not reorder,
+        // and it would hold the exp back to one lane too
+        for (int i = 0; i < S; i++) {
+            const float max_v = *max_element(scores.data() + i*S, scores.data() + (i+1)*S);
+            float* row = A_b + i*S;
+            const float* sc = scores.data() + i*S;
+            for (int j = 0; j < S; j++) row[j] = fastmath::exp(sc[j] - max_v);
+            float sum = 0.0f;
+            for (int j = 0; j < S; j++) sum += row[j];
+            const float inv = 1.0f / sum;
+            for (int j = 0; j < S; j++) row[j] *= inv;
         }
-    }
 
+        // O_b = A_b @ V_b, written straight into this head's columns
+        gemm_serial(false, false, S, D, S, A_b, S, V_b, E3, 0.0f,
+                    concat_all.data() + (size_t)b*S*E + h*D, E);
+    }
     }   // serial BLAS scope ends
 
     // output = concat @ W_o  [S, E]
@@ -213,9 +185,7 @@ TensorPtr MultiHeadAttention::forward(TensorPtr input, int batch) {
             // are about 9 MB together, and copying them per layer per forward
             // cost more than some of the matmuls they exist to support
             concat_all  = std::move(concat_all),
-            Q_heads     = std::move(Q_heads),
-            K_heads     = std::move(K_heads),
-            V_heads     = std::move(V_heads),
+            QKV         = std::move(QKV),
             A_heads     = std::move(A_heads),
             W_qkv       = std::move(W_qkv),
             rows, B, S, E, E3, H, D, attn_scale, rope
@@ -237,81 +207,54 @@ TensorPtr MultiHeadAttention::forward(TensorPtr input, int batch) {
             vector<float> grad_QKV((size_t)rows * E3, 0.0f);
 
             // ── Per-head backward ─────────────────────────────────────────
-            // Same independence as the forward: every (head, sequence) pair
-            // writes only its own slice of grad_QKV.
+            // Same layout as the forward: heads are read from the saved QKV
+            // and from grad_concat with row strides, and each (head, sequence)
+            // pair writes its gradients straight into its own block of
+            // grad_QKV, which no other iteration touches.
             {
             SerialBlasScope serial_blas;
             const int HB = H * B;
             #pragma omp parallel for schedule(static) if(HB > 1)
             for (int hb = 0; hb < HB; hb++) {
                 const int h = hb / B, b = hb % B;
-                const int start = h * D;
-              {
-                const float* A_h = A_heads[h].data() + b*S*S;
-                const float* Q_h = Q_heads[h].data() + b*S*D;
-                const float* K_h = K_heads[h].data() + b*S*D;
-                const float* V_h = V_heads[h].data() + b*S*D;
+                const size_t qkv_off = (size_t)b*S*E3 + h*D;
+                const float* A_h = A_heads[h].data() + (size_t)b*S*S;
+                const float* Q_h = QKV.data() + qkv_off;
+                const float* K_h = Q_h + E;
+                const float* V_h = Q_h + 2*E;
+                const float* gO  = grad_concat.data() + (size_t)b*S*E + h*D;
+                float* gQ = grad_QKV.data() + qkv_off;
+                float* gK = gQ + E;
+                float* gV = gQ + 2*E;
 
-                // Gather grad_O_h from grad_concat  [S, D]
-                vector<float> grad_O_h(S * D);
-                for (int t = 0; t < S; t++)
-                    for (int d = 0; d < D; d++)
-                        grad_O_h[t*D + d] = grad_concat[(b*S + t)*E + start + d];
+                // O = A @ V:  grad_A = grad_O @ V^T,  grad_V = A^T @ grad_O
+                vector<float> grad_A((size_t)S * S);
+                gemm_serial(false, true, S, S, D, gO, E, V_h, E3, 0.0f, grad_A.data(), S);
+                gemm_serial(true, false, S, D, S, A_h, S, gO, E, 1.0f, gV, E3);
 
-                // O_h = A_h @ V_h:
-                //   grad_A_h [S,S] += grad_O_h [S,D] @ V_h^T [D,S]
-                //   grad_V_h [S,D] += A_h^T [S,S] @ grad_O_h [S,D]
-                vector<float> grad_A_h(S * S, 0.0f);
-                matmul_backward_a_serial(S, S, D, grad_O_h.data(), V_h, grad_A_h.data());
-
-                vector<float> grad_V_h(S * D, 0.0f);
-                matmul_backward_b_serial(S, S, D, grad_O_h.data(), A_h, grad_V_h.data());
-
-                // Softmax backward: grad_scores_h = A_h * (grad_A_h - rowsum(grad_A_h * A_h))
-                // Causal-masked positions have A_h[i,j] ≈ 0, so their gradients vanish naturally.
-                vector<float> grad_scores(S * S);
+                // Softmax backward, with the attn_scale applied before the
+                // softmax folded in: grad_scores = scale * A * (grad_A - rowsum)
+                // Causal-masked positions have A ~ 0, so their gradients vanish.
+                vector<float> grad_scores((size_t)S * S);
                 for (int i = 0; i < S; i++) {
                     float rowsum = 0.0f;
                     for (int j = 0; j < S; j++)
-                        rowsum += grad_A_h[i*S + j] * A_h[i*S + j];
+                        rowsum += grad_A[i*S + j] * A_h[i*S + j];
                     for (int j = 0; j < S; j++)
-                        grad_scores[i*S + j] = A_h[i*S + j] * (grad_A_h[i*S + j] - rowsum);
+                        grad_scores[i*S + j] = attn_scale * A_h[i*S + j] * (grad_A[i*S + j] - rowsum);
                 }
 
-                // Scale backward (scores were multiplied by attn_scale before softmax)
-                for (float& g : grad_scores) g *= attn_scale;
+                // scores = Q @ K^T:  grad_Q = grad_scores @ K,  grad_K = grad_scores^T @ Q
+                gemm_serial(false, false, S, D, S, grad_scores.data(), S, K_h, E3, 1.0f, gQ, E3);
+                gemm_serial(true,  false, S, D, S, grad_scores.data(), S, Q_h, E3, 1.0f, gK, E3);
 
-                // scores = Q_h @ K_h^T:
-                //   grad_Q_h [S,D] = grad_scores [S,S] @ K_h [S,D]
-                //   grad_K_h [S,D] = grad_scores^T [S,S] @ Q_h [S,D]
-                vector<float> grad_Q_h(S * D, 0.0f);
-                matmul_forward_serial(S, D, S, grad_scores.data(), K_h, grad_Q_h.data());
-
-                // grad_scores^T @ Q_h is A^T @ B, which is the shape
-                // matmul_backward_b already computes, so the [S,S] transpose
-                // buffer goes away too - 18.9 MB per backward pass at batch 8.
-                vector<float> grad_K_h(S * D, 0.0f);
-                matmul_backward_b_serial(S, S, D, Q_h, grad_scores.data(), grad_K_h.data());
-
-                // RoPE backward: Q_h and K_h in the saved heads are already rotated.
-                // grad_Q_h/grad_K_h are in the rotated space — apply inverse rotation
-                // to bring them back into the original (pre-rotation) Q/K space.
+                // The saved Q and K are rotated, so their gradients are in the
+                // rotated space: apply the inverse rotation to bring them back.
                 if (rope) {
-                    apply_rope_backward_at(grad_Q_h.data(), S, D, 0);
-                    apply_rope_backward_at(grad_K_h.data(), S, D, 0);
+                    apply_rope_backward_at(gQ, S, D, 0, E3);
+                    apply_rope_backward_at(gK, S, D, 0, E3);
                 }
-
-                // Scatter head gradients into the full [rows, E] accumulators
-                for (int t = 0; t < S; t++)
-                    for (int d = 0; d < D; d++) {
-                        const size_t base = (size_t)(b*S + t)*E3 + start + d;
-                        grad_QKV[base          ] += grad_Q_h[t*D + d];
-                        grad_QKV[base + E      ] += grad_K_h[t*D + d];
-                        grad_QKV[base + 2*E    ] += grad_V_h[t*D + d];
-                    }
-              }
             }
-
             }   // serial BLAS scope ends
 
             // ── Input projection backward ─────────────────────────────────

@@ -21,8 +21,9 @@ Linear::Linear(int in_features, int out_features, string init) {
 }
 
 TensorPtr Linear::forward(TensorPtr input){
-    auto result = matmul(input, weights);
-    return broadcast_add(result, bias);
+    // one op: the bias is folded into the gemm's output instead of a
+    // separate broadcast_add pass over the result
+    return linear_op(input, weights, bias);
 }
 
 vector<TensorPtr> Linear::parameters(){

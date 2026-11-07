@@ -1,5 +1,7 @@
 #include "ml/matmul_backend.hpp"
 #include <algorithm>
+#include <stdexcept>
+#include <vector>
 #include <atomic>
 #ifdef PROMETHEUS_USE_OPENMP
     #include <omp.h>
@@ -186,6 +188,65 @@ void matmul_backward_b_serial(int m, int inner, int b_cols,
                               const float* grad_out, const float* a_data, float* b_grad) {
     if (serial_blas_active()) { matmul_backward_b(m, inner, b_cols, grad_out, a_data, b_grad); return; }
     matmul_at_tiled(m, inner, b_cols, a_data, grad_out, b_grad);
+}
+
+void gemm_serial(bool trans_a, bool trans_b, int m, int n, int k,
+                 const float* a, int lda, const float* b, int ldb,
+                 float beta, float* c, int ldc) {
+#if defined(PROMETHEUS_USE_OPENBLAS) || defined(PROMETHEUS_USE_MKL)
+    if (!nested_call()) {
+        cblas_sgemm(CblasRowMajor,
+                    trans_a ? CblasTrans : CblasNoTrans,
+                    trans_b ? CblasTrans : CblasNoTrans,
+                    m, n, k, 1.0f, a, lda, b, ldb, beta, c, ldc);
+        return;
+    }
+#endif
+    for (int i = 0; i < m; i++) {
+        float* ci = c + (size_t)i * ldc;
+        if (beta == 0.0f)      for (int j = 0; j < n; j++) ci[j] = 0.0f;
+        else if (beta != 1.0f) for (int j = 0; j < n; j++) ci[j] *= beta;
+    }
+
+    // Every case is arranged so the innermost loop is an axpy over a row of
+    // C, which vectorises; a dot product over k would be a float reduction
+    // the compiler will not reorder.
+    if (!trans_a && !trans_b) {
+        for (int i = 0; i < m; i++) {
+            float* ci = c + (size_t)i * ldc;
+            for (int kk = 0; kk < k; kk++) {
+                const float aik = a[(size_t)i * lda + kk];
+                const float* bk = b + (size_t)kk * ldb;
+                for (int j = 0; j < n; j++) ci[j] += aik * bk[j];
+            }
+        }
+    } else if (trans_a && !trans_b) {
+        for (int kk = 0; kk < k; kk++) {
+            const float* ak = a + (size_t)kk * lda;
+            const float* bk = b + (size_t)kk * ldb;
+            for (int i = 0; i < m; i++) {
+                const float aki = ak[i];
+                float* ci = c + (size_t)i * ldc;
+                for (int j = 0; j < n; j++) ci[j] += aki * bk[j];
+            }
+        }
+    } else if (!trans_a && trans_b) {
+        // pack B^T to [k, n] once so the inner loop is the same axpy
+        std::vector<float> bt((size_t)k * n);
+        for (int j = 0; j < n; j++)
+            for (int kk = 0; kk < k; kk++)
+                bt[(size_t)kk * n + j] = b[(size_t)j * ldb + kk];
+        for (int i = 0; i < m; i++) {
+            float* ci = c + (size_t)i * ldc;
+            for (int kk = 0; kk < k; kk++) {
+                const float aik = a[(size_t)i * lda + kk];
+                const float* btk = bt.data() + (size_t)kk * n;
+                for (int j = 0; j < n; j++) ci[j] += aik * btk[j];
+            }
+        }
+    } else {
+        throw std::runtime_error("gemm_serial: transposing both operands is not supported");
+    }
 }
 
 const char* matmul_backend_name() {

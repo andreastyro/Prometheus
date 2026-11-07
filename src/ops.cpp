@@ -1175,3 +1175,76 @@ TensorPtr contiguous(TensorPtr a) {
     }
     return out;
 }
+
+// ── Fused linear ──────────────────────────────────────────────────────────────
+
+TensorPtr linear_op(TensorPtr x, TensorPtr W, TensorPtr bias, TensorPtr residual) {
+    reject_view("linear_op", x);
+    reject_view("linear_op", W);
+    reject_view("linear_op", bias);
+    reject_view("linear_op", residual);
+
+    if (x->shape.size() != 2 || W->shape.size() != 2 || x->shape[1] != W->shape[0])
+        throw runtime_error("linear_op: x must be [rows, in] and W [in, out]");
+    const int rows = x->shape[0], in = x->shape[1], out = W->shape[1];
+    if (bias && bias->num_el() != out)
+        throw runtime_error("linear_op: bias must have " + to_string(out) + " elements");
+    if (residual && (residual->shape.size() != 2 || residual->shape[0] != rows
+                                                  || residual->shape[1] != out))
+        throw runtime_error("linear_op: residual must be [rows, out]");
+
+    auto result = make_shared<Tensor>(vector<int>{rows, out});
+    float* y = result->data.data();
+    const float* rd = residual ? residual->data.data() : nullptr;
+    const float* bd = bias ? bias->data.data() : nullptr;
+
+    // seed with residual + bias, one pass, then the gemm accumulates onto it
+    #pragma omp parallel for schedule(static) if((long long)rows * out >= 32768)
+    for (int r = 0; r < rows; r++) {
+        float* yr = y + (size_t)r * out;
+        if (rd) {
+            const float* rr = rd + (size_t)r * out;
+            for (int j = 0; j < out; j++) yr[j] = rr[j];
+        }
+        if (bd)
+            for (int j = 0; j < out; j++) yr[j] += bd[j];
+    }
+    matmul_accumulate(rows, out, in, x->data.data(), W->data.data(), y);
+
+    vector<TensorPtr> inputs = {x, W};
+    if (bias)     inputs.push_back(bias);
+    if (residual) inputs.push_back(residual);
+    bool need = false;
+    for (auto& t : inputs) need = need || t->requires_grad;
+
+    if (need) {
+        auto node = make_node(result, inputs);
+        node->backward_fn = [x, W, bias, residual, result, rows, in, out]() {
+            const float* g = result->grad.data();
+
+            if (x->requires_grad)
+                matmul_backward_a(rows, in, out, g, W->data.data(), x->grad.data());
+            if (W->requires_grad)
+                matmul_backward_b(rows, in, out, g, x->data.data(), W->grad.data());
+
+            // bias: sum over rows, parallel over the output feature so each
+            // thread owns its own slot
+            if (bias && bias->requires_grad) {
+                #pragma omp parallel for schedule(static) if(out >= 256)
+                for (int j = 0; j < out; j++) {
+                    float acc = 0.0f;
+                    for (int r = 0; r < rows; r++) acc += g[(size_t)r * out + j];
+                    bias->grad[j] += acc;
+                }
+            }
+
+            // residual: the gradient passes straight through
+            if (residual && residual->requires_grad) {
+                const int n = rows * out;
+                #pragma omp parallel for schedule(static) if(n >= 32768)
+                for (int i = 0; i < n; i++) residual->grad[i] += g[i];
+            }
+        };
+    }
+    return result;
+}

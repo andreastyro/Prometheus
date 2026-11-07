@@ -24,7 +24,10 @@ TensorPtr TransformerBlock::forward(TensorPtr input, int batch) {
     // FFN sub-layer:       x = x + ff2(gelu(ff1(norm2(x))))
     // LayerNorm, Linear and GELU are all per-token, so the folded batch needs
     // no special handling here.
-    return add(x, ff2.forward(gelu(ff1.forward(norm2.forward(x)))));
+    // The residual is folded into ff2's gemm: one op instead of a gemm, a
+    // bias pass and an add pass, each over the full [rows, embed] buffer.
+    auto h = gelu(ff1.forward(norm2.forward(x)));
+    return linear_op(h, ff2.weights, ff2.bias, x);
 }
 
 vector<TensorPtr> TransformerBlock::parameters() {

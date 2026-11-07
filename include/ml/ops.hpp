@@ -110,6 +110,15 @@ TensorPtr concat_op(std::vector<TensorPtr> inputs, int axis = 0);
 /// Prefer this wherever a weight is stored [out, in] and applied as x @ W^T.
 TensorPtr matmul_bt(TensorPtr a, TensorPtr b);
 
+/// residual + x @ W + bias, as one op (PyTorch's addmm).
+///   x [rows, in],  W [in, out],  bias [out] or null,  residual [rows, out] or null
+///
+/// Written as matmul -> broadcast_add -> add, this is three full passes over
+/// a [rows, out] buffer and two throwaway tensors. Here the output is seeded
+/// with residual + bias and the gemm accumulates onto it.
+TensorPtr linear_op(TensorPtr x, TensorPtr W, TensorPtr bias = nullptr,
+                    TensorPtr residual = nullptr);
+
 /// O(1) transpose: a 2-D view with the strides swapped, sharing storage.
 /// Nothing is copied. The result is non-contiguous, so pass it through
 /// contiguous() before an op that reads `data` directly. To apply a weight

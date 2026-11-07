@@ -44,6 +44,19 @@ private:
     int prev_ = 0;
 };
 
+/// C = op(A) @ op(B) + beta * C with explicit row strides, on the calling
+/// thread (inside a SerialBlasScope it goes through BLAS).
+///
+/// op(A) is m x k and op(B) is k x n; a transposed operand is stored the
+/// other way round. lda/ldb/ldc are the distance between consecutive rows in
+/// memory, so a matrix can be a block of columns inside a wider buffer. That
+/// is what lets attention read each head straight out of the fused QKV
+/// buffer, where a head's row is D floats followed by the other heads, and
+/// write each head's output straight into its columns of the concatenation.
+void gemm_serial(bool trans_a, bool trans_b, int m, int n, int k,
+                 const float* a, int lda, const float* b, int ldb,
+                 float beta, float* c, int ldc);
+
 const char* matmul_backend_name();
 
 /// Threads OpenMP will actually use, or 1 when built without it.
