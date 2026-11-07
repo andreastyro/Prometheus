@@ -905,3 +905,35 @@ TensorPtr concat_op(vector<TensorPtr> inputs, int axis) {
 
     return result;
 }
+
+TensorPtr matmul_bt(TensorPtr a, TensorPtr b) {
+    if (a->shape.size() != 2 || b->shape.size() != 2)
+        throw runtime_error("matmul_bt: both operands must be 2-D");
+
+    const int m = a->shape[0], k = a->shape[1];
+    const int n = b->shape[0];
+    if (b->shape[1] != k)
+        throw runtime_error("matmul_bt: a.cols must equal b.cols, got "
+                            + to_string(k) + " and " + to_string(b->shape[1]));
+
+    auto result = make_shared<Tensor>(vector<int>{m, n});
+    matmul_forward_bt(m, n, k, a->data.data(), b->data.data(),
+                      result->data.data());
+
+    if (a->requires_grad || b->requires_grad) {
+        auto node = make_node(result, {a, b});
+
+        node->backward_fn = [a, b, result, m, n, k]() {
+            const float* g = result->grad.data();
+
+            // C = A @ B^T  =>  dA = dC @ B,  dB = dC^T @ A
+            if (a->requires_grad)
+                matmul_accumulate(m, k, n, g, b->data.data(), a->grad.data());
+
+            if (b->requires_grad)
+                matmul_backward_b(m, n, k, a->data.data(), g, b->grad.data());
+        };
+    }
+
+    return result;
+}

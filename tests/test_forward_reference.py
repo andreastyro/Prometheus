@@ -108,6 +108,15 @@ def test_ops():
     check("matmul", arr(p.matmul(a, tensor([4, 2], m_np))), a_np @ m_np)
 
     check("transpose_op", arr(p.transpose_op(a)), a_np.T)
+
+    # a @ b^T computed with the transpose as a flag rather than a copy, which
+    # is what nn.Linear does in PyTorch. Must agree with both numpy and the
+    # explicit-transpose route.
+    bt = spread(8).reshape(2, 4)
+    check("matmul_bt", arr(p.matmul_bt(a, tensor([2, 4], bt))), a_np @ bt.T)
+    check("matmul_bt == matmul(a, transpose_op(b))",
+          arr(p.matmul_bt(a, tensor([2, 4], bt))),
+          arr(p.matmul(a, p.transpose_op(tensor([2, 4], bt)))))
     check("reshape_op",   arr(p.reshape_op(a, [4, 3])), a_np.reshape(4, 3))
 
     check("max_op", arr(p.max_op(a)), np.array([a_np.max()]))

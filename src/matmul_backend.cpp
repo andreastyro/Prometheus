@@ -108,6 +108,29 @@ void matmul_forward(int m, int n, int k,
 #endif
 }
 
+void matmul_forward_bt(int m, int n, int k,
+                       const float* a, const float* b, float* c) {
+#if defined(PROMETHEUS_USE_OPENBLAS) || defined(PROMETHEUS_USE_MKL)
+    // the transpose is a flag, not a copy
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                m, n, k, 1.0f, a, k, b, k, 0.0f, c, n);
+#else
+    // the tiled kernel accumulates, so clear the destination first
+    for (int i = 0; i < m * n; i++) c[i] = 0.0f;
+    matmul_bt_tiled(m, n, k, a, b, c);
+#endif
+}
+
+void matmul_accumulate(int m, int n, int k,
+                       const float* a, const float* b, float* c) {
+#if defined(PROMETHEUS_USE_OPENBLAS) || defined(PROMETHEUS_USE_MKL)
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                m, n, k, 1.0f, a, k, b, n, 1.0f, c, n);
+#else
+    matmul_tiled(m, n, k, a, b, c);   // already accumulates
+#endif
+}
+
 void matmul_backward_a(int m, int inner, int b_cols,
                        const float* grad_out, const float* b_data, float* a_grad) {
 #if defined(PROMETHEUS_USE_OPENBLAS) || defined(PROMETHEUS_USE_MKL)

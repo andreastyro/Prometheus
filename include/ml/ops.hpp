@@ -101,3 +101,11 @@ TensorPtr transpose_op(TensorPtr a);
 /// Needed for UNet-style skip connections, which join an encoder feature map to
 /// a decoder one along the channel axis. Not expressible from the other ops.
 TensorPtr concat_op(std::vector<TensorPtr> inputs, int axis = 0);
+
+/// a @ b^T, without ever building b^T.
+///   a [m, k],  b [n, k]  ->  [m, n]
+///
+/// Equivalent to matmul(a, transpose_op(b)) but skips the copy: the transpose
+/// becomes a flag to BLAS, or a different loop order in the tiled kernel.
+/// Prefer this wherever a weight is stored [out, in] and applied as x @ W^T.
+TensorPtr matmul_bt(TensorPtr a, TensorPtr b);

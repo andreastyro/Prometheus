@@ -128,6 +128,8 @@ PYBIND11_MODULE(prometheus, m) {
     m.def("reshape_op",    &reshape_op, py::arg("a"), py::arg("new_shape"));
     m.def("transpose_op",  &transpose_op, py::arg("a"));
     m.def("concat_op",     &concat_op, py::arg("inputs"), py::arg("axis") = 0);
+    m.def("matmul_bt",     &matmul_bt, py::arg("a"), py::arg("b"),
+          "a @ b^T without building b^T. a is [m, k], b is [n, k].");
 
     // ------------------------------------------------------------------------
     // grad mode

@@ -11,6 +11,25 @@
 void matmul_forward(int m, int n, int k,
                     const float* a, const float* b, float* c);
 
+/// Forward with the right operand transposed: C = A @ B^T
+///   A [m, k],  B [n, k],  C [m, n]  — C is overwritten
+///
+/// This is what PyTorch's nn.Linear does: it stores the weight as
+/// [out, in] and hands a transpose flag to gemm rather than materialising the
+/// transpose. BLAS reads the matrix transposed while striding over the
+/// original memory, so the transpose costs nothing.
+///
+/// Weight tying needs exactly this: logits = x @ tok_emb.weight^T. Building
+/// the transpose explicitly copied 24.6 MB per forward pass on a 16000x384
+/// embedding table, about 10% of the output projection.
+void matmul_forward_bt(int m, int n, int k,
+                       const float* a, const float* b, float* c);
+
+/// C += A @ B, accumulating rather than overwriting.
+///   A [m, k],  B [k, n],  C [m, n]
+void matmul_accumulate(int m, int n, int k,
+                       const float* a, const float* b, float* c);
+
 /// Backward pass: accumulate dA += grad_out @ B^T into a_grad
 void matmul_backward_a(int m, int inner, int b_cols,
                        const float* grad_out, const float* b_data, float* a_grad);

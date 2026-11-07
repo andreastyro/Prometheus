@@ -90,6 +90,8 @@ int main() {
         check("tanh_op",      [&]{ return tanh_op(x); },            {x});
         check("softmax",      [&]{ return softmax(x); },            {x});
         check("transpose_op", [&]{ return transpose_op(x); },       {x});
+        auto bt = tin({2, 4});
+        check("matmul_bt", [&]{ return matmul_bt(x, bt); }, {x, bt});
         check("reshape_op",   [&]{ return reshape_op(x, {4, 3}); }, {x});
         check("exp_op",       [&]{ return exp_op(x); },             {x});
 
