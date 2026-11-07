@@ -1,6 +1,7 @@
 #include "ml/nn/nlp/layernorm.hpp"
 #include "ml/autograd.hpp"
 #include <cmath>
+#include <utility>
 
 using namespace std;
 
@@ -26,6 +27,7 @@ TensorPtr LayerNorm::forward(TensorPtr input) {
     vector<float> x_hat_all(input->num_el());
     vector<float> inv_std_all(num_rows);
 
+    #pragma omp parallel for schedule(static) if(num_rows >= 64)
     for (int r = 0; r < num_rows; r++) {
         int off = r * N;
 
@@ -53,7 +55,11 @@ TensorPtr LayerNorm::forward(TensorPtr input) {
         auto g = gamma;
         auto b = beta;
         auto node = make_node(output, {input, g, b});
-        node->backward_fn = [input, g, b, output, x_hat_all, inv_std_all, num_rows, N]() {
+        node->backward_fn = [input, g, b, output,
+                            x_hat_all = std::move(x_hat_all),
+                            inv_std_all = std::move(inv_std_all),
+                            num_rows, N]() {
+            #pragma omp parallel for schedule(static) if(num_rows >= 64)
             for (int r = 0; r < num_rows; r++) {
                 int off = r * N;
                 float is = inv_std_all[r];
@@ -74,19 +80,20 @@ TensorPtr LayerNorm::forward(TensorPtr input) {
                 }
             }
 
-            // gamma and beta accumulate over all rows
-            if (g->requires_grad) {
-                for (int r = 0; r < num_rows; r++) {
-                    int off = r * N;
-                    for (int i = 0; i < N; i++)
-                        g->grad[i] += output->grad[off + i] * x_hat_all[off + i];
-                }
-            }
-            if (b->requires_grad) {
-                for (int r = 0; r < num_rows; r++) {
-                    int off = r * N;
-                    for (int i = 0; i < N; i++)
-                        b->grad[i] += output->grad[off + i];
+            // gamma and beta accumulate over every row, so the row loop
+            // cannot be split. Walking the feature index on the outside gives
+            // each thread its own output slot and one pass over the gradient.
+            if (g->requires_grad || b->requires_grad) {
+                #pragma omp parallel for schedule(static) if(N >= 256)
+                for (int i = 0; i < N; i++) {
+                    float gg = 0.0f, bg = 0.0f;
+                    for (int r = 0; r < num_rows; r++) {
+                        float go = output->grad[r * N + i];
+                        gg += go * x_hat_all[r * N + i];
+                        bg += go;
+                    }
+                    if (g->requires_grad) g->grad[i] += gg;
+                    if (b->requires_grad) b->grad[i] += bg;
                 }
             }
         };

@@ -116,6 +116,45 @@ static void matmul_at_tiled(int m, int inner, int ncols,
             }
 }
 
+// A BLAS gemm brings its own thread pool. Called from inside an OpenMP
+// parallel region, each of our N threads asks BLAS for N more, and the machine
+// stops making progress -- attention's per-head matmuls did exactly this and
+// turned a 3.5 s training step into one that never finished.
+//
+// Rather than rely on every caller remembering, the BLAS path checks for
+// itself and falls back to the portable tiled kernel when it is already inside
+// a parallel region. The explicit *_serial entry points remain for callers
+// that want to state the intent.
+static inline bool nested_call() {
+#ifdef PROMETHEUS_USE_OPENMP
+    return omp_in_parallel() != 0;
+#else
+    return false;
+#endif
+}
+
+void matmul_forward_serial(int m, int n, int k,
+                           const float* a, const float* b, float* c) {
+    for (int i = 0; i < m * n; i++) c[i] = 0.0f;
+    matmul_tiled(m, n, k, a, b, c);
+}
+
+void matmul_forward_bt_serial(int m, int n, int k,
+                              const float* a, const float* b, float* c) {
+    for (int i = 0; i < m * n; i++) c[i] = 0.0f;
+    matmul_bt_tiled(m, n, k, a, b, c);
+}
+
+void matmul_backward_a_serial(int m, int inner, int b_cols,
+                              const float* grad_out, const float* b_data, float* a_grad) {
+    matmul_bt_tiled(m, inner, b_cols, grad_out, b_data, a_grad);
+}
+
+void matmul_backward_b_serial(int m, int inner, int b_cols,
+                              const float* grad_out, const float* a_data, float* b_grad) {
+    matmul_at_tiled(m, inner, b_cols, a_data, grad_out, b_grad);
+}
+
 const char* matmul_backend_name() {
 #if defined(PROMETHEUS_USE_OPENBLAS)
     return "openblas";
@@ -137,39 +176,48 @@ int matmul_max_threads() {
 void matmul_forward(int m, int n, int k,
                     const float* a, const float* b, float* c) {
 #if defined(PROMETHEUS_USE_OPENBLAS) || defined(PROMETHEUS_USE_MKL)
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                m, n, k, 1.0f, a, k, b, n, 0.0f, c, n);
-#else
-    matmul_tiled(m, n, k, a, b, c);
+    if (!nested_call()) {
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    m, n, k, 1.0f, a, k, b, n, 0.0f, c, n);
+        return;
+    }
 #endif
+    // the tiled kernel accumulates, so match the overwrite contract above
+    for (int i = 0; i < m * n; i++) c[i] = 0.0f;
+    matmul_tiled(m, n, k, a, b, c);
 }
 
 void matmul_forward_bt(int m, int n, int k,
                        const float* a, const float* b, float* c) {
 #if defined(PROMETHEUS_USE_OPENBLAS) || defined(PROMETHEUS_USE_MKL)
-    // the transpose is a flag, not a copy
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                m, n, k, 1.0f, a, k, b, k, 0.0f, c, n);
-#else
+    if (!nested_call()) {
+        // the transpose is a flag, not a copy
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    m, n, k, 1.0f, a, k, b, k, 0.0f, c, n);
+        return;
+    }
+#endif
     // the tiled kernel accumulates, so clear the destination first
     for (int i = 0; i < m * n; i++) c[i] = 0.0f;
     matmul_bt_tiled(m, n, k, a, b, c);
-#endif
 }
 
 void matmul_accumulate(int m, int n, int k,
                        const float* a, const float* b, float* c) {
 #if defined(PROMETHEUS_USE_OPENBLAS) || defined(PROMETHEUS_USE_MKL)
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                m, n, k, 1.0f, a, k, b, n, 1.0f, c, n);
-#else
-    matmul_tiled(m, n, k, a, b, c);   // already accumulates
+    if (!nested_call()) {
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    m, n, k, 1.0f, a, k, b, n, 1.0f, c, n);
+        return;
+    }
 #endif
+    matmul_tiled(m, n, k, a, b, c);   // already accumulates
 }
 
 void matmul_backward_a(int m, int inner, int b_cols,
                        const float* grad_out, const float* b_data, float* a_grad) {
 #if defined(PROMETHEUS_USE_OPENBLAS) || defined(PROMETHEUS_USE_MKL)
+    if (nested_call()) { matmul_bt_tiled(m, inner, b_cols, grad_out, b_data, a_grad); return; }
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                 m, inner, b_cols,
                 1.0f, grad_out, b_cols, b_data, b_cols,
@@ -182,6 +230,7 @@ void matmul_backward_a(int m, int inner, int b_cols,
 void matmul_backward_b(int m, int inner, int b_cols,
                        const float* grad_out, const float* a_data, float* b_grad) {
 #if defined(PROMETHEUS_USE_OPENBLAS) || defined(PROMETHEUS_USE_MKL)
+    if (nested_call()) { matmul_at_tiled(m, inner, b_cols, a_data, grad_out, b_grad); return; }
     cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
                 inner, b_cols, m,
                 1.0f, a_data, inner, grad_out, b_cols,

@@ -164,7 +164,8 @@ TensorPtr l1_regularization(std::vector<TensorPtr> params, float lambda_) {
             const float g = out->grad[0];
             for (auto& p : params) {
                 if (!p->requires_grad) continue;
-                for (int i = 0; i < p->num_el(); i++) {
+                const int n_1 = p->num_el();
+                for (int i = 0; i < n_1; i++) {
                     const float v = p->data[i];
                     const float sign = (v > 0.0f) ? 1.0f : ((v < 0.0f) ? -1.0f : 0.0f);
                     p->grad[i] += g * lambda_ * sign;
@@ -194,7 +195,8 @@ TensorPtr l2_regularization(std::vector<TensorPtr> params, float lambda_) {
             const float g = out->grad[0];
             for (auto& p : params) {
                 if (!p->requires_grad) continue;
-                for (int i = 0; i < p->num_el(); i++)
+                const int n_2 = p->num_el();
+                for (int i = 0; i < n_2; i++)
                     p->grad[i] += g * 2.0f * lambda_ * p->data[i];
             }
         };

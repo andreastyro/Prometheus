@@ -28,7 +28,9 @@ TensorPtr add(TensorPtr a, TensorPtr b) {
 
         auto result = make_shared<Tensor>(a->shape);
 
-        for(int i = 0; i < a->num_el(); i++){
+        const int n_1 = a->num_el();
+        #pragma omp parallel for schedule(static) if(n_1 >= 32768)
+        for (int i = 0; i < n_1; i++){
             result->data[i] = a->data[i] + b->data[i];
         }
 
@@ -36,7 +38,9 @@ TensorPtr add(TensorPtr a, TensorPtr b) {
             auto node = make_node(result, {a, b});
 
             node->backward_fn = [a, b, result](){
-                for (int i = 0; i < result->num_el(); i++){
+                const int n_2 = result->num_el();
+                #pragma omp parallel for schedule(static) if(n_2 >= 32768)
+                for (int i = 0; i < n_2; i++){
                     if (a->requires_grad) a->grad[i] += result->grad[i];
                     if (b->requires_grad) b->grad[i] += result->grad[i];
                 }
@@ -54,13 +58,17 @@ TensorPtr add(TensorPtr a, TensorPtr b) {
 TensorPtr add(float scalar, TensorPtr a) {
     reject_view("add", a);
     auto result = make_shared<Tensor>(a->shape);
-    for (int i = 0; i < a->num_el(); i++)
+    const int n_3 = a->num_el();
+    #pragma omp parallel for schedule(static) if(n_3 >= 32768)
+    for (int i = 0; i < n_3; i++)
         result->data[i] = scalar + a->data[i];
 
     if (a->requires_grad) {
         auto node = make_node(result, {a});
         node->backward_fn = [a, result]() {
-            for (int i = 0; i < result->num_el(); i++)
+            const int n_4 = result->num_el();
+            #pragma omp parallel for schedule(static) if(n_4 >= 32768)
+            for (int i = 0; i < n_4; i++)
                 a->grad[i] += result->grad[i];
         };
     }
@@ -77,14 +85,18 @@ TensorPtr multiply(TensorPtr a, TensorPtr b) {
 
         auto result = make_shared<Tensor>(a->shape);
 
-        for(int i = 0; i < a->num_el(); i++){
+        const int n_5 = a->num_el();
+        #pragma omp parallel for schedule(static) if(n_5 >= 32768)
+        for (int i = 0; i < n_5; i++){
             result->data[i] = a->data[i] * b->data[i];
         }
 
         if (a->requires_grad || b->requires_grad) {
             auto node = make_node(result, {a, b});
             node->backward_fn = [a, b, result](){
-                for (int i = 0; i < result->num_el(); i++){
+                const int n_6 = result->num_el();
+                #pragma omp parallel for schedule(static) if(n_6 >= 32768)
+                for (int i = 0; i < n_6; i++){
                     if (a->requires_grad) a->grad[i] += b->data[i] * result->grad[i];
                     if (b->requires_grad) b->grad[i] += a->data[i] * result->grad[i];
                 }
@@ -102,13 +114,17 @@ TensorPtr multiply(TensorPtr a, TensorPtr b) {
 TensorPtr multiply(float scalar, TensorPtr a) {
     reject_view("multiply", a);
     auto result = make_shared<Tensor>(a->shape);
-    for (int i = 0; i < a->num_el(); i++)
+    const int n_7 = a->num_el();
+    #pragma omp parallel for schedule(static) if(n_7 >= 32768)
+    for (int i = 0; i < n_7; i++)
         result->data[i] = scalar * a->data[i];
 
     if (a->requires_grad) {
         auto node = make_node(result, {a});
         node->backward_fn = [a, result, scalar]() {
-            for (int i = 0; i < result->num_el(); i++)
+            const int n_8 = result->num_el();
+            #pragma omp parallel for schedule(static) if(n_8 >= 32768)
+            for (int i = 0; i < n_8; i++)
                 a->grad[i] += scalar * result->grad[i];
         };
     }
@@ -160,14 +176,18 @@ TensorPtr relu(TensorPtr a) {
     reject_view("relu", a);
 
     auto result = make_shared<Tensor>(a->shape);
-    for (int i = 0; i < a->num_el(); i++){
+    const int n_9 = a->num_el();
+    #pragma omp parallel for schedule(static) if(n_9 >= 32768)
+    for (int i = 0; i < n_9; i++){
         result->data[i] = a->data[i] > 0 ? a->data[i] : 0.0f;
     }
 
     if (a->requires_grad) {
         auto node = make_node(result, {a});
         node->backward_fn = [a, result]() {
-            for (int i = 0; i < result->num_el(); i++)
+            const int n_10 = result->num_el();
+            #pragma omp parallel for schedule(static) if(n_10 >= 32768)
+            for (int i = 0; i < n_10; i++)
                 if (a->data[i] > 0) a->grad[i] += result->grad[i];
         };
     }
@@ -180,7 +200,9 @@ TensorPtr sigmoid(TensorPtr a) {
     reject_view("sigmoid", a);
 
     auto result = make_shared<Tensor>(a->shape);
-    for (int i = 0; i < a->num_el(); i++){
+    const int n_11 = a->num_el();
+    #pragma omp parallel for schedule(static) if(n_11 >= 32768)
+    for (int i = 0; i < n_11; i++){
         result->data[i] = 1.0f / (1.0f + exp(-a->data[i]));
     }
 
@@ -188,7 +210,9 @@ TensorPtr sigmoid(TensorPtr a) {
         auto node = make_node(result, {a});
 
         node->backward_fn = [a, result](){
-            for (int i = 0; i < result->num_el(); i++){
+            const int n_12 = result->num_el();
+            #pragma omp parallel for schedule(static) if(n_12 >= 32768)
+            for (int i = 0; i < n_12; i++){
                 a->grad[i] += result->data[i] * (1 - result->data[i]) * result->grad[i];
             }
         };
@@ -206,14 +230,18 @@ TensorPtr subtract(TensorPtr a, TensorPtr b) {
 
         auto difference = make_shared<Tensor>(a->shape);
 
-        for (int i = 0; i < a->num_el(); i++){
+        const int n_13 = a->num_el();
+        #pragma omp parallel for schedule(static) if(n_13 >= 32768)
+        for (int i = 0; i < n_13; i++){
             difference->data[i] = a->data[i] - b->data[i];
         }
 
         if (a->requires_grad || b->requires_grad) {
             auto node = make_node(difference, {a, b});
             node->backward_fn = [a, b, difference]() {
-                for (int i = 0; i < difference->num_el(); i++) {
+                const int n_14 = difference->num_el();
+                #pragma omp parallel for schedule(static) if(n_14 >= 32768)
+                for (int i = 0; i < n_14; i++) {
                     if (a->requires_grad) a->grad[i] += difference->grad[i];
                     if (b->requires_grad) b->grad[i] -= difference->grad[i];
                 }
@@ -230,13 +258,17 @@ TensorPtr subtract(TensorPtr a, TensorPtr b) {
 TensorPtr subtract(float scalar, TensorPtr a) {
     reject_view("subtract", a);
     auto result = make_shared<Tensor>(a->shape);
-    for (int i = 0; i < a->num_el(); i++)
+    const int n_15 = a->num_el();
+    #pragma omp parallel for schedule(static) if(n_15 >= 32768)
+    for (int i = 0; i < n_15; i++)
         result->data[i] = scalar - a->data[i];
 
     if (a->requires_grad) {
         auto node = make_node(result, {a});
         node->backward_fn = [a, result]() {
-            for (int i = 0; i < result->num_el(); i++)
+            const int n_16 = result->num_el();
+            #pragma omp parallel for schedule(static) if(n_16 >= 32768)
+            for (int i = 0; i < n_16; i++)
                 a->grad[i] -= result->grad[i];
         };
     }
@@ -248,13 +280,17 @@ TensorPtr subtract(float scalar, TensorPtr a) {
 TensorPtr subtract(TensorPtr a, float scalar) {
     reject_view("subtract", a);
     auto result = make_shared<Tensor>(a->shape);
-    for (int i = 0; i < a->num_el(); i++)
+    const int n_17 = a->num_el();
+    #pragma omp parallel for schedule(static) if(n_17 >= 32768)
+    for (int i = 0; i < n_17; i++)
         result->data[i] = a->data[i] - scalar;
 
     if (a->requires_grad) {
         auto node = make_node(result, {a});
         node->backward_fn = [a, result]() {
-            for (int i = 0; i < result->num_el(); i++)
+            const int n_18 = result->num_el();
+            #pragma omp parallel for schedule(static) if(n_18 >= 32768)
+            for (int i = 0; i < n_18; i++)
                 a->grad[i] += result->grad[i];
         };
     }
@@ -270,7 +306,9 @@ TensorPtr divide(TensorPtr a, TensorPtr b) {
 
         auto result = make_shared<Tensor>(a->shape);
 
-        for (int i = 0; i < a->num_el(); i++){
+        const int n_19 = a->num_el();
+        #pragma omp parallel for schedule(static) if(n_19 >= 32768)
+        for (int i = 0; i < n_19; i++){
 
             if (b->data[i] == 0){
                 int row = i / a->shape[1];
@@ -286,7 +324,9 @@ TensorPtr divide(TensorPtr a, TensorPtr b) {
             auto node = make_node(result, {a, b});
 
             node->backward_fn = [a, b, result](){
-                for (int i = 0; i < result->num_el(); i++){
+                const int n_20 = result->num_el();
+                #pragma omp parallel for schedule(static) if(n_20 >= 32768)
+                for (int i = 0; i < n_20; i++){
                     if (a->requires_grad) a->grad[i] += result->grad[i] / b->data[i];
                     if (b->requires_grad) b->grad[i] += -result->grad[i] * a->data[i] / (b->data[i] * b->data[i]);
                 }
@@ -304,7 +344,9 @@ TensorPtr divide(TensorPtr a, TensorPtr b) {
 TensorPtr divide(float scalar, TensorPtr a) {
     reject_view("divide", a);
     auto result = make_shared<Tensor>(a->shape);
-    for (int i = 0; i < a->num_el(); i++) {
+    const int n_21 = a->num_el();
+    #pragma omp parallel for schedule(static) if(n_21 >= 32768)
+    for (int i = 0; i < n_21; i++) {
         if (a->data[i] == 0)
             throw std::runtime_error("Division by zero at index " + std::to_string(i));
         result->data[i] = scalar / a->data[i];
@@ -313,7 +355,9 @@ TensorPtr divide(float scalar, TensorPtr a) {
     if (a->requires_grad) {
         auto node = make_node(result, {a});
         node->backward_fn = [a, result, scalar]() {
-            for (int i = 0; i < result->num_el(); i++)
+            const int n_22 = result->num_el();
+            #pragma omp parallel for schedule(static) if(n_22 >= 32768)
+            for (int i = 0; i < n_22; i++)
                 a->grad[i] += -scalar * result->grad[i] / (a->data[i] * a->data[i]);
         };
     }
@@ -327,13 +371,17 @@ TensorPtr divide(TensorPtr a, float scalar) {
     if (scalar == 0)
         throw std::runtime_error("Division by zero");
     auto result = make_shared<Tensor>(a->shape);
-    for (int i = 0; i < a->num_el(); i++)
+    const int n_23 = a->num_el();
+    #pragma omp parallel for schedule(static) if(n_23 >= 32768)
+    for (int i = 0; i < n_23; i++)
         result->data[i] = a->data[i] / scalar;
 
     if (a->requires_grad) {
         auto node = make_node(result, {a});
         node->backward_fn = [a, result, scalar]() {
-            for (int i = 0; i < result->num_el(); i++)
+            const int n_24 = result->num_el();
+            #pragma omp parallel for schedule(static) if(n_24 >= 32768)
+            for (int i = 0; i < n_24; i++)
                 a->grad[i] += result->grad[i] / scalar;
         };
     }
@@ -345,7 +393,9 @@ TensorPtr divide(TensorPtr a, float scalar) {
 TensorPtr tanh_op(TensorPtr a) {
     reject_view("tanh_op", a);
     auto result = make_shared<Tensor>(a->shape);
-    for (int i = 0; i < a->num_el(); i++){
+    const int n_25 = a->num_el();
+    #pragma omp parallel for schedule(static) if(n_25 >= 32768)
+    for (int i = 0; i < n_25; i++){
         result->data[i] = (exp(a->data[i]) - exp(-a->data[i])) / (exp(a->data[i]) + exp(-a->data[i]));
     }
 
@@ -353,7 +403,9 @@ TensorPtr tanh_op(TensorPtr a) {
         auto node = make_node(result, {a});
 
         node->backward_fn = [a, result](){
-            for (int i = 0; i < result->num_el(); i++){
+            const int n_26 = result->num_el();
+            #pragma omp parallel for schedule(static) if(n_26 >= 32768)
+            for (int i = 0; i < n_26; i++){
                 a->grad[i] += (1 - result->data[i] * result->data[i]) * result->grad[i];
             }
         };
@@ -434,7 +486,9 @@ TensorPtr softmax(TensorPtr a) {
 TensorPtr log_op(TensorPtr a) {
     reject_view("log_op", a);
     auto result = make_shared<Tensor>(a->shape);
-    for (int i = 0; i < a->num_el(); i++){
+    const int n_27 = a->num_el();
+    #pragma omp parallel for schedule(static) if(n_27 >= 32768)
+    for (int i = 0; i < n_27; i++){
         if (a->data[i] <= 0)
             throw runtime_error("Log of non-positive value at index " + to_string(i));
         result->data[i] = log(a->data[i]);
@@ -443,7 +497,9 @@ TensorPtr log_op(TensorPtr a) {
     if (a->requires_grad) {
         auto node = make_node(result, {a});
         node->backward_fn = [a, result]() {
-            for (int i = 0; i < result->num_el(); i++)
+            const int n_28 = result->num_el();
+            #pragma omp parallel for schedule(static) if(n_28 >= 32768)
+            for (int i = 0; i < n_28; i++)
                 a->grad[i] += result->grad[i] / a->data[i];  // d(ln x)/dx = 1/x
         };
     }
@@ -455,14 +511,18 @@ TensorPtr log_op(TensorPtr a) {
 TensorPtr exp_op(TensorPtr a) {
     reject_view("exp_op", a);
     auto result = make_shared<Tensor>(a->shape);
-    for (int i = 0; i < a->num_el(); i++){
+    const int n_29 = a->num_el();
+    #pragma omp parallel for schedule(static) if(n_29 >= 32768)
+    for (int i = 0; i < n_29; i++){
         result->data[i] = exp(a->data[i]);
     }
 
     if (a->requires_grad) {
         auto node = make_node(result, {a});
         node->backward_fn = [a, result]() {
-            for (int i = 0; i < result->num_el(); i++)
+            const int n_30 = result->num_el();
+            #pragma omp parallel for schedule(static) if(n_30 >= 32768)
+            for (int i = 0; i < n_30; i++)
                 a->grad[i] += result->data[i] * result->grad[i];  // d(e^x)/dx = e^x = result
         };
     }
@@ -474,14 +534,18 @@ TensorPtr exp_op(TensorPtr a) {
 TensorPtr pow_op(TensorPtr a, float p) {
     reject_view("pow_op", a);
     auto result = make_shared<Tensor>(a->shape);
-    for (int i = 0; i < a->num_el(); i++){
+    const int n_31 = a->num_el();
+    #pragma omp parallel for schedule(static) if(n_31 >= 32768)
+    for (int i = 0; i < n_31; i++){
         result->data[i] = pow(a->data[i], p);
     }
 
     if (a->requires_grad) {
         auto node = make_node(result, {a});
         node->backward_fn = [a, result, p]() {
-            for (int i = 0; i < result->num_el(); i++)
+            const int n_32 = result->num_el();
+            #pragma omp parallel for schedule(static) if(n_32 >= 32768)
+            for (int i = 0; i < n_32; i++)
                 a->grad[i] += p * pow(a->data[i], p - 1) * result->grad[i];  // d(x^p)/dx = p*x^(p-1)
         };
     }
@@ -493,7 +557,9 @@ TensorPtr pow_op(TensorPtr a, float p) {
 TensorPtr sqrt_op(TensorPtr a) {
     reject_view("sqrt_op", a);
     auto result = make_shared<Tensor>(a->shape);
-    for (int i = 0; i < a->num_el(); i++){
+    const int n_33 = a->num_el();
+    #pragma omp parallel for schedule(static) if(n_33 >= 32768)
+    for (int i = 0; i < n_33; i++){
         if (a->data[i] < 0)
             throw runtime_error("Cannot compute square root of negative value " +
                                 to_string(a->data[i]) + " at index " + to_string(i));
@@ -503,7 +569,9 @@ TensorPtr sqrt_op(TensorPtr a) {
     if (a->requires_grad) {
         auto node = make_node(result, {a});
         node->backward_fn = [a, result]() {
-            for (int i = 0; i < result->num_el(); i++)
+            const int n_34 = result->num_el();
+            #pragma omp parallel for schedule(static) if(n_34 >= 32768)
+            for (int i = 0; i < n_34; i++)
                 a->grad[i] += result->grad[i] / (2.0f * result->data[i]);  // d(sqrt(x))/dx = 1/(2*sqrt(x))
         };
     }
@@ -515,7 +583,9 @@ TensorPtr sqrt_op(TensorPtr a) {
 TensorPtr abs_op(TensorPtr a) {
     reject_view("abs_op", a);
     auto result = make_shared<Tensor>(a->shape);
-    for (int i = 0; i < a->num_el(); i++){
+    const int n_35 = a->num_el();
+    #pragma omp parallel for schedule(static) if(n_35 >= 32768)
+    for (int i = 0; i < n_35; i++){
         result->data[i] = abs(a->data[i]);
     }
 
@@ -523,7 +593,9 @@ TensorPtr abs_op(TensorPtr a) {
         auto node = make_node(result, {a});
 
         node->backward_fn = [a, result](){
-            for (int i = 0; i < result->num_el(); i++){
+            const int n_36 = result->num_el();
+            #pragma omp parallel for schedule(static) if(n_36 >= 32768)
+            for (int i = 0; i < n_36; i++){
                 if (a->data[i] > 0) a->grad[i] += result->grad[i];
                 else if (a->data[i] < 0) a->grad[i] -= result->grad[i];
             }
@@ -551,13 +623,15 @@ TensorPtr sum(TensorPtr a, int axis) {
     // global sum — returns a single value
     if (axis == -1) {
         auto result = make_shared<Tensor>(vector<int>{1});
-        for (int i = 0; i < a->num_el(); i++)
+        const int n_37 = a->num_el();
+        for (int i = 0; i < n_37; i++)
             result->data[0] += a->data[i];
 
         if (a->requires_grad) {
             auto node = make_node(result, {a});
             node->backward_fn = [a, result]() {
-                for (int i = 0; i < a->num_el(); i++)
+                const int n_38 = a->num_el();
+                for (int i = 0; i < n_38; i++)
                     a->grad[i] += result->grad[0];  // every element gets the same gradient
             };
         }
@@ -627,7 +701,8 @@ TensorPtr mean(TensorPtr a, int axis) {
     shared_ptr<Tensor> result;
     if (axis == -1) {
         result = make_shared<Tensor>(vector<int>{1});
-        for (int i = 0; i < a->num_el(); i++)
+        const int n_39 = a->num_el();
+        for (int i = 0; i < n_39; i++)
             result->data[0] += a->data[i];
         result->data[0] /= count;
     } else if (axis == 0) {
@@ -651,7 +726,8 @@ TensorPtr mean(TensorPtr a, int axis) {
 
         node->backward_fn = [a, result, axis, count, rows, cols]() {
             if (axis == -1) {
-                for (int i = 0; i < a->num_el(); i++)
+                const int n_40 = a->num_el();
+                for (int i = 0; i < n_40; i++)
                     a->grad[i] += result->grad[0] / count;
 
             } else if (axis == 0) {
@@ -722,7 +798,9 @@ TensorPtr min_op(TensorPtr a) {
 TensorPtr clip(TensorPtr a, float min_val, float max_val) {
     reject_view("clip", a);
     auto result = make_shared<Tensor>(a->shape);
-    for (int i = 0; i < a->num_el(); i++){
+    const int n_41 = a->num_el();
+    #pragma omp parallel for schedule(static) if(n_41 >= 32768)
+    for (int i = 0; i < n_41; i++){
         if (a->data[i] > max_val){
             result->data[i] = max_val;
         } else if (a->data[i] < min_val) {
@@ -735,7 +813,9 @@ TensorPtr clip(TensorPtr a, float min_val, float max_val) {
     if (a->requires_grad) {
         auto node = make_node(result, {a});
         node->backward_fn = [a, result, min_val, max_val]() {
-            for (int i = 0; i < result->num_el(); i++) {
+            const int n_42 = result->num_el();
+            #pragma omp parallel for schedule(static) if(n_42 >= 32768)
+            for (int i = 0; i < n_42; i++) {
                 // gradient is 1 where value wasn't clamped, 0 where it was
                 if (a->data[i] > min_val && a->data[i] < max_val)
                     a->grad[i] += result->grad[i];

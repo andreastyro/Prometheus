@@ -2,6 +2,8 @@
 #include "ml/autograd.hpp"
 #include "ml/matmul_backend.hpp"
 #include <cmath>
+#include <cstring>
+#include <utility>
 #include <algorithm>
 #include <stdexcept>
 #include <string>   // to_string; MSVC does not get it transitively
@@ -81,10 +83,20 @@ TensorPtr MultiHeadAttention::forward(TensorPtr input, int batch) {
 
     // ── Forward ──────────────────────────────────────────────────────────────
     // Q = input @ W_q,  K = input @ W_k,  V = input @ W_v   each [S, E]
-    vector<float> Q_all(rows * E), K_all(rows * E), V_all(rows * E);
-    matmul_forward(rows, E, E, input->data.data(), W_q->data.data(), Q_all.data());
-    matmul_forward(rows, E, E, input->data.data(), W_k->data.data(), K_all.data());
-    matmul_forward(rows, E, E, input->data.data(), W_v->data.data(), V_all.data());
+    // Three [rows, E] x [E, E] gemms are small enough that BLAS cannot
+    // amortise its packing over them -- measured at 72 GFLOPS against 188 for
+    // the same work as one [rows, E] x [E, 3E] gemm, a 2.6x difference. So
+    // pack the three weights side by side and issue a single call. The pack is
+    // 3*E*E floats and is dwarfed by what it saves.
+    const int E3 = 3 * E;
+    vector<float> W_qkv((size_t)E * E3);
+    for (int e = 0; e < E; e++) {
+        memcpy(&W_qkv[(size_t)e*E3        ], &W_q->data[(size_t)e*E], E*sizeof(float));
+        memcpy(&W_qkv[(size_t)e*E3 + E    ], &W_k->data[(size_t)e*E], E*sizeof(float));
+        memcpy(&W_qkv[(size_t)e*E3 + 2*E  ], &W_v->data[(size_t)e*E], E*sizeof(float));
+    }
+    vector<float> QKV((size_t)rows * E3);
+    matmul_forward(rows, E3, E, input->data.data(), W_qkv.data(), QKV.data());
 
     // Per-head slices and softmax weights saved for backward
     vector<vector<float>> Q_heads(H, vector<float>(rows * D));
@@ -95,15 +107,18 @@ TensorPtr MultiHeadAttention::forward(TensorPtr input, int batch) {
 
     vector<float> concat_all(rows * E, 0.0f);
 
+    // Slicing and rotation are per head, and each head owns its own buffer,
+    // so this splits across threads with no sharing.
+    #pragma omp parallel for schedule(static) if(H > 1)
     for (int h = 0; h < H; h++) {
-        int start = h * D;
+        const int start = h * D;
 
         // Slice Q_h, K_h, V_h for every row  [rows, D]
         for (int t = 0; t < rows; t++)
             for (int d = 0; d < D; d++) {
-                Q_heads[h][t*D + d] = Q_all[t*E + start + d];
-                K_heads[h][t*D + d] = K_all[t*E + start + d];
-                V_heads[h][t*D + d] = V_all[t*E + start + d];
+                Q_heads[h][t*D + d] = QKV[t*E3 + start + d];
+                K_heads[h][t*D + d] = QKV[t*E3 + E + start + d];
+                V_heads[h][t*D + d] = QKV[t*E3 + 2*E + start + d];
             }
 
         // RoPE positions restart at every sequence, so rotate each slice
@@ -113,8 +128,19 @@ TensorPtr MultiHeadAttention::forward(TensorPtr input, int batch) {
                 apply_rope_at(Q_heads[h].data() + b*S*D, S, D, 0);
                 apply_rope_at(K_heads[h].data() + b*S*D, S, D, 0);
             }
+    }
 
-        for (int b = 0; b < B; b++) {
+    // Scores, softmax and the value product are independent for every
+    // (head, sequence) pair -- 48 of them at 6 heads and batch 8, every bit
+    // of it scalar work that was running on a single core while the matmuls
+    // around it used all 16. Flattened into one loop because MSVC's OpenMP
+    // 2.0 has no collapse(2).
+    const int HB = H * B;
+    #pragma omp parallel for schedule(static) if(HB > 1)
+    for (int hb = 0; hb < HB; hb++) {
+        const int h = hb / B, b = hb % B;
+        const int start = h * D;
+        {
             const float* Q_b = Q_heads[h].data() + b*S*D;
             const float* K_b = K_heads[h].data() + b*S*D;
             const float* V_b = V_heads[h].data() + b*S*D;
@@ -125,7 +151,7 @@ TensorPtr MultiHeadAttention::forward(TensorPtr input, int batch) {
             // sequence per layer - 288 copies and 9.4 MB per forward pass at
             // batch 8, for a matrix that is only read.
             vector<float> scores(S * S, 0.0f);
-            matmul_forward_bt(S, S, D, Q_b, K_b, scores.data());
+            matmul_forward_bt_serial(S, S, D, Q_b, K_b, scores.data());
             for (float& v : scores) v *= attn_scale;
 
             // Causal mask: future positions get ~0 weight after softmax
@@ -147,7 +173,7 @@ TensorPtr MultiHeadAttention::forward(TensorPtr input, int batch) {
 
             // O_b = A_b @ V_b  [S, D]
             vector<float> O_b(S * D, 0.0f);
-            matmul_forward(S, D, S, A_b, V_b, O_b.data());
+            matmul_forward_serial(S, D, S, A_b, V_b, O_b.data());
 
             for (int t = 0; t < S; t++)
                 for (int d = 0; d < D; d++)
@@ -172,8 +198,16 @@ TensorPtr MultiHeadAttention::forward(TensorPtr input, int batch) {
         // TensorPtrs keep the weight tensors alive; vectors own their data.
         node->backward_fn = [
             input, W_q=W_q, W_k=W_k, W_v=W_v, W_o=W_o, result,
-            concat_all, Q_heads, K_heads, V_heads, A_heads,
-            rows, B, S, E, H, D, attn_scale, rope
+            // moved, not copied: at [1024, 384] with 6 heads these buffers
+            // are about 9 MB together, and copying them per layer per forward
+            // cost more than some of the matmuls they exist to support
+            concat_all  = std::move(concat_all),
+            Q_heads     = std::move(Q_heads),
+            K_heads     = std::move(K_heads),
+            V_heads     = std::move(V_heads),
+            A_heads     = std::move(A_heads),
+            W_qkv       = std::move(W_qkv),
+            rows, B, S, E, E3, H, D, attn_scale, rope
         ]() {
             const float* grad_out = result->grad.data();
 
@@ -187,14 +221,19 @@ TensorPtr MultiHeadAttention::forward(TensorPtr input, int batch) {
                 matmul_backward_b(rows, E, E, grad_out, concat_all.data(), W_o->grad.data());
 
             // Full gradient accumulators for the Q, K, V projections  [rows, E]
-            vector<float> grad_Q(rows * E, 0.0f);
-            vector<float> grad_K(rows * E, 0.0f);
-            vector<float> grad_V(rows * E, 0.0f);
+            // one interleaved [rows, 3E] accumulator, laid out to match
+            // W_qkv so the projection backward is also a single pair of gemms
+            vector<float> grad_QKV((size_t)rows * E3, 0.0f);
 
             // ── Per-head backward ─────────────────────────────────────────
-            for (int h = 0; h < H; h++) {
-                int start = h * D;
-              for (int b = 0; b < B; b++) {
+            // Same independence as the forward: every (head, sequence) pair
+            // writes only its own slice of grad_QKV.
+            const int HB = H * B;
+            #pragma omp parallel for schedule(static) if(HB > 1)
+            for (int hb = 0; hb < HB; hb++) {
+                const int h = hb / B, b = hb % B;
+                const int start = h * D;
+              {
                 const float* A_h = A_heads[h].data() + b*S*S;
                 const float* Q_h = Q_heads[h].data() + b*S*D;
                 const float* K_h = K_heads[h].data() + b*S*D;
@@ -210,10 +249,10 @@ TensorPtr MultiHeadAttention::forward(TensorPtr input, int batch) {
                 //   grad_A_h [S,S] += grad_O_h [S,D] @ V_h^T [D,S]
                 //   grad_V_h [S,D] += A_h^T [S,S] @ grad_O_h [S,D]
                 vector<float> grad_A_h(S * S, 0.0f);
-                matmul_backward_a(S, S, D, grad_O_h.data(), V_h, grad_A_h.data());
+                matmul_backward_a_serial(S, S, D, grad_O_h.data(), V_h, grad_A_h.data());
 
                 vector<float> grad_V_h(S * D, 0.0f);
-                matmul_backward_b(S, S, D, grad_O_h.data(), A_h, grad_V_h.data());
+                matmul_backward_b_serial(S, S, D, grad_O_h.data(), A_h, grad_V_h.data());
 
                 // Softmax backward: grad_scores_h = A_h * (grad_A_h - rowsum(grad_A_h * A_h))
                 // Causal-masked positions have A_h[i,j] ≈ 0, so their gradients vanish naturally.
@@ -233,13 +272,13 @@ TensorPtr MultiHeadAttention::forward(TensorPtr input, int batch) {
                 //   grad_Q_h [S,D] = grad_scores [S,S] @ K_h [S,D]
                 //   grad_K_h [S,D] = grad_scores^T [S,S] @ Q_h [S,D]
                 vector<float> grad_Q_h(S * D, 0.0f);
-                matmul_forward(S, D, S, grad_scores.data(), K_h, grad_Q_h.data());
+                matmul_forward_serial(S, D, S, grad_scores.data(), K_h, grad_Q_h.data());
 
                 // grad_scores^T @ Q_h is A^T @ B, which is the shape
                 // matmul_backward_b already computes, so the [S,S] transpose
                 // buffer goes away too - 18.9 MB per backward pass at batch 8.
                 vector<float> grad_K_h(S * D, 0.0f);
-                matmul_backward_b(S, S, D, Q_h, grad_scores.data(), grad_K_h.data());
+                matmul_backward_b_serial(S, S, D, Q_h, grad_scores.data(), grad_K_h.data());
 
                 // RoPE backward: Q_h and K_h in the saved heads are already rotated.
                 // grad_Q_h/grad_K_h are in the rotated space — apply inverse rotation
@@ -252,9 +291,10 @@ TensorPtr MultiHeadAttention::forward(TensorPtr input, int batch) {
                 // Scatter head gradients into the full [rows, E] accumulators
                 for (int t = 0; t < S; t++)
                     for (int d = 0; d < D; d++) {
-                        grad_Q[(b*S + t)*E + start + d] += grad_Q_h[t*D + d];
-                        grad_K[(b*S + t)*E + start + d] += grad_K_h[t*D + d];
-                        grad_V[(b*S + t)*E + start + d] += grad_V_h[t*D + d];
+                        const size_t base = (size_t)(b*S + t)*E3 + start + d;
+                        grad_QKV[base          ] += grad_Q_h[t*D + d];
+                        grad_QKV[base + E      ] += grad_K_h[t*D + d];
+                        grad_QKV[base + 2*E    ] += grad_V_h[t*D + d];
                     }
               }
             }
@@ -263,18 +303,25 @@ TensorPtr MultiHeadAttention::forward(TensorPtr input, int batch) {
             // Q = input @ W_q:
             //   grad_W_q   += input^T @ grad_Q
             //   grad_input += grad_Q @ W_q^T   (and similarly for K, V)
-            if (W_q->requires_grad)
-                matmul_backward_b(rows, E, E, grad_Q.data(), input->data.data(), W_q->grad.data());
-            if (W_k->requires_grad)
-                matmul_backward_b(rows, E, E, grad_K.data(), input->data.data(), W_k->grad.data());
-            if (W_v->requires_grad)
-                matmul_backward_b(rows, E, E, grad_V.data(), input->data.data(), W_v->grad.data());
-
-            if (input->requires_grad) {
-                matmul_backward_a(rows, E, E, grad_Q.data(), W_q->data.data(), input->grad.data());
-                matmul_backward_a(rows, E, E, grad_K.data(), W_k->data.data(), input->grad.data());
-                matmul_backward_a(rows, E, E, grad_V.data(), W_v->data.data(), input->grad.data());
+            if (W_q->requires_grad || W_k->requires_grad || W_v->requires_grad) {
+                // one gemm for all three weight gradients, then split the
+                // [E, 3E] result back into the three parameter tensors
+                vector<float> W_qkv_grad((size_t)E * E3, 0.0f);
+                matmul_backward_b(rows, E, E3, grad_QKV.data(),
+                                  input->data.data(), W_qkv_grad.data());
+                for (int e = 0; e < E; e++)
+                    for (int j = 0; j < E; j++) {
+                        const size_t src = (size_t)e*E3 + j;
+                        const size_t dst = (size_t)e*E  + j;
+                        if (W_q->requires_grad) W_q->grad[dst] += W_qkv_grad[src];
+                        if (W_k->requires_grad) W_k->grad[dst] += W_qkv_grad[src + E];
+                        if (W_v->requires_grad) W_v->grad[dst] += W_qkv_grad[src + 2*E];
+                    }
             }
+
+            if (input->requires_grad)
+                matmul_backward_a(rows, E, E3, grad_QKV.data(), W_qkv.data(),
+                                  input->grad.data());
         };
     }
 

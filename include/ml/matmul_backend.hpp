@@ -13,6 +13,20 @@
 /// macros with every option defaulting to off, so a build that silently fell
 /// back to the portable kernel looks identical from the outside. Reading a
 /// benchmark without checking this produced a phantom 4x regression once.
+/// Serial variants, for small matrices multiplied from inside a parallel
+/// region. A BLAS gemm brings its own thread pool, so calling one from each
+/// of 16 OpenMP threads asks for 256 threads and the machine stops making
+/// progress -- attention's per-head matmuls hit exactly this. These always
+/// use the portable tiled kernel and spawn nothing.
+void matmul_forward_serial(int m, int n, int k,
+                           const float* a, const float* b, float* c);
+void matmul_forward_bt_serial(int m, int n, int k,
+                              const float* a, const float* b, float* c);
+void matmul_backward_a_serial(int m, int inner, int b_cols,
+                              const float* grad_out, const float* b_data, float* a_grad);
+void matmul_backward_b_serial(int m, int inner, int b_cols,
+                              const float* grad_out, const float* a_data, float* b_grad);
+
 const char* matmul_backend_name();
 
 /// Threads OpenMP will actually use, or 1 when built without it.
