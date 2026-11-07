@@ -120,14 +120,12 @@ TensorPtr MultiHeadAttention::forward(TensorPtr input, int batch) {
             const float* V_b = V_heads[h].data() + b*S*D;
             float* A_b = A_heads[h].data() + b*S*S;
 
-            // scores = Q_b @ K_b^T  [S, S] — transpose K_b into [D, S]
-            vector<float> K_b_T(D * S);
-            for (int t = 0; t < S; t++)
-                for (int d = 0; d < D; d++)
-                    K_b_T[d*S + t] = K_b[t*D + d];
-
+            // scores = Q_b @ K_b^T  [S, S], with the transpose handed to the
+            // kernel as a flag. Building K_b^T explicitly ran once per head per
+            // sequence per layer - 288 copies and 9.4 MB per forward pass at
+            // batch 8, for a matrix that is only read.
             vector<float> scores(S * S, 0.0f);
-            matmul_forward(S, S, D, Q_b, K_b_T.data(), scores.data());
+            matmul_forward_bt(S, S, D, Q_b, K_b, scores.data());
             for (float& v : scores) v *= attn_scale;
 
             // Causal mask: future positions get ~0 weight after softmax
@@ -237,12 +235,11 @@ TensorPtr MultiHeadAttention::forward(TensorPtr input, int batch) {
                 vector<float> grad_Q_h(S * D, 0.0f);
                 matmul_forward(S, D, S, grad_scores.data(), K_h, grad_Q_h.data());
 
-                vector<float> grad_scores_T(S * S);
-                for (int i = 0; i < S; i++)
-                    for (int j = 0; j < S; j++)
-                        grad_scores_T[j*S + i] = grad_scores[i*S + j];
+                // grad_scores^T @ Q_h is A^T @ B, which is the shape
+                // matmul_backward_b already computes, so the [S,S] transpose
+                // buffer goes away too - 18.9 MB per backward pass at batch 8.
                 vector<float> grad_K_h(S * D, 0.0f);
-                matmul_forward(S, D, S, grad_scores_T.data(), Q_h, grad_K_h.data());
+                matmul_backward_b(S, S, D, Q_h, grad_scores.data(), grad_K_h.data());
 
                 // RoPE backward: Q_h and K_h in the saved heads are already rotated.
                 // grad_Q_h/grad_K_h are in the rotated space — apply inverse rotation

@@ -50,26 +50,41 @@ static void matmul_tiled(int m, int n, int k,
 // at once. Accumulates into out, so the caller's existing gradient survives.
 static void matmul_bt_tiled(int m, int inner, int kdim,
                             const float* g, const float* b, float* out) {
+    // out[m, inner] += g[m, kdim] @ b[inner, kdim]^T
+    //
+    // The obvious loop -- accumulate g[i][kk]*b[j][kk] over kk -- reads both
+    // operands contiguously and looks ideal, but it is a floating-point
+    // reduction into a single scalar, and the compiler may not reassociate
+    // that, so it stays scalar. Measured at 128x128x64 it ran 2.6x slower
+    // than transposing b and calling matmul_tiled.
+    //
+    // So pack a tile of b^T into a contiguous buffer and use the same
+    // j-innermost axpy that matmul_tiled uses, which vectorises. The pack is
+    // TILE^2 elements and is amortised over the rows of the tile.
     #ifdef PROMETHEUS_USE_OPENMP
     #pragma omp parallel for schedule(dynamic) if(worth_parallel(m, inner, kdim))
     #endif
-    for (int i0 = 0; i0 < m; i0 += TILE)
-        for (int j0 = 0; j0 < inner; j0 += TILE) {
-            int i_end = std::min(i0 + TILE, m);
-            int j_end = std::min(j0 + TILE, inner);
-            for (int k0 = 0; k0 < kdim; k0 += TILE) {
+    for (int i0 = 0; i0 < m; i0 += TILE) {
+        float bt[TILE * TILE];
+        int i_end = std::min(i0 + TILE, m);
+        for (int k0 = 0; k0 < kdim; k0 += TILE)
+            for (int j0 = 0; j0 < inner; j0 += TILE) {
                 int k_end = std::min(k0 + TILE, kdim);
+                int j_end = std::min(j0 + TILE, inner);
+
+                for (int j = j0; j < j_end; j++)
+                    for (int kk = k0; kk < k_end; kk++)
+                        bt[(kk - k0) * TILE + (j - j0)] = b[j * kdim + kk];
+
                 for (int i = i0; i < i_end; i++)
-                    for (int j = j0; j < j_end; j++) {
-                        float acc = 0.0f;
-                        const float* gi = g + i * kdim;
-                        const float* bj = b + j * kdim;
-                        for (int kk = k0; kk < k_end; kk++)
-                            acc += gi[kk] * bj[kk];
-                        out[i * inner + j] += acc;
+                    for (int kk = k0; kk < k_end; kk++) {
+                        float g_ik = g[i * kdim + kk];
+                        const float* btr = bt + (kk - k0) * TILE - j0;
+                        for (int j = j0; j < j_end; j++)
+                            out[i * inner + j] += g_ik * btr[j];
                     }
             }
-        }
+    }
 }
 
 // dB += A^T @ grad_out
