@@ -1,32 +1,16 @@
 #pragma once
 
-/// Fast matmul dispatch — which backend is compiled in depends on build flags:
-///   PROMETHEUS_USE_OPENBLAS — cblas_sgemm from OpenBLAS (best on AMD)
-///   PROMETHEUS_USE_MKL      — cblas_sgemm from Intel MKL (best on Intel)
-///   PROMETHEUS_USE_OPENMP   — tiled matmul parallelised across CPU cores
-///   (none)                  — plain tiled cache-friendly matmul (no dependencies)
+/// Fast matmul dispatch. The BLAS library -- OpenBLAS, Intel MKL, or none --
+/// is chosen at runtime (see ml/blas.hpp); without one, a tiled
+/// cache-friendly kernel is used, parallelised across cores when built with
+/// PROMETHEUS_USE_OPENMP.
 
 /// Forward pass: C = A @ B
 /// A [m, k],  B [k, n],  C [m, n]  — C is zeroed before accumulation
-/// Which matmul backend this build actually compiled in, and whether it can
-/// use more than one core. Worth having: the backend is chosen by compile-time
-/// macros with every option defaulting to off, so a build that silently fell
-/// back to the portable kernel looks identical from the outside. Reading a
-/// benchmark without checking this produced a phantom 4x regression once.
-/// Serial variants, for small matrices multiplied from inside a parallel
-/// region. A BLAS gemm brings its own thread pool, so calling one from each
-/// of 16 OpenMP threads asks for 256 threads and the machine stops making
-/// progress -- attention's per-head matmuls hit exactly this. These always
-/// use the portable tiled kernel and spawn nothing.
-void matmul_forward_serial(int m, int n, int k,
-                           const float* a, const float* b, float* c);
-void matmul_forward_bt_serial(int m, int n, int k,
-                              const float* a, const float* b, float* c);
-void matmul_backward_a_serial(int m, int inner, int b_cols,
-                              const float* grad_out, const float* b_data, float* a_grad);
-void matmul_backward_b_serial(int m, int inner, int b_cols,
-                              const float* grad_out, const float* a_data, float* b_grad);
-
+/// Which matmul backend is in use right now: "openblas", "mkl" or "tiled".
+/// Worth checking before reading any benchmark: a run that silently fell back
+/// to the portable kernel looks identical from the outside, and once produced
+/// a phantom 4x regression.
 /// While one of these is alive, BLAS runs on the calling thread only, so
 /// gemms issued from inside a parallel region use BLAS's kernels rather than
 /// falling back to the portable tiled loop. Create it outside the region:

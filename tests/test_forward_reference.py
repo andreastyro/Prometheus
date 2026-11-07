@@ -22,8 +22,13 @@ FAILURES = []
 CHECKS = [0]
 
 
-def check(name, got, want, atol=1e-5):
-    """Compare a prometheus result against the numpy reference."""
+def check(name, got, want, atol=1e-5, rtol=0.0):
+    """Compare a prometheus result against the numpy reference.
+
+    Passes where |got - want| <= atol + rtol * |want| everywhere, the same
+    criterion as numpy.allclose. rtol defaults to 0, so a check is purely
+    absolute unless it asks otherwise.
+    """
     CHECKS[0] += 1
     got = np.asarray(got, dtype=np.float64)
     want = np.asarray(want, dtype=np.float64)
@@ -35,7 +40,7 @@ def check(name, got, want, atol=1e-5):
         return
 
     err = float(np.max(np.abs(got - want))) if got.size else 0.0
-    ok = err <= atol
+    ok = bool(np.all(np.abs(got - want) <= atol + rtol * np.abs(want)))
     if not ok:
         FAILURES.append("%s: max abs error %.3e" % (name, err))
     print("  %-46s max abs err %.3e   %s" % (name, err, "ok" if ok else "** FAIL **"))
@@ -693,10 +698,25 @@ def test_batching():
                                tflat).backward()
     together = [list(t.grad) for t in gpt.parameters()]
 
-    worst = max(abs(a / B - b)
-                for A, Bg in zip(alone, together) for a, b in zip(A, Bg))
-    check("GPT batched gradients == per-sequence sum / B",
-          np.array([worst]), np.array([0.0]), atol=1e-6)
+    # The two routes multiply matrices of different shapes -- 20 rows at once
+    # against 5 at a time -- and a BLAS library is free to pick a different
+    # kernel, and so a different summation order, for each. Under MKL that
+    # moves gradients by a few parts in a million of their scale.
+    #
+    # The scale is the tensor's, not the element's: a gradient that is a sum
+    # of large terms which nearly cancel carries rounding error the size of
+    # the terms, so an element-wise relative test fails on it while the
+    # tensor is right. So each parameter's worst error is measured against
+    # its largest gradient. A real batching bug is off by orders of magnitude
+    # more than the 1e-5 allowed here.
+    worst = 0.0
+    for A, Bg in zip(alone, together):
+        a = np.array(A) / B
+        b = np.array(Bg)
+        scale = max(float(np.max(np.abs(a))), 1e-12)
+        worst = max(worst, float(np.max(np.abs(a - b))) / scale)
+    check("GPT batched gradients == per-sequence sum / B (rel. to scale)",
+          np.array([worst]), np.array([0.0]), atol=1e-5)
 
     # a batch that does not divide the token count must be refused
     threw = False

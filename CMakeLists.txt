@@ -3,12 +3,11 @@ project(prometheus)
 
 set(CMAKE_CXX_STANDARD 17)
 
-# ── Backend options ────────────────────────────────────────────────────────────
-# Pass -DUSE_OPENBLAS=ON, -DUSE_MKL=ON, or -DUSE_OPENMP=ON to cmake to enable.
-# Priority: OpenBLAS > MKL > OpenMP > plain tiled matmul (default fallback).
-option(USE_OPENBLAS "Use OpenBLAS for matmul (best on AMD)"   OFF)
-option(USE_MKL      "Use Intel MKL for matmul (best on Intel)" OFF)
-option(USE_OPENMP   "Parallelise matmul across CPU cores"      OFF)
+# ── Build options ──────────────────────────────────────────────────────────────
+# The BLAS library (OpenBLAS, MKL or none) is chosen at runtime, not here: set
+# PROMETHEUS_BLAS=openblas|mkl|tiled, or call prometheus.set_blas(). Only
+# OpenMP is a build-time choice.
+option(USE_OPENMP   "Parallelise across CPU cores"      OFF)
 
 # ── Source files ──────────────────────────────────────────────────────────────
 set(SOURCES
@@ -16,6 +15,7 @@ set(SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/ops.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/loss.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/matmul_backend.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/blas_loader.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/linear.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/activations.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/dropout.cpp
@@ -59,41 +59,9 @@ set(SOURCES
 add_library(prometheus ${SOURCES})
 target_include_directories(prometheus PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
-# ── Backend detection & linking ───────────────────────────────────────────────
-if(USE_OPENBLAS)
-    # If OPENBLAS_ROOT is set, use it directly (Windows pre-built zip)
-    if(OPENBLAS_ROOT)
-        message(STATUS "Backend: OpenBLAS (from OPENBLAS_ROOT=${OPENBLAS_ROOT})")
-        target_compile_definitions(prometheus PUBLIC PROMETHEUS_USE_OPENBLAS)
-        target_include_directories(prometheus PUBLIC "${OPENBLAS_ROOT}/include")
-        target_link_libraries(prometheus "${OPENBLAS_ROOT}/lib/libopenblas.dll.a")
-    else()
-        # Linux/macOS: find via pkg-config or system paths
-        find_library(OPENBLAS_LIB NAMES openblas)
-        find_path(OPENBLAS_INCLUDE NAMES cblas.h PATH_SUFFIXES openblas)
-        if(OPENBLAS_LIB AND OPENBLAS_INCLUDE)
-            message(STATUS "Backend: OpenBLAS (system)")
-            target_compile_definitions(prometheus PUBLIC PROMETHEUS_USE_OPENBLAS)
-            target_include_directories(prometheus PUBLIC ${OPENBLAS_INCLUDE})
-            target_link_libraries(prometheus ${OPENBLAS_LIB})
-        else()
-            message(WARNING "OpenBLAS not found — falling back to tiled matmul")
-        endif()
-    endif()
-
-elseif(USE_MKL)
-    find_package(MKL QUIET)
-    if(MKL_FOUND)
-        message(STATUS "Backend: Intel MKL ${MKL_VERSION}")
-        target_compile_definitions(prometheus PUBLIC PROMETHEUS_USE_MKL)
-        target_include_directories(prometheus PUBLIC ${MKL_INCLUDE_DIRS})
-        target_link_libraries(prometheus ${MKL_LIBRARIES})
-    else()
-        message(WARNING "MKL not found — falling back to tiled matmul")
-    endif()
-
-else()
-    message(STATUS "Backend: tiled cache-friendly matmul (no external BLAS)")
+# ── Runtime BLAS loading needs the dynamic loader ─────────────────────────────
+if(UNIX)
+    target_link_libraries(prometheus ${CMAKE_DL_LIBS})
 endif()
 
 if(USE_OPENMP)

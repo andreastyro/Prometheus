@@ -125,51 +125,45 @@ Adam and AdamW persist their momentum buffers through `save_state()` / `load_sta
 
 ## Performance
 
-`matmul` dispatches through a pluggable backend selected at build time:
-
-| Backend | Notes |
-|---|---|
-| **OpenBLAS** | `cblas_sgemm`; best on AMD |
-| **Intel MKL** | `cblas_sgemm`; best on Intel |
-| **Tiled + OpenMP** | Cache-friendly `ikj` tiling, parallel outer loop |
-| **Tiled** | Fallback, no external dependency |
-
-Every backend defaults to **off**, so a build with no flags uses the portable
-tiled kernel on one thread. Nothing is auto-detected. Ask the library what it
-actually got, rather than assuming:
+`matmul` goes through a BLAS library chosen **at runtime**, not at build time.
+OpenBLAS and Intel MKL both export the standard `cblas_sgemm`, so the module
+loads whichever is selected and calls through it. One build serves every case,
+and switching costs no rebuild:
 
 ```python
->>> prometheus.backend()
-{'matmul': 'openblas', 'threads': 16}
+>>> import prometheus as p
+>>> p.backend()
+{'matmul': 'mkl', 'library': '...\\mkl_rt.3.dll', 'blas_threads': 8, 'threads': 16}
+>>> p.set_blas("openblas")      # or "mkl", "tiled", "auto"
 ```
 
-Measured on a 16.8M-parameter GPT, batch 8, sequence 128, 16 threads, one
-training step including the backward pass and the optimiser:
-
-| Build | tok/s |
+| Backend | Where it comes from |
 |---|---|
-| Tiled, 1 thread | 48 |
-| Tiled + OpenMP | 120-190 |
-| OpenBLAS + OpenMP | 323-362 |
+| **Intel MKL** | `pip install mkl` (or `pip install prometheus[mkl]`) |
+| **OpenBLAS** | system package, or `libopenblas` next to the module |
+| **Tiled** | built in: cache-friendly tiling, parallel with OpenMP |
 
-The spread on the tiled rows is real run-to-run variance on a desktop, not a
-range of configurations. Benchmark with
+By default (`"auto"`) MKL is tried first, then OpenBLAS, then the built-in
+kernel. `PROMETHEUS_BLAS=mkl|openblas|tiled` picks one at startup, and
+`PROMETHEUS_BLAS_PATH` names the exact library file. Asking for a library that
+cannot be loaded raises an error rather than quietly falling back: always
+check `backend()` before trusting a benchmark.
+
+Measured on a 16.8M-parameter GPT (vocab 16000, embed 384, 6 heads, 6 layers),
+batch 8, sequence 128, one full training step including backward and Adam, on
+a Ryzen AI 7 350. PyTorch 2.15 CPU was run on the identical architecture, in
+the same session, interleaved with Prometheus:
+
+| | tok/s |
+|---|---|
+| Prometheus, tiled + OpenMP | 218 |
+| Prometheus, OpenBLAS | 1523 |
+| Prometheus, MKL | 1532-1681 |
+| PyTorch 2.15 (MKL) | 1917-1976 |
+
+Absolute numbers on a laptop move with power and thermal state by as much as
+40%, which is why the comparison is interleaved. Benchmark with
 [tests/benchmark_matmul.cpp](tests/benchmark_matmul.cpp).
-
-#### Windows: OpenBLAS in three steps
-
-The official release ships its import library as `libopenblas.lib`, and the
-headers are in a separate directory from the `.a` files, so it needs pointing at:
-
-```bash
-# 1. unpack https://github.com/OpenMathLib/OpenBLAS/releases -> OpenBLAS-<ver>-x64.zip
-# 2. build against it
-OPENBLAS_ROOT=/path/to/openblas PROMETHEUS_USE_OPENBLAS=1 PROMETHEUS_USE_OPENMP=1     pip install -e . --no-build-isolation
-# 3. put libopenblas.dll next to the built module, or on PATH
-```
-
-Then check `prometheus.backend()` says `openblas`. If it says `tiled`, the
-build fell back and the numbers above do not apply.
 
 ---
 
@@ -181,13 +175,14 @@ build fell back and the numbers above do not apply.
 pip install -e . --no-build-isolation
 ```
 
-Backend selection via environment variables before building:
+Parallelise across cores with OpenMP:
 
 ```bash
-PROMETHEUS_USE_OPENBLAS=1 pip install -e . --no-build-isolation   # OpenBLAS
-PROMETHEUS_USE_MKL=1      pip install -e . --no-build-isolation   # Intel MKL
-PROMETHEUS_USE_OPENMP=1   pip install -e . --no-build-isolation   # OpenMP
+PROMETHEUS_USE_OPENMP=1 pip install -e . --no-build-isolation
+pip install mkl                  # optional: fastest matmul, picked up automatically
 ```
+
+The BLAS library is not a build option; see [Performance](#performance).
 
 Prebuilt wheels for Windows, Linux, and macOS are produced by
 [.github/workflows/build_wheels.yml](.github/workflows/build_wheels.yml).
@@ -206,21 +201,12 @@ Each component has its own test executable (`test_tensor`, `test_gpt`, `test_att
 built alongside the library. `ctest` runs them all with the correct working
 directory, which some tests need in order to find their fixtures.
 
-#### Optional BLAS backend
+#### OpenMP and BLAS
 
-OpenBLAS is **not** vendored in this repository — install it and point CMake at it:
-
-```bash
-# Linux / macOS: auto-detected once installed
-sudo apt install libopenblas-dev        # or: brew install openblas
-cmake -B build -DUSE_OPENBLAS=ON
-
-# Windows: extract a pre-built release, then pass its path
-cmake -B build -DUSE_OPENBLAS=ON -DOPENBLAS_ROOT=C:/path/to/openblas
-```
-
-`OPENBLAS_ROOT` must contain `include/cblas.h` and `lib/libopenblas.dll.a`.
-Intel MKL (`-DUSE_MKL=ON`) and plain OpenMP (`-DUSE_OPENMP=ON`) work the same way.
+`cmake -B build -DUSE_OPENMP=ON` parallelises across cores. BLAS needs no
+build flag: the test binaries load MKL or OpenBLAS at runtime if one is on the
+library path or beside the executable, and `PROMETHEUS_BLAS=tiled ctest`
+forces the built-in kernel.
 
 ---
 

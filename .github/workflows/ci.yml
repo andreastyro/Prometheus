@@ -143,7 +143,7 @@ jobs:
           case "${{ matrix.backend }}" in
             tiled)    FLAGS="" ;;
             openmp)   FLAGS="-DUSE_OPENMP=ON" ;;
-            openblas) FLAGS="-DUSE_OPENBLAS=ON" ;;
+            openblas) FLAGS="-DUSE_OPENMP=ON" ;;
           esac
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release $FLAGS
 
@@ -152,8 +152,12 @@ jobs:
 
       # the whole suite, not just the backend test: a wrong gemm corrupts
       # every layer that multiplies matrices
+      # BLAS is loaded at runtime. Naming it explicitly makes a failure to
+      # load it an error instead of a quiet fallback to the tiled kernel.
       - name: Run tests
-        run: ctest --test-dir build --output-on-failure
+        run: |
+          if [ "${{ matrix.backend }}" = openblas ]; then export PROMETHEUS_BLAS=openblas; else export PROMETHEUS_BLAS=tiled; fi
+          ctest --test-dir build --output-on-failure
 
   # ── Examples, so they cannot rot silently ────────────────────────────────
   examples:

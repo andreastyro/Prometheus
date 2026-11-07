@@ -6,6 +6,7 @@
 #include "ml/tensor.hpp"
 #include "ml/ops.hpp"
 #include "ml/matmul_backend.hpp"
+#include "ml/blas.hpp"
 #include "ml/loss.hpp"
 #include "ml/metrics/metrics.hpp"
 
@@ -138,12 +139,45 @@ PYBIND11_MODULE(prometheus, m) {
           "O(1) reshape sharing storage.");
     m.def("contiguous",     &contiguous, py::arg("a"),
           "Materialise a view; returns the input unchanged if it owns its data.");
-    m.def("backend", []() {
+    // Where pip and conda put shared libraries, so `pip install mkl` is found
+    // with no configuration: <prefix>/Library/bin on Windows, <prefix>/lib
+    // elsewhere, for both the interpreter's prefix and the user base.
+    {
+        std::vector<std::string> dirs;
+        auto sys  = py::module_::import("sys");
+        auto site = py::module_::import("site");
+        std::vector<std::string> bases = {py::str(sys.attr("prefix"))};
+        try { bases.push_back(py::str(site.attr("getuserbase")())); } catch (...) {}
+        for (const auto& b : bases) {
+#ifdef _WIN32
+            dirs.push_back(b + "/Library/bin");
+#else
+            dirs.push_back(b + "/lib");
+#endif
+        }
+        blas::set_search_dirs(dirs);
+    }
+
+    auto backend_info = []() {
         py::dict d;
-        d["matmul"]  = matmul_backend_name();
-        d["threads"] = matmul_max_threads();
+        d["matmul"]       = matmul_backend_name();
+        d["library"]      = blas::library_path();
+        d["blas_threads"] = blas::get_threads();
+        d["threads"]      = matmul_max_threads();
         return d;
-    }, "Which matmul backend this build compiled in, and its thread count.");
+    };
+    m.def("backend", backend_info,
+          "The matmul backend in use ('openblas', 'mkl' or 'tiled'), the "
+          "library file, and thread counts.");
+    m.def("set_blas", [backend_info](const std::string& which, const std::string& path) {
+        std::string err;
+        if (!blas::select(which, path, &err))
+            throw std::runtime_error(err);
+        return backend_info();
+    }, py::arg("which"), py::arg("path") = "",
+    "Switch matmul backend: 'auto', 'openblas', 'mkl' or 'tiled'. `path` names "
+    "the exact library file if it is not found on its own. Raises if the "
+    "library cannot be loaded. Not safe while another thread is training.");
     m.def("linear_op",     &linear_op, py::arg("x"), py::arg("W"),
           py::arg("bias") = nullptr, py::arg("residual") = nullptr,
           "residual + x @ W + bias as one op.");
