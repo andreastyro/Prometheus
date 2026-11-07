@@ -53,9 +53,19 @@ def test_self_contained():
     m = MLP(4, 2, (8,))
     html = build_dashboard(m, x=tensor([3, 4]))
 
-    # the whole point is that it opens from the filesystem, offline
-    for bad in ("http://", "https://", "<script src", "<link rel"):
-        check("no %s reference" % bad.strip("<"), bad not in html)
+    # The point is that it opens from the filesystem, offline. Check for
+    # actual resource loads rather than any occurrence of "http": the inlined
+    # isometric SVG carries xmlns="http://www.w3.org/2000/svg", which is a
+    # namespace identifier and is never fetched.
+    for bad in ('src="http', 'href="http', "url(http",
+                "<script src", "<link rel", "@import"):
+        check("no external load via %s" % bad, bad not in html)
+
+    urls = re.findall(r"https?://[^\s\"')]+", html)
+    external = [u for u in urls if not u.startswith("http://www.w3.org/")]
+    check("every URL present is a namespace, not a fetch",
+          not external, str(external[:3]))
+
     check("inline style block present", "<style>" in html)
     check("inline svg present", "<svg" in html)
     check("declares a doctype", html.lstrip().startswith("<!doctype html>"))

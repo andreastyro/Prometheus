@@ -120,9 +120,66 @@ def _subsample(flat, h, w, cap=14):
     return out, nh, nw
 
 
-# ── panel 1: architecture ────────────────────────────────────────────────────
-def _architecture(model, shapes):
-    """Layered graph: one node per layer, shape annotations on the edges."""
+# ── panel 1: architecture ──────────────────────────────
+def _isometric_svg(model, theme="default"):
+    """The isometric diagram from python/visualise.py, as a bare SVG string.
+
+    Reuses _make_svg rather than parsing the standalone page: that file sets
+    html/body to 100vw/100vh and owns the #vp scroll container, which would
+    fight the dashboard layout if it were inlined wholesale.
+    """
+    try:
+        from ..visualise import _collect, _make_svg
+    except Exception:
+        return None
+    layers = _collect(model)
+    if not layers:
+        return None
+    try:
+        return _make_svg(type(model).__name__, layers, theme)
+    except Exception:
+        return None
+
+
+def _architecture(model, shapes, theme="default"):
+    """Isometric 3D diagram, with the per-layer shapes listed beneath it."""
+    svg = _isometric_svg(model, theme)
+
+    if svg is None:
+        return _architecture_flat(model, shapes)
+
+    # drag-to-pan, scoped to this panel so it cannot capture the page
+    pan = ('<div class="iso" id="iso">' + svg + '</div>'
+           '<script>(function(){var e=document.getElementById("iso");'
+           'if(!e)return;var d=0,x=0,l=0;'
+           'e.addEventListener("mousedown",function(v){d=1;x=v.pageX;'
+           'l=e.scrollLeft;e.style.cursor="grabbing";});'
+           'document.addEventListener("mouseup",function(){d=0;'
+           'e.style.cursor="grab";});'
+           'e.addEventListener("mousemove",function(v){if(!d)return;'
+           'v.preventDefault();e.scrollLeft=l-(v.pageX-x);});})();</script>')
+
+    if not shapes:
+        return pan + ('<p class="hint">Pass x=&lt;a sample batch&gt; for the '
+                      'output shape of each layer.</p>')
+
+    rows = []
+    for name, layer in model._layers:
+        sh = shapes.get(name)
+        if not sh:
+            continue
+        rows.append(
+            '<tr><td class="n">%s</td><td class="t">%s</td>'
+            '<td class="s">%s</td></tr>'
+            % (_esc(name), _esc(type(layer).__name__),
+               "x".join(str(d) for d in sh)))
+    return pan + ('<table class="shapes"><thead><tr><th>layer</th>'
+                  '<th>type</th><th>output</th></tr></thead>'
+                  '<tbody>%s</tbody></table>' % "".join(rows))
+
+
+def _architecture_flat(model, shapes):
+    """Fallback layered graph, used when the isometric view cannot be built."""
     layers = model._layers
     if not layers:
         return "<p>no layers</p>"
@@ -612,13 +669,24 @@ a:hover{opacity:0.75}
 .hint{font-size:12px;color:%(dim)s;padding:14px 0}
 .body{overflow-x:auto}
 footer{color:%(dim)s;font-size:11px;margin-top:8px;text-align:center}
+.iso{overflow-x:auto;cursor:grab;user-select:none;padding:6px 0 14px;
+border-bottom:1px solid %(edge)s;margin-bottom:14px}
+.iso svg{display:block}
+table.shapes{border-collapse:collapse;font-size:11px;width:100%%}
+table.shapes th{text-align:left;color:%(dim)s;font-weight:600;
+padding:4px 14px 6px 0;border-bottom:1px solid %(edge)s;
+text-transform:uppercase;letter-spacing:0.6px;font-size:9px}
+table.shapes td{padding:3px 14px 3px 0;border-bottom:1px solid #121a24}
+table.shapes td.n{color:%(text)s}
+table.shapes td.t{color:%(dim)s}
+table.shapes td.s{color:%(accent)s}
 """ % {"bg": BG, "panel": PANEL, "edge": EDGE, "text": TEXT, "dim": DIM,
        "accent": ACCENT}
 
 
 def build_dashboard(model, x=None, history=None, real=None, labels=None,
                     token_ids=None, attention_layer=0, live_seconds=None,
-                    view_3d_href=None):
+                    theme="default"):
     """Return the dashboard as one self-contained HTML string."""
     kind = type(model).__name__
 
@@ -628,8 +696,9 @@ def build_dashboard(model, x=None, history=None, real=None, labels=None,
         for name, t in trace:
             shapes[name] = _shape_of(t)
 
-    parts = [_panel("Architecture", _architecture(model, shapes),
-                    "one node per layer, output shape on the right")]
+    parts = [_panel("Architecture", _architecture(model, shapes, theme),
+                    "isometric diagram, drag to pan; block size scales with "
+                    "parameter count and colour with layer type")]
     parts.append(_panel("Parameters", _parameters(model),
                         "%s total across %d layers"
                         % (_fmt(model.num_parameters()), len(model._layers))))
@@ -690,20 +759,19 @@ dependencies</footer>
         "mode": "training" if model.training else "eval",
         "livenote": (" &middot; live, refreshing every %ds" % live_seconds
                      if live_seconds else ""),
-        "view3d": ('  &middot; <a href="%s">isometric 3D view</a>'
-                   % _esc(view_3d_href)) if view_3d_href else "",
+        "view3d": "",
         "parts": "".join(parts),
     })
 
 
 def visualise(model, x=None, history=None, filename=None, open_browser=True,
               real=None, labels=None, token_ids=None, attention_layer=0,
-              live_seconds=None, view_3d=True):
+              live_seconds=None, theme="default", standalone_3d=False):
     """Write the dashboard to disk and open it. Returns the path.
 
-    view_3d also renders the isometric diagram from python/visualise.py next to
-    it and links the two, so the panel dashboard and the 3D view are reachable
-    from each other rather than being two separate tools.
+    The isometric diagram is embedded in the Architecture panel, so one file
+    holds everything. standalone_3d=True additionally writes the full-page 3D
+    view beside it, for when you want the diagram on its own.
     """
     if filename is None:
         fd, filename = tempfile.mkstemp(
@@ -711,21 +779,19 @@ def visualise(model, x=None, history=None, filename=None, open_browser=True,
             suffix=".html")
         os.close(fd)
 
-    href = None
-    if view_3d:
+    if standalone_3d:
         base, ext = os.path.splitext(filename)
-        path_3d = base + "_3d" + (ext or ".html")
         try:
             from ..visualise import visualise as _iso
-            _iso(model, filename=path_3d, open_browser=False)
-            href = os.path.basename(path_3d)
+            _iso(model, filename=base + "_3d" + (ext or ".html"),
+                 open_browser=False)
         except Exception:
-            href = None          # the 3D view is a bonus, never a hard failure
+            pass                 # a bonus file, never a hard failure
 
     html = build_dashboard(model, x=x, history=history, real=real,
                            labels=labels, token_ids=token_ids,
                            attention_layer=attention_layer,
-                           live_seconds=live_seconds, view_3d_href=href)
+                           live_seconds=live_seconds, theme=theme)
 
     with open(filename, "w", encoding="utf-8") as fh:
         fh.write(html)
