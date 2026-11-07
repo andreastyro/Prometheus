@@ -305,8 +305,22 @@ def test_diagnostics():
 
     stats = activation_stats(tr, m)
     check("one stat row per traced layer", len(stats) == len(tr))
-    check("dead fraction is a proportion",
-          all(0.0 <= st["dead"] <= 1.0 for st in stats))
+    check("zero fraction is a proportion",
+          all(0.0 <= st["zeros"] <= 1.0 for st in stats))
+
+    # A ReLU zeroing about half its values is doing its job. The flaggable
+    # condition is a unit zero for every sample in the batch, which gets no
+    # gradient from any of them. Warning on the former flagged every healthy
+    # ReLU in the library.
+    relu_stats = [st for st in stats if st["kind"] == "ReLU"]
+    check("ReLU zeroes roughly half its values",
+          relu_stats and all(0.2 < st["zeros"] < 0.8 for st in relu_stats),
+          str([round(st["zeros"], 2) for st in relu_stats]))
+    check("but almost no units are dead across the batch",
+          relu_stats and all(st["dead_units"] < 0.25 for st in relu_stats),
+          str([round(st["dead_units"], 2) for st in relu_stats]))
+    check("a healthy ReLU is therefore not flagged",
+          not [i for i in diagnose(m, tr, None) if "units are zero" in i[2]])
 
     # saturation only applies where the activation is bounded -- reporting a
     # conv output above 0.99 as saturated flagged every healthy conv layer in
@@ -318,9 +332,9 @@ def test_diagnostics():
           str([st["name"] for st in unbounded if st["saturated"] is not None]))
 
     # ReLU should have some exact zeros, and that is where "dead" is meaningful
-    relus = [st for st in stats if st["kind"] == "ReLU"]
-    check("ReLU layers report a dead fraction",
-          relus and all(st["dead"] > 0 for st in relus))
+    check("dead-unit measure is per unit, not per value",
+          all(st["dead_units"] is None or st["dead_units"] <= st["zeros"] + 1e-9
+              for st in stats))
 
     # update ratio must scale with the learning rate
     r_small = dict((n, v) for n, v, _, _ in update_ratios(m, 1e-5))

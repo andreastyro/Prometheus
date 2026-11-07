@@ -378,9 +378,19 @@ def _gradient_flow(norms):
 # These are the numbers that explain a model which trains but trains badly.
 # Each one is a specific, nameable failure rather than a picture to interpret.
 
-DEAD_FRACTION = 0.5      # a layer this dead is worth flagging
+# A ReLU zeroing half its outputs is doing its job, not failing: for a roughly
+# zero-centred input that is exactly what it should do. The first version of
+# this panel warned at 50% of individual values being zero and so flagged every
+# healthy ReLU in the library.
+#
+# The real pathology is a unit that is zero for EVERY sample in the batch,
+# because it is then receiving no gradient from any of them and cannot recover.
+# That is what DEAD_UNITS measures, and the threshold is set where it starts to
+# mean something rather than where ReLU normally sits.
+DEAD_UNITS = 0.25        # fraction of units zero across the whole batch
 SATURATED = 0.99         # |tanh| or sigmoid distance from its asymptote
-RATIO_HIGH = 1e-2        # lr*|grad|/|w| above this: the step is too large
+SATURATED_FRACTION = 0.5
+RATIO_HIGH = 1e-2        # lr*|grad|/|w| above this: the step is large
 RATIO_LOW = 1e-5         # below this: the layer is effectively frozen
 
 
@@ -423,11 +433,28 @@ def activation_stats(trace, model=None):
         zeros = sum(1 for v in vals if v == 0.0)
         sat = (sum(1 for v in vals if abs(v) >= SATURATED) / n
                if bounded else None)
+
+        # a unit is dead only if it is zero for every sample in the batch
+        shape = _shape_of(t)
+        batch = shape[0] if shape else 1
+        per = n // batch if batch else n
+        dead_units = None
+        if batch > 1 and per:
+            count = 0
+            for u in range(per):
+                for b in range(batch):
+                    if vals[b * per + u] != 0.0:
+                        break
+                else:
+                    count += 1
+            dead_units = count / per
+
         out.append({
             "name": name,
             "kind": kind,
             "n": n,
-            "dead": zeros / n,
+            "zeros": zeros / n,
+            "dead_units": dead_units,
             "saturated": sat,
             "nonfinite": _nonfinite(vals),
             "absmax": max((abs(v) for v in vals), default=0.0),
@@ -464,11 +491,12 @@ def diagnose(model, trace=None, lr=None):
             if st["nonfinite"]:
                 issues.append(("error", st["name"],
                                "%d non-finite activations" % st["nonfinite"]))
-            if st["dead"] >= DEAD_FRACTION:
+            if st["dead_units"] is not None and st["dead_units"] >= DEAD_UNITS:
                 issues.append(("warn", st["name"],
-                               "%.0f%% of activations are exactly zero"
-                               % (100 * st["dead"])))
-            if st["saturated"] is not None and st["saturated"] >= DEAD_FRACTION:
+                               "%.0f%% of units are zero for every sample in "
+                               "the batch and receive no gradient"
+                               % (100 * st["dead_units"])))
+            if st["saturated"] is not None and st["saturated"] >= SATURATED_FRACTION:
                 issues.append(("warn", st["name"],
                                "%.0f%% saturated: %s has stopped passing "
                                "gradient there"
@@ -497,8 +525,9 @@ def diagnose(model, trace=None, lr=None):
                 continue
             if ratio > RATIO_HIGH:
                 issues.append(("warn", name,
-                               "update/weight ratio %.1e: the step is large "
-                               "relative to the weights" % ratio))
+                               "update/weight ratio %.1e: large relative to "
+                               "the weights (expected in the first few steps "
+                               "with Adam, a problem if it persists)" % ratio))
             elif ratio < RATIO_LOW:
                 issues.append(("warn", name,
                                "update/weight ratio %.1e: barely moving"
@@ -546,15 +575,24 @@ def _diagnostics(model, trace, lr):
         stats = activation_stats(trace, model)
         srows = "".join(
             '<tr><td class="n">%s</td><td class="t">%.0f%%</td>'
-            '<td class="t">%s</td><td class="s">%.3g</td></tr>'
-            % (_esc(st["name"]), 100 * st["dead"],
+            '<td class="t">%s</td><td class="t">%s</td>'
+            '<td class="s">%.3g</td></tr>'
+            % (_esc(st["name"]), 100 * st["zeros"],
+               ("%.0f%%" % (100 * st["dead_units"]))
+               if st["dead_units"] is not None else "n/a",
                ("%.0f%%" % (100 * st["saturated"]))
                if st["saturated"] is not None else "n/a",
                st["absmax"])
             for st in stats)
         body += ('<table class="shapes"><thead><tr><th>layer</th>'
-                 '<th>zero</th><th>saturated</th><th>max |activation|</th>'
-                 '</tr></thead><tbody>%s</tbody></table>' % srows)
+                 '<th>zeros</th><th>dead units</th><th>saturated</th>'
+                 '<th>max |activation|</th></tr></thead><tbody>%s</tbody>'
+                 '</table>'
+                 '<p class="hint">"zeros" counts individual zero values, which '
+                 'for a ReLU on zero-centred input is normally about half and '
+                 'is not a problem. "dead units" counts units that are zero '
+                 'for every sample in the batch; those receive no gradient '
+                 'from any of them.</p>' % srows)
 
     if lr:
         urows = "".join(
