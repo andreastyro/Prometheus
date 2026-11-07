@@ -6,9 +6,24 @@
 
 using namespace std;
 
+// A strided view owns no `data`. Every op below reads memory directly, so a
+// view reaching one of them would read an empty buffer and crash. Until the
+// ops learn to walk strides, they refuse views with a message that says what
+// to do instead. The view ops themselves (transpose_view, reshape_view,
+// contiguous) are the only ones that accept a view, and are exempt.
+static void reject_view(const char* op, const TensorPtr& t) {
+    if (t && t->is_view())
+        throw runtime_error(string(op) + ": was handed a strided view, which "
+            "owns no data of its own. Pass it through contiguous() first, or "
+            "use matmul_bt if the goal is to multiply by a transpose.");
+}
+
+
 
 // Element-wise addition: a + b
 TensorPtr add(TensorPtr a, TensorPtr b) {
+    reject_view("add", a);
+    reject_view("add", b);
     if (a->shape == b->shape){
 
         auto result = make_shared<Tensor>(a->shape);
@@ -37,6 +52,7 @@ TensorPtr add(TensorPtr a, TensorPtr b) {
 
 // Scalar + tensor
 TensorPtr add(float scalar, TensorPtr a) {
+    reject_view("add", a);
     auto result = make_shared<Tensor>(a->shape);
     for (int i = 0; i < a->num_el(); i++)
         result->data[i] = scalar + a->data[i];
@@ -54,6 +70,8 @@ TensorPtr add(float scalar, TensorPtr a) {
 
 // Element-wise multiplication: a * b
 TensorPtr multiply(TensorPtr a, TensorPtr b) {
+    reject_view("multiply", a);
+    reject_view("multiply", b);
 
     if (a->shape == b->shape){
 
@@ -82,6 +100,7 @@ TensorPtr multiply(TensorPtr a, TensorPtr b) {
 
 // Scalar * tensor
 TensorPtr multiply(float scalar, TensorPtr a) {
+    reject_view("multiply", a);
     auto result = make_shared<Tensor>(a->shape);
     for (int i = 0; i < a->num_el(); i++)
         result->data[i] = scalar * a->data[i];
@@ -99,6 +118,8 @@ TensorPtr multiply(float scalar, TensorPtr a) {
 
 // Matrix multiplication: a x b
 TensorPtr matmul(TensorPtr a, TensorPtr b) {
+    reject_view("matmul", a);
+    reject_view("matmul", b);
 
     if (a->shape[1] == b->shape[0]){
 
@@ -136,6 +157,7 @@ TensorPtr matmul(TensorPtr a, TensorPtr b) {
 
 // ReLU activation: max(0, x) for each element
 TensorPtr relu(TensorPtr a) {
+    reject_view("relu", a);
 
     auto result = make_shared<Tensor>(a->shape);
     for (int i = 0; i < a->num_el(); i++){
@@ -155,6 +177,7 @@ TensorPtr relu(TensorPtr a) {
 
 // Sigmoid activation: 1 / (1 + e^-x) for each element
 TensorPtr sigmoid(TensorPtr a) {
+    reject_view("sigmoid", a);
 
     auto result = make_shared<Tensor>(a->shape);
     for (int i = 0; i < a->num_el(); i++){
@@ -176,6 +199,8 @@ TensorPtr sigmoid(TensorPtr a) {
 
 // Element-wise subtraction: a - b
 TensorPtr subtract(TensorPtr a, TensorPtr b) {
+    reject_view("subtract", a);
+    reject_view("subtract", b);
 
     if (a->shape == b->shape){
 
@@ -203,6 +228,7 @@ TensorPtr subtract(TensorPtr a, TensorPtr b) {
 
 // Scalar - tensor  (d/da = -1)
 TensorPtr subtract(float scalar, TensorPtr a) {
+    reject_view("subtract", a);
     auto result = make_shared<Tensor>(a->shape);
     for (int i = 0; i < a->num_el(); i++)
         result->data[i] = scalar - a->data[i];
@@ -220,6 +246,7 @@ TensorPtr subtract(float scalar, TensorPtr a) {
 
 // Tensor - scalar  (d/da = 1)
 TensorPtr subtract(TensorPtr a, float scalar) {
+    reject_view("subtract", a);
     auto result = make_shared<Tensor>(a->shape);
     for (int i = 0; i < a->num_el(); i++)
         result->data[i] = a->data[i] - scalar;
@@ -237,6 +264,8 @@ TensorPtr subtract(TensorPtr a, float scalar) {
 
 // Element-wise division: a / b
 TensorPtr divide(TensorPtr a, TensorPtr b) {
+    reject_view("divide", a);
+    reject_view("divide", b);
     if (a->shape == b->shape){
 
         auto result = make_shared<Tensor>(a->shape);
@@ -273,6 +302,7 @@ TensorPtr divide(TensorPtr a, TensorPtr b) {
 
 // Scalar / tensor  dL/da = -scalar * result.grad / a^2
 TensorPtr divide(float scalar, TensorPtr a) {
+    reject_view("divide", a);
     auto result = make_shared<Tensor>(a->shape);
     for (int i = 0; i < a->num_el(); i++) {
         if (a->data[i] == 0)
@@ -293,6 +323,7 @@ TensorPtr divide(float scalar, TensorPtr a) {
 
 // Tensor / scalar  dL/da = result.grad / scalar
 TensorPtr divide(TensorPtr a, float scalar) {
+    reject_view("divide", a);
     if (scalar == 0)
         throw std::runtime_error("Division by zero");
     auto result = make_shared<Tensor>(a->shape);
@@ -312,6 +343,7 @@ TensorPtr divide(TensorPtr a, float scalar) {
 
 // Tanh activation: (e^x - e^-x) / (e^x + e^-x)
 TensorPtr tanh_op(TensorPtr a) {
+    reject_view("tanh_op", a);
     auto result = make_shared<Tensor>(a->shape);
     for (int i = 0; i < a->num_el(); i++){
         result->data[i] = (exp(a->data[i]) - exp(-a->data[i])) / (exp(a->data[i]) + exp(-a->data[i]));
@@ -332,6 +364,7 @@ TensorPtr tanh_op(TensorPtr a) {
 
 // Softmax: converts logits to probabilities along each row
 TensorPtr softmax(TensorPtr a) {
+    reject_view("softmax", a);
 
     auto result = make_shared<Tensor>(a->shape);
 
@@ -399,6 +432,7 @@ TensorPtr softmax(TensorPtr a) {
 
 // Element-wise natural log
 TensorPtr log_op(TensorPtr a) {
+    reject_view("log_op", a);
     auto result = make_shared<Tensor>(a->shape);
     for (int i = 0; i < a->num_el(); i++){
         if (a->data[i] <= 0)
@@ -419,6 +453,7 @@ TensorPtr log_op(TensorPtr a) {
 
 // Element-wise e^x
 TensorPtr exp_op(TensorPtr a) {
+    reject_view("exp_op", a);
     auto result = make_shared<Tensor>(a->shape);
     for (int i = 0; i < a->num_el(); i++){
         result->data[i] = exp(a->data[i]);
@@ -437,6 +472,7 @@ TensorPtr exp_op(TensorPtr a) {
 
 // Element-wise power: x^p
 TensorPtr pow_op(TensorPtr a, float p) {
+    reject_view("pow_op", a);
     auto result = make_shared<Tensor>(a->shape);
     for (int i = 0; i < a->num_el(); i++){
         result->data[i] = pow(a->data[i], p);
@@ -455,6 +491,7 @@ TensorPtr pow_op(TensorPtr a, float p) {
 
 // Element-wise square root
 TensorPtr sqrt_op(TensorPtr a) {
+    reject_view("sqrt_op", a);
     auto result = make_shared<Tensor>(a->shape);
     for (int i = 0; i < a->num_el(); i++){
         if (a->data[i] < 0)
@@ -476,6 +513,7 @@ TensorPtr sqrt_op(TensorPtr a) {
 
 // Element-wise absolute value
 TensorPtr abs_op(TensorPtr a) {
+    reject_view("abs_op", a);
     auto result = make_shared<Tensor>(a->shape);
     for (int i = 0; i < a->num_el(); i++){
         result->data[i] = abs(a->data[i]);
@@ -497,6 +535,7 @@ TensorPtr abs_op(TensorPtr a) {
 
 // Sum all elements (axis=-1) or along a given axis
 TensorPtr sum(TensorPtr a, int axis) {
+    reject_view("sum", a);
 
     // A 1-D tensor has no shape[1]. Reading it unconditionally was an
     // out-of-bounds vector access: harmless-looking in release builds, where it
@@ -565,6 +604,7 @@ TensorPtr sum(TensorPtr a, int axis) {
 
 // Mean of all elements (axis=-1) or along a given axis
 TensorPtr mean(TensorPtr a, int axis) {
+    reject_view("mean", a);
 
     // A 1-D tensor has no shape[1]. Reading it unconditionally was an
     // out-of-bounds vector access: harmless-looking in release builds, where it
@@ -635,6 +675,7 @@ TensorPtr mean(TensorPtr a, int axis) {
 // maximum; every other element has no influence on the result. Ties go to the
 // first occurrence, matching the forward scan.
 TensorPtr max_op(TensorPtr a) {
+    reject_view("max_op", a);
     auto result = make_shared<Tensor>(vector<int>{1});
     result->data[0] = a->data[0];
     int arg = 0;
@@ -657,6 +698,7 @@ TensorPtr max_op(TensorPtr a) {
 // Min element — returns a scalar tensor
 // Min element — mirror of max_op, gradient reaches only the arg-min.
 TensorPtr min_op(TensorPtr a) {
+    reject_view("min_op", a);
     auto result = make_shared<Tensor>(vector<int>{1});
     result->data[0] = a->data[0];
     int arg = 0;
@@ -678,6 +720,7 @@ TensorPtr min_op(TensorPtr a) {
 
 // Clip — clamp all values between min and max
 TensorPtr clip(TensorPtr a, float min_val, float max_val) {
+    reject_view("clip", a);
     auto result = make_shared<Tensor>(a->shape);
     for (int i = 0; i < a->num_el(); i++){
         if (a->data[i] > max_val){
@@ -706,6 +749,8 @@ TensorPtr clip(TensorPtr a, float min_val, float max_val) {
 // Broadcast add — adds a 1D bias tensor to every row of a 2D tensor
 // e.g. a={32,64} + b={64} -> {32,64}
 TensorPtr broadcast_add(TensorPtr a, TensorPtr b) {
+    reject_view("broadcast_add", a);
+    reject_view("broadcast_add", b);
 
     if (a->shape.size() != 2)
         throw runtime_error("broadcast_add: 'a' must be a 2D tensor, got " + to_string(a->shape.size()) + "D");
@@ -747,6 +792,7 @@ TensorPtr broadcast_add(TensorPtr a, TensorPtr b) {
 
 // Argmax — returns a 1D tensor of class indices, one per row
 TensorPtr argmax(TensorPtr a) {
+    reject_view("argmax", a);
     int rows = a->shape[0];
     int cols = a->shape[1];
     auto result = make_shared<Tensor>(vector<int>{rows});
@@ -769,6 +815,7 @@ TensorPtr argmax(TensorPtr a) {
 // GELU activation — tanh approximation used by GPT-2/3/4.
 // Formula: x * 0.5 * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
 TensorPtr gelu(TensorPtr a) {
+    reject_view("gelu", a);
     auto result = make_shared<Tensor>(a->shape);
     int n = a->num_el();
     constexpr float kSqrt2OverPi = 0.7978845608f;
@@ -800,6 +847,7 @@ TensorPtr gelu(TensorPtr a) {
 
 // reshape_op — gradient-tracking reshape (unlike Tensor::reshape which is in-place).
 TensorPtr reshape_op(TensorPtr a, std::vector<int> new_shape) {
+    reject_view("reshape_op", a);
     auto result = make_shared<Tensor>(new_shape);
     result->data = a->data;
 
@@ -815,6 +863,7 @@ TensorPtr reshape_op(TensorPtr a, std::vector<int> new_shape) {
 }
 
 TensorPtr transpose_op(TensorPtr a) {
+    reject_view("transpose_op", a);
     if (a->shape.size() != 2)
         throw runtime_error("transpose_op: only supported for 2D tensors");
 
@@ -840,6 +889,7 @@ TensorPtr transpose_op(TensorPtr a) {
 }
 
 TensorPtr concat_op(vector<TensorPtr> inputs, int axis) {
+    for (auto& t_ : inputs) reject_view("concat_op", t_);
     if (inputs.empty())
         throw runtime_error("concat_op: no inputs");
 
@@ -907,6 +957,8 @@ TensorPtr concat_op(vector<TensorPtr> inputs, int axis) {
 }
 
 TensorPtr matmul_bt(TensorPtr a, TensorPtr b) {
+    reject_view("matmul_bt", a);
+    reject_view("matmul_bt", b);
     if (a->shape.size() != 2 || b->shape.size() != 2)
         throw runtime_error("matmul_bt: both operands must be 2-D");
 
@@ -963,7 +1015,7 @@ TensorPtr transpose_view(TensorPtr a) {
     v->strides = {in_strides[1], in_strides[0]};
 
     if (a->requires_grad) {
-        auto node = make_node(v, {a});
+        auto node = make_node(v, {a}, true);
         node->backward_fn = [a, v, rows, cols]() {
             // v->grad is row-major over [cols, rows]; a->grad over [rows, cols]
             for (int i = 0; i < rows; i++)
@@ -993,7 +1045,7 @@ TensorPtr reshape_view(TensorPtr a, vector<int> new_shape) {
     v->strides = Tensor::contiguous_strides(new_shape);
 
     if (a->requires_grad) {
-        auto node = make_node(v, {a});
+        auto node = make_node(v, {a}, true);
         node->backward_fn = [a, v]() {
             // element order is unchanged, so this is one to one
             const int n = a->num_el();
@@ -1024,7 +1076,7 @@ TensorPtr contiguous(TensorPtr a) {
     }
 
     if (a->requires_grad) {
-        auto node = make_node(out, {a});
+        auto node = make_node(out, {a}, true);
         node->backward_fn = [a, out, n]() {
             // Both gradients are row-major over the same shape, so this is a
             // straight accumulate. Walking the strides here was the defect in

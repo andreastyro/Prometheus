@@ -12,7 +12,8 @@ public API into raw buffers.
       -> LayerNorm                    [S, E]
       -> logits = x @ tok_emb.weight^T  [S, V]   (weight tying)
 
-Weight tying works because `transpose_op` is differentiable: gradients from the
+Weight tying uses `matmul_bt`, which multiplies by the transpose without
+building it. It is differentiable, so gradients from the
 output projection flow back into the same tensor the embedding lookup reads, so
 `tok_emb.weight` appears exactly once in `parameters()`.
 
@@ -95,7 +96,7 @@ class GPT(Model):
         x = self.ln_f.forward(x)
         out.append(("ln_f", x))
 
-        logits = p.matmul(x, p.transpose_op(self.tok_emb.weight))
+        logits = p.matmul_bt(x, self.tok_emb.weight)
         out.append(("logits", logits))
         return out
 
@@ -115,6 +116,8 @@ class GPT(Model):
 
         # Embedding expects [batch, seq] and returns [batch, seq, embed];
         # reshape_op drops the batch axis while keeping the gradient path.
+        # reshape_view would be free, but a view carries no data of its own
+        # and the blocks below read data directly, so it cannot go here yet.
         ids = p.Tensor([1, S], [float(t) for t in token_ids])
         x = p.reshape_op(self.tok_emb.forward(ids), [S, E])
 
@@ -127,8 +130,8 @@ class GPT(Model):
 
         x = self.ln_f.forward(x)
 
-        # Weight tying: logits = x @ tok_emb.weight^T
-        return p.matmul(x, p.transpose_op(self.tok_emb.weight))
+        # Weight tying: logits = x @ tok_emb.weight^T, transpose never built
+        return p.matmul_bt(x, self.tok_emb.weight)
 
     def parameters(self):
         """All learnable tensors.

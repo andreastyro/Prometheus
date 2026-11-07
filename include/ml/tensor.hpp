@@ -220,7 +220,21 @@ struct NoGrad {
 /// Wire a new result tensor into the computation graph.
 /// Sets requires_grad=true on result, creates a GradNode with the given inputs,
 /// and returns the node so the caller can attach a backward_fn.
-inline std::shared_ptr<GradNode> make_node(TensorPtr result, std::vector<TensorPtr> inputs) {
+inline std::shared_ptr<GradNode> make_node(TensorPtr result, std::vector<TensorPtr> inputs,
+                                           bool accepts_views = false) {
+    // A view owns no `data`, so an op that reads `data` directly reads an
+    // empty buffer and segfaults. Nothing in the library is stride-aware yet,
+    // so every op except the view ops themselves must refuse a view rather
+    // than crash on it. The three that opt in pass accepts_views = true.
+    if (!accepts_views)
+        for (auto& in : inputs)
+            if (in && in->is_view())
+                throw std::runtime_error(
+                    "this op reads memory directly and was handed a strided "
+                    "view, which owns no data; pass it through contiguous() "
+                    "first, or use matmul_bt if the goal is to multiply by a "
+                    "transpose");
+
     auto node = std::make_shared<GradNode>();
     node->inputs = inputs;
 
