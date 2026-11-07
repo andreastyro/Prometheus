@@ -142,40 +142,65 @@ def _isometric_svg(model, theme="default"):
 
 
 def _architecture(model, shapes, theme="default"):
-    """Isometric 3D diagram, with the per-layer shapes listed beneath it."""
-    svg = _isometric_svg(model, theme)
+    """Isometric and flat views of the same model, with a toggle between them.
 
-    if svg is None:
-        return _architecture_flat(model, shapes)
+    Both are rendered into the page and one is hidden, rather than being built
+    on demand: the dashboard is a static file with no server behind it, so
+    there is nothing to ask for the other view later.
+    """
+    iso = _isometric_svg(model, theme)
+    flat = _architecture_flat(model, shapes)
 
-    # drag-to-pan, scoped to this panel so it cannot capture the page
-    pan = ('<div class="iso" id="iso">' + svg + '</div>'
-           '<script>(function(){var e=document.getElementById("iso");'
-           'if(!e)return;var d=0,x=0,l=0;'
-           'e.addEventListener("mousedown",function(v){d=1;x=v.pageX;'
-           'l=e.scrollLeft;e.style.cursor="grabbing";});'
-           'document.addEventListener("mouseup",function(){d=0;'
-           'e.style.cursor="grab";});'
-           'e.addEventListener("mousemove",function(v){if(!d)return;'
-           'v.preventDefault();e.scrollLeft=l-(v.pageX-x);});})();</script>')
+    if iso is None:
+        return flat        # nothing to toggle between
 
-    if not shapes:
-        return pan + ('<p class="hint">Pass x=&lt;a sample batch&gt; for the '
-                      'output shape of each layer.</p>')
+    buttons = (
+        '<div class="toggle">'
+        '<button id="b3d" class="on" onclick="archView(3)">3D isometric</button>'
+        '<button id="b2d" onclick="archView(2)">2D layered</button>'
+        '</div>')
 
-    rows = []
-    for name, layer in model._layers:
-        sh = shapes.get(name)
-        if not sh:
-            continue
-        rows.append(
-            '<tr><td class="n">%s</td><td class="t">%s</td>'
-            '<td class="s">%s</td></tr>'
-            % (_esc(name), _esc(type(layer).__name__),
-               "x".join(str(d) for d in sh)))
-    return pan + ('<table class="shapes"><thead><tr><th>layer</th>'
-                  '<th>type</th><th>output</th></tr></thead>'
-                  '<tbody>%s</tbody></table>' % "".join(rows))
+    views = ('<div class="iso" id="arch3d">%s</div>'
+             '<div id="arch2d" hidden>%s</div>' % (iso, flat))
+
+    script = (
+        '<script>'
+        'function archView(v){'
+        'var a=document.getElementById("arch3d"),'
+        'b=document.getElementById("arch2d"),'
+        'x=document.getElementById("b3d"),y=document.getElementById("b2d");'
+        'var three=(v===3);'
+        'a.hidden=!three;b.hidden=three;'
+        'x.className=three?"on":"";y.className=three?"":"on";}'
+        '(function(){var e=document.getElementById("arch3d");'
+        'if(!e)return;var d=0,px=0,sl=0;'
+        'e.addEventListener("mousedown",function(v){d=1;px=v.pageX;'
+        'sl=e.scrollLeft;e.style.cursor="grabbing";});'
+        'document.addEventListener("mouseup",function(){d=0;'
+        'e.style.cursor="grab";});'
+        'e.addEventListener("mousemove",function(v){if(!d)return;'
+        'v.preventDefault();e.scrollLeft=sl-(v.pageX-px);});})();'
+        '</script>')
+
+    table = ""
+    if shapes:
+        rows = []
+        for name, layer in model._layers:
+            sh = shapes.get(name)
+            if not sh:
+                continue
+            rows.append('<tr><td class="n">%s</td><td class="t">%s</td>'
+                        '<td class="s">%s</td></tr>'
+                        % (_esc(name), _esc(type(layer).__name__),
+                           "x".join(str(d) for d in sh)))
+        table = ('<table class="shapes"><thead><tr><th>layer</th><th>type</th>'
+                 '<th>output</th></tr></thead><tbody>%s</tbody></table>'
+                 % "".join(rows))
+    else:
+        table = ('<p class="hint">Pass x=&lt;a sample batch&gt; for the output '
+                 'shape of each layer.</p>')
+
+    return buttons + views + script + table
 
 
 def _architecture_flat(model, shapes):
@@ -669,8 +694,17 @@ a:hover{opacity:0.75}
 .hint{font-size:12px;color:%(dim)s;padding:14px 0}
 .body{overflow-x:auto}
 footer{color:%(dim)s;font-size:11px;margin-top:8px;text-align:center}
+.toggle{display:flex;gap:6px;margin-bottom:12px}
+.toggle button{background:transparent;color:%(dim)s;border:1px solid %(edge)s;
+border-radius:5px;padding:5px 11px;font-size:10px;cursor:pointer;
+font-family:inherit;letter-spacing:0.5px;text-transform:uppercase;
+transition:all 0.12s}
+.toggle button:hover{color:%(text)s;border-color:%(dim)s}
+.toggle button.on{background:%(accent)s;border-color:%(accent)s;color:#0b0f14;
+font-weight:600}
 .iso{overflow-x:auto;cursor:grab;user-select:none;padding:6px 0 14px;
 border-bottom:1px solid %(edge)s;margin-bottom:14px}
+#arch2d{padding:6px 0 14px;border-bottom:1px solid %(edge)s;margin-bottom:14px}
 .iso svg{display:block}
 table.shapes{border-collapse:collapse;font-size:11px;width:100%%}
 table.shapes th{text-align:left;color:%(dim)s;font-weight:600;
@@ -697,8 +731,8 @@ def build_dashboard(model, x=None, history=None, real=None, labels=None,
             shapes[name] = _shape_of(t)
 
     parts = [_panel("Architecture", _architecture(model, shapes, theme),
-                    "isometric diagram, drag to pan; block size scales with "
-                    "parameter count and colour with layer type")]
+                    "switch views; the isometric blocks scale with parameter "
+                    "count and are coloured by layer type, drag to pan")]
     parts.append(_panel("Parameters", _parameters(model),
                         "%s total across %d layers"
                         % (_fmt(model.num_parameters()), len(model._layers))))

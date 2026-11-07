@@ -264,10 +264,40 @@ def test_large_model_size_is_bounded():
     check("still has its panels", len(panels(html)) >= 5)
 
 
+def test_architecture_toggle():
+    print("\n=== 3D / 2D toggle ===")
+    m = CNN(1, 4, (8,), image_size=8)
+    html = build_dashboard(m, x=tensor([2, 1, 8, 8]))
+
+    check("two toggle buttons", html.count("<button") == 2)
+    check("3D view container present", 'id="arch3d"' in html)
+    check("2D view container present", 'id="arch2d"' in html)
+    check("2D starts hidden", 'id="arch2d" hidden' in html)
+    check("3D starts active", 'id="b3d" class="on"' in html)
+    check("switcher is defined", "function archView" in html)
+
+    # both views must actually be in the page: it is a static file, so there is
+    # nothing to fetch the other one from later
+    iso = html[html.index('id="arch3d"'):html.index('id="arch2d"')]
+    flat = html[html.index('id="arch2d"'):]
+    check("3D view holds the isometric blocks", iso.count("<polygon") > 5,
+          "%d polygons" % iso.count("<polygon"))
+    check("2D view holds the layered graph", "<svg" in flat[:4000])
+
+    # every layer should be named in both
+    missing_3d = [n for n in m.layer_names if n not in iso]
+    check("3D names every layer", not missing_3d, str(missing_3d))
+
+    # a model the isometric renderer cannot handle still gets one usable view
+    html2 = build_dashboard(MLP(4, 2, (8,)))
+    check("still renders without a sample", "Architecture" in html2)
+
+
 def main():
     print("Model dashboard")
     test_self_contained()
     test_shared_panels()
+    test_architecture_toggle()
     test_graceful_without_input()
     test_gradient_norms()
     test_model_specific_panels()
