@@ -89,7 +89,17 @@ GPT::GPT(int vocab_size, int max_seq_len, int embed_dim,
 }
 
 TensorPtr GPT::forward(TensorPtr token_ids) {
-    int S = token_ids->num_el();
+    return forward(token_ids, 1);
+}
+
+TensorPtr GPT::forward(TensorPtr token_ids, int batch) {
+    int total = token_ids->num_el();
+    if (batch <= 0 || total % batch != 0)
+        throw runtime_error("GPT::forward: token count " + to_string(total)
+                            + " is not divisible by batch " + to_string(batch));
+
+    const int B = batch;
+    const int S = total / B;
     int E = embed_dim_;
     int V = vocab_size_;
 
@@ -98,16 +108,19 @@ TensorPtr GPT::forward(TensorPtr token_ids) {
                             + " exceeds max_seq_len " + to_string(max_seq_len_));
 
     // ── Input embedding (fused tok + pos, with gradient tracking) ────────────
-    // Out[t, d] = tok_emb.weight[tok_id, d] + pos_emb.weight[t, d]
-    auto x = make_shared<Tensor>(vector<int>{S, E});
-    vector<int> tok_ids(S);
-    for (int t = 0; t < S; t++) {
-        tok_ids[t] = (int)token_ids->data[t];
-        int tid     = tok_ids[t];
+    // Out[b, t, d] = tok_emb.weight[tok_id, d] + pos_emb.weight[t, d]
+    // Position restarts at every sequence, so pos_emb is indexed by t, not by
+    // the folded row.
+    auto x = make_shared<Tensor>(vector<int>{B * S, E});
+    vector<int> tok_ids(B * S);
+    for (int r = 0; r < B * S; r++) {
+        const int t = r % S;
+        tok_ids[r] = (int)token_ids->data[r];
+        int tid    = tok_ids[r];
         if (tid < 0 || tid >= V)
             throw runtime_error("GPT: token id " + to_string(tid) + " out of range");
         for (int d = 0; d < E; d++)
-            x->data[t*E + d] = tok_emb.weight->data[tid*E + d]
+            x->data[r*E + d] = tok_emb.weight->data[tid*E + d]
                               + pos_emb.weight->data[t  *E + d];
     }
 
@@ -116,12 +129,13 @@ TensorPtr GPT::forward(TensorPtr token_ids) {
         auto pw = pos_emb.weight;
         auto node = make_node(x, {tw, pw});
         node->backward_fn = [tw, pw, x, tok_ids, S, E]() {
-            for (int t = 0; t < S; t++) {
-                int tid = tok_ids[t];
+            for (int r = 0; r < (int)tok_ids.size(); r++) {
+                const int t   = r % S;          // position inside its sequence
+                const int tid = tok_ids[r];
                 for (int d = 0; d < E; d++) {
-                    float g = x->grad[t*E + d];
+                    float g = x->grad[r*E + d];
                     tw->grad[tid*E + d] += g;
-                    pw->grad[t  *E + d] += g;
+                    pw->grad[t  *E + d] += g;   // accumulates across the batch
                 }
             }
         };
@@ -129,7 +143,7 @@ TensorPtr GPT::forward(TensorPtr token_ids) {
 
     // ── Transformer blocks ────────────────────────────────────────────────────
     for (auto& blk : blocks)
-        x = blk.forward(x);
+        x = blk.forward(x, B);
 
     // ── Final LayerNorm ───────────────────────────────────────────────────────
     x = ln_f.forward(x);
@@ -138,7 +152,8 @@ TensorPtr GPT::forward(TensorPtr token_ids) {
     // logits[t, v] = Σ_d x[t, d] * tok_emb.weight[v, d]
     //              = x @ tok_emb.weight^T,   tok_emb.weight [V, E]
     // Implemented as: logits = x @ W_T  where W_T = tok_emb.weight^T [E, V]
-    auto logits = make_shared<Tensor>(vector<int>{S, V});
+    const int rows = B * S;
+    auto logits = make_shared<Tensor>(vector<int>{rows, V});
 
     auto tw = tok_emb.weight;
     vector<float> W_T(E * V);
@@ -146,24 +161,24 @@ TensorPtr GPT::forward(TensorPtr token_ids) {
         for (int d = 0; d < E; d++)
             W_T[d*V + v] = tw->data[v*E + d];
 
-    matmul_forward(S, V, E, x->data.data(), W_T.data(), logits->data.data());
+    matmul_forward(rows, V, E, x->data.data(), W_T.data(), logits->data.data());
 
     // Register backward for the weight-tied projection
     {
         auto node = make_node(logits, {x, tw});
-        node->backward_fn = [x, tw, logits, W_T, S, E, V]() {
+        node->backward_fn = [x, tw, logits, W_T, rows, E, V]() {
             const float* gl = logits->grad.data();
 
             // grad_x += grad_logits @ W    (W_T [E,V] used as b in backward_a)
             if (x->requires_grad)
-                matmul_backward_a(S, E, V, gl, W_T.data(), x->grad.data());
+                matmul_backward_a(rows, E, V, gl, W_T.data(), x->grad.data());
 
             // grad_W[v,d] += Σ_t grad_logits[t,v] * x[t,d]
             //   = (grad_logits^T @ x)^T
             // Computed via backward_b into W_T_grad [E,V] then transposed into tw->grad
             if (tw->requires_grad) {
                 vector<float> W_T_grad(E * V, 0.0f);
-                matmul_backward_b(S, E, V, gl, x->data.data(), W_T_grad.data());
+                matmul_backward_b(rows, E, V, gl, x->data.data(), W_T_grad.data());
                 for (int v = 0; v < V; v++)
                     for (int d = 0; d < E; d++)
                         tw->grad[v*E + d] += W_T_grad[d*V + v];

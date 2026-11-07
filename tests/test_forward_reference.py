@@ -622,6 +622,83 @@ def test_batchnorm_modes():
           out, g * (one - rm) / np.sqrt(rv + 1e-5) + b, atol=1e-4)
 
 
+def test_batching():
+    print("\n=== batching ===\n")
+    # The decisive property: a batch must give exactly what the sequences give
+    # one at a time. Attention is the only layer that must not see across a
+    # sequence boundary, so a mistake there shows up here and nowhere else.
+    p.Tensor.manual_seed(7)
+    E, H, S, B = 8, 2, 5, 4
+
+    for causal in (False, True):
+        for rope in (False, True):
+            mha = p.MultiHeadAttention(E, H, causal, rope)
+            seqs = [[0.1 * ((i * 7 + b * 3) % 11 - 5) for i in range(S * E)]
+                    for b in range(B)]
+
+            alone = []
+            for row in seqs:
+                alone += list(mha.forward(tensor([S, E], row)).data)
+
+            flat = [v for row in seqs for v in row]
+            together = list(mha.forward(tensor([B * S, E], flat), B).data)
+
+            check("attention causal=%s rope=%s: batched == per-sequence"
+                  % (causal, rope),
+                  np.array(together), np.array(alone), atol=1e-6)
+
+    # and the same for the whole model, which also exercises the position
+    # embedding restarting at each sequence
+    V, L = 50, 2
+    for rope in (False, True):
+        gpt = p.GPT(V, S + 1, E, H, L, 0, rope)
+        ids = [[(i * 7 + b * 3) % V for i in range(S)] for b in range(B)]
+
+        alone = []
+        for row in ids:
+            alone += list(gpt.forward(tensor([S], row)).data)
+        flat = [t for row in ids for t in row]
+        together = list(gpt.forward(tensor([B * S], flat), B).data)
+
+        check("GPT rope=%s: batched logits == per-sequence" % rope,
+              np.array(together), np.array(alone), atol=1e-4)
+
+    # gradients: the batched loss averages over B*S positions where the loop
+    # averages over S each, so the batched gradient is the per-sequence sum
+    # divided by B
+    gpt = p.GPT(V, S + 1, E, H, L)
+    ids = [[(i * 5 + b) % V for i in range(S)] for b in range(B)]
+    tgts = [[(i * 5 + b + 1) % V for i in range(S)] for b in range(B)]
+
+    for t in gpt.parameters():
+        t.reset_grad()
+    for row, tg in zip(ids, tgts):
+        p.cross_entropy_sparse_seq(gpt.forward(tensor([S], row)), tg).backward()
+    alone = [list(t.grad) for t in gpt.parameters()]
+
+    for t in gpt.parameters():
+        t.reset_grad()
+    flat = [x for row in ids for x in row]
+    tflat = [x for tg in tgts for x in tg]
+    p.cross_entropy_sparse_seq(gpt.forward(tensor([B * S], flat), B),
+                               tflat).backward()
+    together = [list(t.grad) for t in gpt.parameters()]
+
+    worst = max(abs(a / B - b)
+                for A, Bg in zip(alone, together) for a, b in zip(A, Bg))
+    check("GPT batched gradients == per-sequence sum / B",
+          np.array([worst]), np.array([0.0]), atol=1e-6)
+
+    # a batch that does not divide the token count must be refused
+    threw = False
+    try:
+        gpt.forward(tensor([S * 3], [1.0] * (S * 3)), 2)
+    except Exception:
+        threw = True
+    check("an indivisible batch raises", np.array([1.0 if threw else 0.0]),
+          np.array([1.0]), atol=0)
+
+
 def main():
     print("Forward-pass verification against numpy reference implementations")
     test_ops()
@@ -634,6 +711,7 @@ def main():
     test_lstm_gru()
     test_losses()
     test_attention()
+    test_batching()
     test_optimizers()
     test_rmsprop_and_clip()
     test_metrics()

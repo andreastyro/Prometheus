@@ -349,7 +349,15 @@ PYBIND11_MODULE(prometheus, m) {
         .def(py::init<int, int, bool, bool>(),
              py::arg("embed_dim"), py::arg("num_heads"),
              py::arg("causal") = false, py::arg("rope") = false)
-        .def("forward",    &MultiHeadAttention::forward)
+        .def("forward",
+             static_cast<TensorPtr (MultiHeadAttention::*)(TensorPtr)>(
+                 &MultiHeadAttention::forward))
+        .def("forward",
+             static_cast<TensorPtr (MultiHeadAttention::*)(TensorPtr, int)>(
+                 &MultiHeadAttention::forward),
+             py::arg("input"), py::arg("batch"),
+             "Batched forward. input is [batch * seq, embed]; the batch is "
+             "folded into the row dimension.")
         .def("parameters", &MultiHeadAttention::parameters)
         .def_readonly("W_q", &MultiHeadAttention::W_q)
         .def_readonly("W_k", &MultiHeadAttention::W_k)
@@ -360,7 +368,13 @@ PYBIND11_MODULE(prometheus, m) {
         .def(py::init<int, int, int, bool, bool>(),
              py::arg("embed_dim"), py::arg("num_heads"), py::arg("ff_dim"),
              py::arg("causal") = false, py::arg("rope") = false)
-        .def("forward",    &TransformerBlock::forward)
+        .def("forward",
+             static_cast<TensorPtr (TransformerBlock::*)(TensorPtr)>(
+                 &TransformerBlock::forward))
+        .def("forward",
+             static_cast<TensorPtr (TransformerBlock::*)(TensorPtr, int)>(
+                 &TransformerBlock::forward),
+             py::arg("input"), py::arg("batch"))
         .def("parameters", &TransformerBlock::parameters)
         .def_readonly("attn",  &TransformerBlock::attn)
         .def_readonly("norm1", &TransformerBlock::norm1)
@@ -377,7 +391,13 @@ PYBIND11_MODULE(prometheus, m) {
              py::arg("vocab_size"), py::arg("max_seq_len"), py::arg("embed_dim"),
              py::arg("num_heads"), py::arg("num_layers"),
              py::arg("ff_dim") = 0, py::arg("rope") = false)
-        .def("forward",         &GPT::forward)
+        .def("forward",
+             static_cast<TensorPtr (GPT::*)(TensorPtr)>(&GPT::forward))
+        .def("forward",
+             static_cast<TensorPtr (GPT::*)(TensorPtr, int)>(&GPT::forward),
+             py::arg("token_ids"), py::arg("batch"),
+             "Batched forward. token_ids holds batch*seq ids; the result is "
+             "[batch*seq, vocab_size].")
         .def("forward_cached",  &GPT::forward_cached,
              py::arg("token_id"), py::arg("cache"))
         .def("make_kv_cache",   &GPT::make_kv_cache)

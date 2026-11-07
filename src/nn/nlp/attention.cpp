@@ -4,12 +4,13 @@
 #include <cmath>
 #include <algorithm>
 #include <stdexcept>
+#include <string>   // to_string; MSVC does not get it transitively
 
 using namespace std;
 
 // RoPE: rotate each consecutive pair of dims by angle pos * θ_i,  θ_i = 10000^(-2i/D).
 // v is [S, D], modified in-place. pos_offset shifts all position indices (for KV cache).
-static void apply_rope(vector<float>& v, int S, int D, int pos_offset) {
+static void apply_rope_at(float* v, int S, int D, int pos_offset) {
     for (int t = 0; t < S; t++) {
         for (int i = 0; i < D / 2; i++) {
             float theta = powf(10000.0f, -2.0f * i / D);
@@ -23,7 +24,7 @@ static void apply_rope(vector<float>& v, int S, int D, int pos_offset) {
 }
 
 // Backward through RoPE: applies the transpose (= inverse) rotation R(-θ) to the gradient.
-static void apply_rope_backward(vector<float>& grad, int S, int D, int pos_offset) {
+static void apply_rope_backward_at(float* grad, int S, int D, int pos_offset) {
     for (int t = 0; t < S; t++) {
         for (int i = 0; i < D / 2; i++) {
             float theta = powf(10000.0f, -2.0f * i / D);
@@ -34,6 +35,13 @@ static void apply_rope_backward(vector<float>& grad, int S, int D, int pos_offse
             grad[t*D + 2*i + 1] = -g0*s + g1*c;
         }
     }
+}
+
+static inline void apply_rope(vector<float>& v, int S, int D, int off) {
+    apply_rope_at(v.data(), S, D, off);
+}
+static inline void apply_rope_backward(vector<float>& g, int S, int D, int off) {
+    apply_rope_backward_at(g.data(), S, D, off);
 }
 
 MultiHeadAttention::MultiHeadAttention(int embed_dim, int num_heads, bool causal, bool rope)
@@ -56,7 +64,16 @@ MultiHeadAttention::MultiHeadAttention(int embed_dim, int num_heads, bool causal
 // the backward, and attaches a single GradNode that implements the full
 // attention gradient in one lambda.
 TensorPtr MultiHeadAttention::forward(TensorPtr input) {
-    int S = input->shape[0];
+    return forward(input, 1);
+}
+
+TensorPtr MultiHeadAttention::forward(TensorPtr input, int batch) {
+    int rows = input->shape[0];
+    if (batch <= 0 || rows % batch != 0)
+        throw runtime_error("MultiHeadAttention: row count " + to_string(rows) +
+                            " is not divisible by batch " + to_string(batch));
+    int B = batch;
+    int S = rows / B;
     int E = embed_dim;
     int H = num_heads;
     int D = head_dim;
@@ -64,74 +81,85 @@ TensorPtr MultiHeadAttention::forward(TensorPtr input) {
 
     // ── Forward ──────────────────────────────────────────────────────────────
     // Q = input @ W_q,  K = input @ W_k,  V = input @ W_v   each [S, E]
-    vector<float> Q_all(S * E), K_all(S * E), V_all(S * E);
-    matmul_forward(S, E, E, input->data.data(), W_q->data.data(), Q_all.data());
-    matmul_forward(S, E, E, input->data.data(), W_k->data.data(), K_all.data());
-    matmul_forward(S, E, E, input->data.data(), W_v->data.data(), V_all.data());
+    vector<float> Q_all(rows * E), K_all(rows * E), V_all(rows * E);
+    matmul_forward(rows, E, E, input->data.data(), W_q->data.data(), Q_all.data());
+    matmul_forward(rows, E, E, input->data.data(), W_k->data.data(), K_all.data());
+    matmul_forward(rows, E, E, input->data.data(), W_v->data.data(), V_all.data());
 
     // Per-head slices and softmax weights saved for backward
-    vector<vector<float>> Q_heads(H, vector<float>(S * D));
-    vector<vector<float>> K_heads(H, vector<float>(S * D));
-    vector<vector<float>> V_heads(H, vector<float>(S * D));
-    vector<vector<float>> A_heads(H, vector<float>(S * S));
+    vector<vector<float>> Q_heads(H, vector<float>(rows * D));
+    vector<vector<float>> K_heads(H, vector<float>(rows * D));
+    vector<vector<float>> V_heads(H, vector<float>(rows * D));
+    // one [S, S] attention matrix per head per sequence
+    vector<vector<float>> A_heads(H, vector<float>(B * S * S));
 
-    vector<float> concat_all(S * E, 0.0f);
+    vector<float> concat_all(rows * E, 0.0f);
 
     for (int h = 0; h < H; h++) {
         int start = h * D;
 
-        // Slice Q_h, K_h, V_h  [S, D]
-        for (int t = 0; t < S; t++)
+        // Slice Q_h, K_h, V_h for every row  [rows, D]
+        for (int t = 0; t < rows; t++)
             for (int d = 0; d < D; d++) {
                 Q_heads[h][t*D + d] = Q_all[t*E + start + d];
                 K_heads[h][t*D + d] = K_all[t*E + start + d];
                 V_heads[h][t*D + d] = V_all[t*E + start + d];
             }
 
-        if (rope_) {
-            apply_rope(Q_heads[h], S, D, 0);
-            apply_rope(K_heads[h], S, D, 0);
-        }
-
-        // scores = Q_h @ K_h^T  [S, S] — transpose K_h into [D, S] for matmul
-        vector<float> K_h_T(D * S);
-        for (int t = 0; t < S; t++)
-            for (int d = 0; d < D; d++)
-                K_h_T[d*S + t] = K_heads[h][t*D + d];
-
-        vector<float> scores(S * S, 0.0f);
-        matmul_forward(S, S, D, Q_heads[h].data(), K_h_T.data(), scores.data());
-        for (float& v : scores) v *= attn_scale;
-
-        // Causal mask: future positions get ~0 weight after softmax
-        if (causal_)
-            for (int i = 0; i < S; i++)
-                for (int j = i + 1; j < S; j++)
-                    scores[i*S + j] = -1e9f;
-
-        // Row-wise softmax → A_h [S, S]
-        for (int i = 0; i < S; i++) {
-            float max_v = *max_element(scores.data() + i*S, scores.data() + (i+1)*S);
-            float sum = 0.0f;
-            for (int j = 0; j < S; j++) {
-                A_heads[h][i*S + j] = expf(scores[i*S + j] - max_v);
-                sum += A_heads[h][i*S + j];
+        // RoPE positions restart at every sequence, so rotate each slice
+        // separately rather than letting position run across the batch.
+        if (rope_)
+            for (int b = 0; b < B; b++) {
+                apply_rope_at(Q_heads[h].data() + b*S*D, S, D, 0);
+                apply_rope_at(K_heads[h].data() + b*S*D, S, D, 0);
             }
-            for (int j = 0; j < S; j++) A_heads[h][i*S + j] /= sum;
+
+        for (int b = 0; b < B; b++) {
+            const float* Q_b = Q_heads[h].data() + b*S*D;
+            const float* K_b = K_heads[h].data() + b*S*D;
+            const float* V_b = V_heads[h].data() + b*S*D;
+            float* A_b = A_heads[h].data() + b*S*S;
+
+            // scores = Q_b @ K_b^T  [S, S] — transpose K_b into [D, S]
+            vector<float> K_b_T(D * S);
+            for (int t = 0; t < S; t++)
+                for (int d = 0; d < D; d++)
+                    K_b_T[d*S + t] = K_b[t*D + d];
+
+            vector<float> scores(S * S, 0.0f);
+            matmul_forward(S, S, D, Q_b, K_b_T.data(), scores.data());
+            for (float& v : scores) v *= attn_scale;
+
+            // Causal mask: future positions get ~0 weight after softmax
+            if (causal_)
+                for (int i = 0; i < S; i++)
+                    for (int j = i + 1; j < S; j++)
+                        scores[i*S + j] = -1e9f;
+
+            // Row-wise softmax → A_b [S, S]
+            for (int i = 0; i < S; i++) {
+                float max_v = *max_element(scores.data() + i*S, scores.data() + (i+1)*S);
+                float sum = 0.0f;
+                for (int j = 0; j < S; j++) {
+                    A_b[i*S + j] = expf(scores[i*S + j] - max_v);
+                    sum += A_b[i*S + j];
+                }
+                for (int j = 0; j < S; j++) A_b[i*S + j] /= sum;
+            }
+
+            // O_b = A_b @ V_b  [S, D]
+            vector<float> O_b(S * D, 0.0f);
+            matmul_forward(S, D, S, A_b, V_b, O_b.data());
+
+            for (int t = 0; t < S; t++)
+                for (int d = 0; d < D; d++)
+                    concat_all[(b*S + t)*E + start + d] = O_b[t*D + d];
         }
-
-        // O_h = A_h @ V_h  [S, D]
-        vector<float> O_h(S * D, 0.0f);
-        matmul_forward(S, D, S, A_heads[h].data(), V_heads[h].data(), O_h.data());
-
-        for (int t = 0; t < S; t++)
-            for (int d = 0; d < D; d++)
-                concat_all[t*E + start + d] = O_h[t*D + d];
     }
 
     // output = concat @ W_o  [S, E]
-    auto result = make_shared<Tensor>(vector<int>{S, E});
-    matmul_forward(S, E, E, concat_all.data(), W_o->data.data(), result->data.data());
+    auto result = make_shared<Tensor>(vector<int>{rows, E});
+    matmul_forward(rows, E, E, concat_all.data(), W_o->data.data(), result->data.data());
 
     // ── Backward ─────────────────────────────────────────────────────────────
     bool need_grad = input->requires_grad || W_q->requires_grad ||
@@ -147,7 +175,7 @@ TensorPtr MultiHeadAttention::forward(TensorPtr input) {
         node->backward_fn = [
             input, W_q=W_q, W_k=W_k, W_v=W_v, W_o=W_o, result,
             concat_all, Q_heads, K_heads, V_heads, A_heads,
-            S, E, H, D, attn_scale, rope
+            rows, B, S, E, H, D, attn_scale, rope
         ]() {
             const float* grad_out = result->grad.data();
 
@@ -155,29 +183,30 @@ TensorPtr MultiHeadAttention::forward(TensorPtr input) {
             // output = concat @ W_o:
             //   grad_concat = grad_out @ W_o^T
             //   grad_W_o   += concat^T @ grad_out
-            vector<float> grad_concat(S * E, 0.0f);
-            matmul_backward_a(S, E, E, grad_out, W_o->data.data(), grad_concat.data());
+            vector<float> grad_concat(rows * E, 0.0f);
+            matmul_backward_a(rows, E, E, grad_out, W_o->data.data(), grad_concat.data());
             if (W_o->requires_grad)
-                matmul_backward_b(S, E, E, grad_out, concat_all.data(), W_o->grad.data());
+                matmul_backward_b(rows, E, E, grad_out, concat_all.data(), W_o->grad.data());
 
-            // Full gradient accumulators for the Q, K, V projections  [S, E]
-            vector<float> grad_Q(S * E, 0.0f);
-            vector<float> grad_K(S * E, 0.0f);
-            vector<float> grad_V(S * E, 0.0f);
+            // Full gradient accumulators for the Q, K, V projections  [rows, E]
+            vector<float> grad_Q(rows * E, 0.0f);
+            vector<float> grad_K(rows * E, 0.0f);
+            vector<float> grad_V(rows * E, 0.0f);
 
             // ── Per-head backward ─────────────────────────────────────────
             for (int h = 0; h < H; h++) {
                 int start = h * D;
-                const float* A_h = A_heads[h].data();
-                const float* Q_h = Q_heads[h].data();
-                const float* K_h = K_heads[h].data();
-                const float* V_h = V_heads[h].data();
+              for (int b = 0; b < B; b++) {
+                const float* A_h = A_heads[h].data() + b*S*S;
+                const float* Q_h = Q_heads[h].data() + b*S*D;
+                const float* K_h = K_heads[h].data() + b*S*D;
+                const float* V_h = V_heads[h].data() + b*S*D;
 
                 // Gather grad_O_h from grad_concat  [S, D]
                 vector<float> grad_O_h(S * D);
                 for (int t = 0; t < S; t++)
                     for (int d = 0; d < D; d++)
-                        grad_O_h[t*D + d] = grad_concat[t*E + start + d];
+                        grad_O_h[t*D + d] = grad_concat[(b*S + t)*E + start + d];
 
                 // O_h = A_h @ V_h:
                 //   grad_A_h [S,S] += grad_O_h [S,D] @ V_h^T [D,S]
@@ -219,17 +248,18 @@ TensorPtr MultiHeadAttention::forward(TensorPtr input) {
                 // grad_Q_h/grad_K_h are in the rotated space — apply inverse rotation
                 // to bring them back into the original (pre-rotation) Q/K space.
                 if (rope) {
-                    apply_rope_backward(grad_Q_h, S, D, 0);
-                    apply_rope_backward(grad_K_h, S, D, 0);
+                    apply_rope_backward_at(grad_Q_h.data(), S, D, 0);
+                    apply_rope_backward_at(grad_K_h.data(), S, D, 0);
                 }
 
-                // Scatter head gradients into full [S, E] accumulators
+                // Scatter head gradients into the full [rows, E] accumulators
                 for (int t = 0; t < S; t++)
                     for (int d = 0; d < D; d++) {
-                        grad_Q[t*E + start + d] += grad_Q_h[t*D + d];
-                        grad_K[t*E + start + d] += grad_K_h[t*D + d];
-                        grad_V[t*E + start + d] += grad_V_h[t*D + d];
+                        grad_Q[(b*S + t)*E + start + d] += grad_Q_h[t*D + d];
+                        grad_K[(b*S + t)*E + start + d] += grad_K_h[t*D + d];
+                        grad_V[(b*S + t)*E + start + d] += grad_V_h[t*D + d];
                     }
+              }
             }
 
             // ── Input projection backward ─────────────────────────────────
@@ -237,16 +267,16 @@ TensorPtr MultiHeadAttention::forward(TensorPtr input) {
             //   grad_W_q   += input^T @ grad_Q
             //   grad_input += grad_Q @ W_q^T   (and similarly for K, V)
             if (W_q->requires_grad)
-                matmul_backward_b(S, E, E, grad_Q.data(), input->data.data(), W_q->grad.data());
+                matmul_backward_b(rows, E, E, grad_Q.data(), input->data.data(), W_q->grad.data());
             if (W_k->requires_grad)
-                matmul_backward_b(S, E, E, grad_K.data(), input->data.data(), W_k->grad.data());
+                matmul_backward_b(rows, E, E, grad_K.data(), input->data.data(), W_k->grad.data());
             if (W_v->requires_grad)
-                matmul_backward_b(S, E, E, grad_V.data(), input->data.data(), W_v->grad.data());
+                matmul_backward_b(rows, E, E, grad_V.data(), input->data.data(), W_v->grad.data());
 
             if (input->requires_grad) {
-                matmul_backward_a(S, E, E, grad_Q.data(), W_q->data.data(), input->grad.data());
-                matmul_backward_a(S, E, E, grad_K.data(), W_k->data.data(), input->grad.data());
-                matmul_backward_a(S, E, E, grad_V.data(), W_v->data.data(), input->grad.data());
+                matmul_backward_a(rows, E, E, grad_Q.data(), W_q->data.data(), input->grad.data());
+                matmul_backward_a(rows, E, E, grad_K.data(), W_k->data.data(), input->grad.data());
+                matmul_backward_a(rows, E, E, grad_V.data(), W_v->data.data(), input->grad.data());
             }
         };
     }

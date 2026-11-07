@@ -1,5 +1,6 @@
 #include "ml/utils/summary.hpp"
 #include <stdio.h>
+#include <string>   // to_string; MSVC does not get it transitively
 
 using namespace std;
 

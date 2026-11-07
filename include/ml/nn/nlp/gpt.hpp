@@ -65,6 +65,18 @@ public:
     // Full-sequence training forward. Returns [seq_len, vocab_size] logits.
     TensorPtr forward(TensorPtr token_ids) override;
 
+    /// Batched forward.
+    ///
+    /// token_ids is [batch, seq] (or [batch * seq] with batch given), and the
+    /// result is [batch * seq, vocab_size] -- the batch folded into the row
+    /// dimension, which is the layout cross_entropy_sparse_seq already takes.
+    ///
+    /// Batching is what makes the matmuls large enough to be worth splitting
+    /// across cores: a single sequence at width 384 gives 384x384 products,
+    /// too small to parallelise, while a batch of 32 gives the same weights
+    /// 32x the rows of work per call.
+    TensorPtr forward(TensorPtr token_ids, int batch);
+
     // Incremental inference forward — processes one token, updates cache.
     // Returns [vocab_size] logits for the new position.
     // Call GPT::make_kv_cache() to initialise a fresh cache before generation.

@@ -48,6 +48,18 @@ public:
     // Compute multi-head self-attention over the input sequence
     TensorPtr forward(TensorPtr input) override;
 
+    /// Batched forward.
+    ///
+    /// input is [batch * seq, embed] -- the batch folded into the row
+    /// dimension. Everything in a transformer except attention itself is
+    /// per-token, so folding keeps every projection a plain 2-D matmul and
+    /// confines the batch to the one place that genuinely needs it: scores,
+    /// softmax and the causal mask, which must not see across a sequence
+    /// boundary.
+    ///
+    /// batch must divide the row count. forward(input) is forward(input, 1).
+    TensorPtr forward(TensorPtr input, int batch);
+
     // Returns {W_q, W_k, W_v, W_o}
     std::vector<TensorPtr> parameters() override;
 };
