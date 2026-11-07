@@ -70,7 +70,14 @@ PYBIND11_MODULE(prometheus, m) {
         .def_readwrite("data",          &Tensor::data)
         .def_readwrite("shape",         &Tensor::shape)
         .def_readwrite("grad",          &Tensor::grad)
-        .def_readwrite("requires_grad", &Tensor::requires_grad)
+        .def_property("requires_grad",
+                      [](Tensor &t) { return t.requires_grad; },
+                      [](Tensor &t, bool v) {
+                          t.requires_grad = v;
+                          // the buffer is allocated lazily, so a tensor the
+                          // user marks by hand needs one before any op writes
+                          if (v) t.ensure_grad();
+                      })
         .def("get",       &Tensor::get)
         .def("set",       &Tensor::set)
         .def("fill",      &Tensor::fill)

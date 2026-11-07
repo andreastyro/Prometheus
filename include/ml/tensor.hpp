@@ -27,10 +27,15 @@ public:
     std::shared_ptr<GradNode> grad_fn = nullptr;
 
     /// Create a tensor from existing data.
+    ///
+    /// `grad` is deliberately left empty. Both constructors used to size it
+    /// alongside `data`, which doubled the memory of every tensor in the
+    /// program -- including constants, inputs and the intermediate activations
+    /// of an inference pass, none of which ever receive a gradient. It is
+    /// allocated on first need instead, by ensure_grad().
     Tensor(std::vector<int> shape_, std::vector<float> data_) {
         shape = shape_;
         data  = data_;
-        grad.resize(data.size(), 0.0f);
     }
 
     /// Create a zero-filled tensor with the given shape.
@@ -40,7 +45,6 @@ public:
         for (int i : shape)
             total *= i;
         data.resize(total, 0.0f);
-        grad.resize(total, 0.0f);
     }
 
     /// Total number of elements — product of all dimension sizes.
@@ -87,6 +91,21 @@ public:
     void reset_grad() {
         grad.assign(data.size(), 0.0f);
     }
+
+    /// Allocate the gradient buffer if it has not been allocated yet.
+    ///
+    /// Every backward_fn writes with `grad[i] +=`, so the buffer has to exist
+    /// and be zeroed before the first write. make_node() calls this on each
+    /// input, which covers everything that takes part in a graph; anything
+    /// else never needs one.
+    void ensure_grad() {
+        if (grad.size() != data.size())
+            grad.assign(data.size(), 0.0f);
+    }
+
+    /// True once a gradient buffer exists. Useful for asserting that a tensor
+    /// actually took part in a backward pass.
+    bool has_grad() const { return grad.size() == data.size(); }
 
     /// Create a tensor filled with random values from N(0, 1).
     /// Used to initialise weights — random breaks symmetry so neurons learn different things.
@@ -150,12 +169,21 @@ inline std::shared_ptr<GradNode> make_node(TensorPtr result, std::vector<TensorP
     auto node = std::make_shared<GradNode>();
     node->inputs = inputs;
 
+    // Anything joining the graph will be written to by a backward_fn, so give
+    // it a gradient buffer now. Done before the NoGrad check below is pointless
+    // -- under NoGrad nothing will ever run backward -- so it comes after.
+
     // Under NoGrad the node is returned but not attached: the caller still
     // assigns its backward_fn, which is then discarded with the node, and the
     // result stays a leaf. That keeps every call site unchanged while making
     // inference allocate nothing beyond the output tensor itself.
     if (!grad_enabled())
         return node;
+
+    for (auto& in : inputs)
+        if (in && in->requires_grad)
+            in->ensure_grad();
+    result->ensure_grad();
 
     result->requires_grad = true;
     result->grad_fn = node;

@@ -12,6 +12,10 @@ import sys
 
 import prometheus as p
 
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+from python.models import MLP          # noqa: E402
+
 FAILURES = []
 CHECKS = [0]
 
@@ -156,12 +160,60 @@ def test_save_load():
     check("loading a missing file raises", threw)
 
 
+def test_lazy_grad_and_no_grad():
+    print("\n=== lazy gradients and no_grad ===")
+    # the buffer used to be sized in the constructor, doubling the memory of
+    # every tensor including constants and inference activations
+    a = p.Tensor([256, 256])
+    check("a fresh tensor allocates no gradient buffer", len(a.grad) == 0,
+          "%d entries" % len(a.grad))
+    a.requires_grad = True
+    check("marking requires_grad allocates it", len(a.grad) == a.num_el())
+
+    m = MLP(8, 4, (16,))
+    x = tensor([4, 8], spread(32))
+    x.requires_grad = True
+
+    with_grad = m.forward(x)
+    check("a training forward records a graph", with_grad.requires_grad)
+    check("and allocates a gradient buffer", len(with_grad.grad) == with_grad.num_el())
+
+    import python.models as models
+    with models.no_grad():
+        inferred = m.forward(x)
+    check("no_grad forward records no graph", not inferred.requires_grad)
+    check("and allocates no gradient buffer", len(inferred.grad) == 0)
+    check("values are identical either way",
+          list(with_grad.data) == list(inferred.data))
+    check("grad mode is restored", p.is_grad_enabled())
+
+    # backward on a graph-less result must raise rather than silently leave
+    # every parameter at zero, which is indistinguishable from a severed graph
+    with models.no_grad():
+        y = m.forward(x)
+    threw = False
+    try:
+        y.backward()
+    except Exception:
+        threw = True
+    check("backward on a no_grad result raises", threw)
+
+    # and training still works after a no_grad block
+    for t in m.parameters():
+        t.reset_grad()
+    out = m.forward(x)
+    p.mean(p.multiply(out, out), -1).backward()
+    check("training is unaffected afterwards",
+          all(any(v != 0.0 for v in t.grad) for t in m.parameters()))
+
+
 def main():
     print("Python API checks")
     test_bindings_present()
     test_reproducibility()
     test_gradcheck_from_python()
     test_python_gpt_matches_cpp()
+    test_lazy_grad_and_no_grad()
     test_save_load()
 
     print("\n%d checks, %d failed" % (CHECKS[0], len(FAILURES)))
