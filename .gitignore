@@ -25,3 +25,20 @@ model.onnx
 
 # generated model dashboards
 dashboards/
+
+# ── build output ──────────────────────────────────────────────────────────
+*.pyd
+*.so
+*.whl
+*.obj
+*.lib
+dist/
+*.egg-info/
+stubs/
+
+# ── scratch written by examples and tests ─────────────────────────────────
+_vocab.txt
+_tmp_*.bin
+_opt_state.bin
+*_state.bin
+tests/assets/model.bin

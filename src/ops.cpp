@@ -335,17 +335,32 @@ TensorPtr softmax(TensorPtr a) {
 
     auto result = make_shared<Tensor>(a->shape);
 
+    // Subtract the row maximum before exponentiating. softmax(x + c) equals
+    // softmax(x) for any constant c, so this changes nothing mathematically
+    // while keeping every exponent at or below zero.
+    //
+    // Without it exp() overflows to inf and the result is NaN: measured here,
+    // a row whose largest logit was 90 already produced NaN, and attention
+    // scores or an untrained output layer reach that easily. The backward pass
+    // is unaffected, since it is written in terms of the output probabilities.
+    const int cols = a->shape[1];
+
     for (int i = 0; i < a->shape[0]; i++){
+
+        float row_max = a->data[i * cols];
+        for (int j = 1; j < cols; j++)
+            if (a->data[i * cols + j] > row_max)
+                row_max = a->data[i * cols + j];
 
         float s = 0;
 
-        for (int j = 0; j < a->shape[1]; j++){
-            result->data[i * a->shape[1] + j] = exp(a->data[i * a->shape[1] + j]);
-            s += result->data[i * a->shape[1] + j];
+        for (int j = 0; j < cols; j++){
+            result->data[i * cols + j] = exp(a->data[i * cols + j] - row_max);
+            s += result->data[i * cols + j];
         }
 
-        for (int j = 0; j < a->shape[1]; j++){
-            result->data[i * a->shape[1] + j] = result->data[i * a->shape[1] + j] / s;
+        for (int j = 0; j < cols; j++){
+            result->data[i * cols + j] = result->data[i * cols + j] / s;
         }
     }
 

@@ -91,6 +91,19 @@ def test_ops():
     sm = sm / sm.sum(axis=-1, keepdims=True)
     check("softmax (row-wise)", arr(p.softmax(a)), sm)
 
+    # Large logits. This is the case the check above cannot see: with values in
+    # [-0.9, 0.9] an unstabilised softmax agrees with a stabilised one to 1e-8,
+    # which is exactly why the missing max-subtraction went unnoticed. exp(90)
+    # already overflows float32.
+    for mx in (50.0, 90.0, 200.0, 1e4):
+        row = np.array([[mx, mx - 1.0, mx - 2.0, mx - 3.0]])
+        ref = np.exp(row - row.max(axis=-1, keepdims=True))
+        ref = ref / ref.sum(axis=-1, keepdims=True)
+        got = arr(p.softmax(tensor([1, 4], row)))
+        check("softmax with max logit %g" % mx, got, ref, atol=1e-6)
+        check("softmax rows sum to 1 at max logit %g" % mx,
+              got.sum(), 1.0, atol=1e-5)
+
     m_np = spread(8).reshape(4, 2)
     check("matmul", arr(p.matmul(a, tensor([4, 2], m_np))), a_np @ m_np)
 
