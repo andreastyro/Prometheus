@@ -32,6 +32,21 @@ GradCheckResult gradcheck(const function<TensorPtr()>& forward,
         // analytical gradients
         for (const TensorPtr& q : inputs) if (q) q->reset_grad();
         auto loss = scalarise(forward());
+
+        // A forward that produced no graph cannot be differentiated. Report it
+        // as the detachment it is, rather than letting backward() throw out of
+        // a diagnostic routine.
+        if (!loss->grad_fn) {
+            snprintf(line, sizeof(line),
+                     "  tensor %zu: the forward pass produced no computation "
+                     "graph, so every analytical gradient is zero\n", t);
+            r.report += line;
+            r.passed = false;
+            r.checked++;
+            r.failed++;
+            continue;
+        }
+
         loss->backward();
         vector<float> analytic = p->grad;
 

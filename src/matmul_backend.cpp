@@ -9,11 +9,25 @@
 
 static constexpr int TILE = 64;
 
+// Below this many multiply-adds, run serially.
+//
+// The parallel region itself costs something: a fork and a join per call. A
+// transformer step issues tens of small matmuls -- at an embedding width of 384
+// each is 384x384, which is only 36 tiles -- and handing 36 tiles to 16 threads
+// loses more to synchronisation than it gains. Measured on a 16.8M-parameter
+// GPT, throughput peaked at 2 threads and fell back at 4 and above, which is
+// the signature of exactly this.
+static constexpr long long PARALLEL_MIN_WORK = 2LL * 1024 * 1024;
+
+static inline bool worth_parallel(int m, int n, int k) {
+    return (long long)m * (long long)n * (long long)k >= PARALLEL_MIN_WORK;
+}
+
 // Tiled cache-friendly matmul — always compiled in as fallback
 static void matmul_tiled(int m, int n, int k,
                          const float* a, const float* b, float* c) {
     #ifdef PROMETHEUS_USE_OPENMP
-    #pragma omp parallel for schedule(dynamic)
+    #pragma omp parallel for schedule(dynamic) if(worth_parallel(m, n, k))
     #endif
     for (int i0 = 0; i0 < m; i0 += TILE)
         for (int k0 = 0; k0 < k; k0 += TILE)
@@ -37,7 +51,7 @@ static void matmul_tiled(int m, int n, int k,
 static void matmul_bt_tiled(int m, int inner, int kdim,
                             const float* g, const float* b, float* out) {
     #ifdef PROMETHEUS_USE_OPENMP
-    #pragma omp parallel for schedule(dynamic)
+    #pragma omp parallel for schedule(dynamic) if(worth_parallel(m, inner, kdim))
     #endif
     for (int i0 = 0; i0 < m; i0 += TILE)
         for (int j0 = 0; j0 < inner; j0 += TILE) {
@@ -65,7 +79,7 @@ static void matmul_bt_tiled(int m, int inner, int kdim,
 static void matmul_at_tiled(int m, int inner, int ncols,
                             const float* a, const float* g, float* out) {
     #ifdef PROMETHEUS_USE_OPENMP
-    #pragma omp parallel for schedule(dynamic)
+    #pragma omp parallel for schedule(dynamic) if(worth_parallel(inner, ncols, m))
     #endif
     for (int i0 = 0; i0 < inner; i0 += TILE)
         for (int k0 = 0; k0 < m; k0 += TILE)

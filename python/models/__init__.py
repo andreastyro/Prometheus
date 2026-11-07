@@ -20,7 +20,7 @@ every layer stays reachable for the visualiser. The GPT in python/gpt.py follows
 the same contract and is the reference implementation for the C++ p.GPT.
 """
 
-from .base import Model
+from .base import Model, no_grad
 from .visualiser import build_dashboard, visualise
 from .gan import GAN, Discriminator, Generator
 from .mlp import CNN, MLP
@@ -30,6 +30,7 @@ from .vae import VAE
 
 __all__ = [
     "Model",
+    "no_grad",
     "visualise",
     "build_dashboard",
     "MLP",

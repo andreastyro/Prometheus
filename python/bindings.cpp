@@ -122,6 +122,19 @@ PYBIND11_MODULE(prometheus, m) {
     m.def("transpose_op",  &transpose_op, py::arg("a"));
     m.def("concat_op",     &concat_op, py::arg("inputs"), py::arg("axis") = 0);
 
+    // ------------------------------------------------------------------------
+    // grad mode
+    // ------------------------------------------------------------------------
+    m.def("is_grad_enabled", []() { return grad_enabled(); },
+          "Whether ops currently record a computation graph.");
+    m.def("set_grad_enabled", [](bool on) { grad_enabled() = on; },
+          py::arg("enabled"),
+          "Turn graph recording on or off. Prefer the no_grad() context "
+          "manager, which restores the previous setting.");
+
+    py::class_<NoGrad>(m, "_NoGradGuard")
+        .def(py::init<>());
+
     // gradcheck: numeric gradient verification, in the spirit of
     // torch.autograd.gradcheck. Returns a dict so a failing check can report
     // which element disagreed and by how much.

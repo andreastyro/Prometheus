@@ -15,7 +15,28 @@ pulling intermediate activations is free from Python and requires a new binding
 for every member in C++.
 """
 
+import contextlib
+
 import prometheus as p
+
+
+@contextlib.contextmanager
+def no_grad():
+    """Disable graph recording for the duration of the block.
+
+    At inference there is nothing to backpropagate, so recording is pure
+    overhead: each op would allocate a graph node holding its inputs and a
+    closure, and the whole graph would stay alive until the result was dropped.
+
+        with no_grad():
+            logits = model.forward(x)
+    """
+    previous = p.is_grad_enabled()
+    p.set_grad_enabled(False)
+    try:
+        yield
+    finally:
+        p.set_grad_enabled(previous)
 
 
 class Model:

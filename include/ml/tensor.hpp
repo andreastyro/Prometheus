@@ -122,13 +122,42 @@ public:
 /// randomness (Dropout) draw from this so a run can be reproduced.
 std::mt19937& prometheus_rng();
 
+/// Whether ops should record a computation graph. True by default.
+///
+/// At inference there is nothing to backpropagate, so building the graph is
+/// pure waste: every op would allocate a GradNode holding shared_ptrs to its
+/// inputs and a std::function closure, and the whole graph would be kept alive
+/// until the result went out of scope. Turning this off skips all of it.
+bool &grad_enabled();
+
+/// Scoped guard. Restores the previous setting on destruction, so it nests and
+/// is exception-safe:
+///
+///     {
+///         NoGrad _;
+///         auto logits = model.forward(x);   // no graph built
+///     }
+struct NoGrad {
+    bool previous;
+    NoGrad() : previous(grad_enabled()) { grad_enabled() = false; }
+    ~NoGrad() { grad_enabled() = previous; }
+};
+
 /// Wire a new result tensor into the computation graph.
 /// Sets requires_grad=true on result, creates a GradNode with the given inputs,
 /// and returns the node so the caller can attach a backward_fn.
 inline std::shared_ptr<GradNode> make_node(TensorPtr result, std::vector<TensorPtr> inputs) {
-    result->requires_grad = true;
     auto node = std::make_shared<GradNode>();
     node->inputs = inputs;
+
+    // Under NoGrad the node is returned but not attached: the caller still
+    // assigns its backward_fn, which is then discarded with the node, and the
+    // result stays a leaf. That keeps every call site unchanged while making
+    // inference allocate nothing beyond the output tensor itself.
+    if (!grad_enabled())
+        return node;
+
+    result->requires_grad = true;
     result->grad_fn = node;
     return node;
 }

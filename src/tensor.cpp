@@ -33,6 +33,11 @@ static mt19937& global_rng() {
 
 mt19937& prometheus_rng() { return global_rng(); }
 
+bool &grad_enabled() {
+    static bool enabled = true;
+    return enabled;
+}
+
 void Tensor::manual_seed(unsigned int seed) {
     global_rng().seed(seed);
 }
@@ -74,23 +79,45 @@ TensorPtr Tensor::reshape(vector<int> new_shape) const {
     return result;
 }
 
+// Iterative post-order traversal.
+//
+// This was recursive, which puts one C++ stack frame per graph node: a long
+// sequence or a deep residual stack is thousands of nodes and can overflow the
+// stack with no useful diagnostic. The explicit stack has no such limit.
 void dfs(TensorPtr node, vector<TensorPtr>& order, unordered_set<TensorPtr>& visited){
-    if (visited.count(node)){
-        return; // already visited
-    }
+    vector<pair<TensorPtr, bool>> stack;      // (node, children_expanded)
+    stack.push_back({node, false});
 
-    visited.insert(node);
+    while (!stack.empty()) {
+        auto [cur, expanded] = stack.back();
+        stack.pop_back();
 
-    if (node->grad_fn) {
-        for (TensorPtr& input : node->grad_fn->inputs){
-            dfs(input, order, visited);
+        if (expanded) {
+            order.push_back(cur);
+            continue;
         }
-    }
+        if (!cur || visited.count(cur)) continue;
+        visited.insert(cur);
 
-    order.push_back(node);
+        stack.push_back({cur, true});         // emit after its inputs
+        if (cur->grad_fn)
+            for (auto& input : cur->grad_fn->inputs)
+                if (input && !visited.count(input))
+                    stack.push_back({input, false});
+    }
 }
 
 void Tensor::backward(){
+
+    // A tensor with no grad_fn has nothing behind it. Walking the graph would
+    // silently do nothing and leave every parameter at zero, which is the same
+    // failure mode as a severed graph and just as hard to notice -- the usual
+    // cause is forgetting to leave a NoGrad scope.
+    if (!grad_fn)
+        throw runtime_error(
+            "backward() called on a tensor with no computation graph. It is "
+            "either a leaf, or it was produced while gradients were disabled "
+            "(NoGrad / no_grad()).");
 
     grad.assign(data.size(), 1.0f);
 
