@@ -152,6 +152,28 @@ def _fmt(n):
     return str(n) if n > 0 else '—'
 
 def _collect(model):
+    # A Prometheus Model keeps its children in _layers as ordered (name, layer)
+    # pairs, which is exact and already in forward order. Prefer it: the
+    # attribute walk below only finds layers that happen to be bound to a named
+    # attribute, so MLP, CNN and ResNet -- which store theirs solely in _layers
+    # -- came back empty, and UNet reported 35 entries by recursing into
+    # sub-blocks.
+    layers = getattr(model, '_layers', None)
+    if layers:
+        flat = []
+        for name, layer in layers:
+            if _is_mod(layer):
+                flat.append((name, layer))
+            else:
+                # a plain holder such as the UNet conv block
+                subs = getattr(layer, 'sublayers', None)
+                if callable(subs):
+                    for i, sub in enumerate(subs()):
+                        if _is_mod(sub):
+                            flat.append(('%s.%d' % (name, i), sub))
+        if flat:
+            return flat
+
     seen, out = set(), []
     def _w(obj, pre=''):
         if id(obj) in seen: return
