@@ -1,5 +1,6 @@
 #include "ml/matmul_backend.hpp"
 #include <algorithm>
+#include <atomic>
 #ifdef PROMETHEUS_USE_OPENMP
     #include <omp.h>
 #endif
@@ -125,33 +126,65 @@ static void matmul_at_tiled(int m, int inner, int ncols,
 // itself and falls back to the portable tiled kernel when it is already inside
 // a parallel region. The explicit *_serial entry points remain for callers
 // that want to state the intent.
+static std::atomic<int> g_serial_blas{0};
+
 static inline bool nested_call() {
 #ifdef PROMETHEUS_USE_OPENMP
-    return omp_in_parallel() != 0;
+    // inside a region is fine once BLAS has been pinned to one thread
+    return omp_in_parallel() != 0
+        && g_serial_blas.load(std::memory_order_relaxed) == 0;
 #else
     return false;
 #endif
 }
 
+static inline bool serial_blas_active() {
+#if defined(PROMETHEUS_USE_OPENBLAS)
+    return g_serial_blas.load(std::memory_order_relaxed) > 0;
+#else
+    return false;
+#endif
+}
+
+SerialBlasScope::SerialBlasScope() {
+#if defined(PROMETHEUS_USE_OPENBLAS)
+    if (g_serial_blas.fetch_add(1) == 0) {
+        prev_ = openblas_get_num_threads();
+        openblas_set_num_threads(1);
+    }
+#endif
+}
+
+SerialBlasScope::~SerialBlasScope() {
+#if defined(PROMETHEUS_USE_OPENBLAS)
+    if (g_serial_blas.fetch_sub(1) == 1 && prev_ > 0)
+        openblas_set_num_threads(prev_);
+#endif
+}
+
 void matmul_forward_serial(int m, int n, int k,
                            const float* a, const float* b, float* c) {
+    if (serial_blas_active()) { matmul_forward(m, n, k, a, b, c); return; }
     for (int i = 0; i < m * n; i++) c[i] = 0.0f;
     matmul_tiled(m, n, k, a, b, c);
 }
 
 void matmul_forward_bt_serial(int m, int n, int k,
                               const float* a, const float* b, float* c) {
+    if (serial_blas_active()) { matmul_forward_bt(m, n, k, a, b, c); return; }
     for (int i = 0; i < m * n; i++) c[i] = 0.0f;
     matmul_bt_tiled(m, n, k, a, b, c);
 }
 
 void matmul_backward_a_serial(int m, int inner, int b_cols,
                               const float* grad_out, const float* b_data, float* a_grad) {
+    if (serial_blas_active()) { matmul_backward_a(m, inner, b_cols, grad_out, b_data, a_grad); return; }
     matmul_bt_tiled(m, inner, b_cols, grad_out, b_data, a_grad);
 }
 
 void matmul_backward_b_serial(int m, int inner, int b_cols,
                               const float* grad_out, const float* a_data, float* b_grad) {
+    if (serial_blas_active()) { matmul_backward_b(m, inner, b_cols, grad_out, a_data, b_grad); return; }
     matmul_at_tiled(m, inner, b_cols, a_data, grad_out, b_grad);
 }
 

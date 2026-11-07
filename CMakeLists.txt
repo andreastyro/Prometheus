@@ -193,6 +193,8 @@ target_link_libraries(test_gradcheck prometheus)
 
 add_executable(test_matmul_backend ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_matmul_backend.cpp)
 target_link_libraries(test_matmul_backend prometheus)
+add_executable(test_fastmath ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_fastmath.cpp)
+target_link_libraries(test_fastmath prometheus)
 
 enable_testing()
 add_test(NAME test_tensor COMMAND test_tensor WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
@@ -222,3 +224,4 @@ add_test(NAME test_checkpoint COMMAND test_checkpoint WORKING_DIRECTORY ${CMAKE_
 add_test(NAME test_gpt COMMAND test_gpt WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME test_gradcheck COMMAND test_gradcheck WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME test_matmul_backend COMMAND test_matmul_backend WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME test_fastmath COMMAND test_fastmath WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})

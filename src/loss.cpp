@@ -1,6 +1,7 @@
 #include "ml/loss.hpp"
 #include "ml/ops.hpp"
 #include "ml/autograd.hpp"
+#include "ml/fastmath.hpp"
 #include <cmath>
 #include <algorithm>
 
@@ -243,14 +244,28 @@ TensorPtr cross_entropy_sparse_seq(TensorPtr logits, const std::vector<int>& tar
     int vocab    = logits->shape[1];
 
     // Forward: accumulate loss per position
+    // 1024 positions x 16000 vocab is 16M exps per step, and this ran them
+    // one at a time on one core. Rows are independent, so split them across
+    // threads; within a row, exp into a scratch buffer first so that loop
+    // vectorises, then sum it.
     std::vector<float> max_v(seq_len), sum_exp(seq_len, 0.0f);
-    for (int t = 0; t < seq_len; t++) {
-        float mx = logits->data[t * vocab];
-        for (int v = 1; v < vocab; v++)
-            mx = std::max(mx, logits->data[t * vocab + v]);
-        max_v[t] = mx;
-        for (int v = 0; v < vocab; v++)
-            sum_exp[t] += std::expf(logits->data[t * vocab + v] - mx);
+    #pragma omp parallel if(seq_len >= 16)
+    {
+        std::vector<float> e(vocab);
+        #pragma omp for schedule(static)
+        for (int t = 0; t < seq_len; t++) {
+            const float* row = logits->data.data() + (size_t)t * vocab;
+            float mx = row[0];
+            for (int v = 1; v < vocab; v++)
+                mx = std::max(mx, row[v]);
+            max_v[t] = mx;
+            for (int v = 0; v < vocab; v++)
+                e[v] = fastmath::exp(row[v] - mx);
+            float s = 0.0f;
+            for (int v = 0; v < vocab; v++)
+                s += e[v];
+            sum_exp[t] = s;
+        }
     }
 
     float total = 0.0f;
@@ -263,12 +278,18 @@ TensorPtr cross_entropy_sparse_seq(TensorPtr logits, const std::vector<int>& tar
     if (logits->requires_grad) {
         auto node = make_node(result, {logits});
         node->backward_fn = [logits, result, targets, seq_len, vocab, max_v, sum_exp]() {
-            float scale = result->grad[0] / (float)seq_len;
+            const float scale = result->grad[0] / (float)seq_len;
+            #pragma omp parallel for schedule(static) if(seq_len >= 16)
             for (int t = 0; t < seq_len; t++) {
-                for (int v = 0; v < vocab; v++) {
-                    float p = std::expf(logits->data[t * vocab + v] - max_v[t]) / sum_exp[t];
-                    logits->grad[t * vocab + v] += scale * (p - (v == targets[t] ? 1.0f : 0.0f));
-                }
+                const float* row = logits->data.data() + (size_t)t * vocab;
+                float* g = logits->grad.data() + (size_t)t * vocab;
+                const float mx = max_v[t];
+                const float k  = scale / sum_exp[t];
+                // the target's -1 is applied once after the loop, so the loop
+                // body has no branch and vectorises
+                for (int v = 0; v < vocab; v++)
+                    g[v] += k * fastmath::exp(row[v] - mx);
+                g[targets[t]] -= scale;
             }
         };
     }

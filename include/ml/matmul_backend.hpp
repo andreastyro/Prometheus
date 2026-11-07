@@ -27,6 +27,23 @@ void matmul_backward_a_serial(int m, int inner, int b_cols,
 void matmul_backward_b_serial(int m, int inner, int b_cols,
                               const float* grad_out, const float* a_data, float* b_grad);
 
+/// While one of these is alive, BLAS runs on the calling thread only, so
+/// gemms issued from inside a parallel region use BLAS's kernels rather than
+/// falling back to the portable tiled loop. Create it outside the region:
+/// changing BLAS's thread count is not itself thread-safe.
+///
+/// This is how attention gets the effect of a batched gemm: 48 small
+/// per-head matmuls, each on one core through a tuned kernel, all at once.
+class SerialBlasScope {
+public:
+    SerialBlasScope();
+    ~SerialBlasScope();
+    SerialBlasScope(const SerialBlasScope&) = delete;
+    SerialBlasScope& operator=(const SerialBlasScope&) = delete;
+private:
+    int prev_ = 0;
+};
+
 const char* matmul_backend_name();
 
 /// Threads OpenMP will actually use, or 1 when built without it.

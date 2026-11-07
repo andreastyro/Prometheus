@@ -1,6 +1,7 @@
 #include "ml/tensor.hpp"
 #include "ml/autograd.hpp"
 #include "ml/matmul_backend.hpp"
+#include "ml/fastmath.hpp"
 #include <cmath>
 #include <string>
 
@@ -900,10 +901,14 @@ TensorPtr gelu(TensorPtr a) {
     int n = a->num_el();
     constexpr float kSqrt2OverPi = 0.7978845608f;
 
+    // gelu was missed when the other elementwise ops were parallelised -- it
+    // bounds its loop with a local, not num_el() -- and tanhf is an opaque
+    // call that kept it to one lane besides
+    #pragma omp parallel for schedule(static) if(n >= 32768)
     for (int i = 0; i < n; i++) {
         float x = a->data[i];
         float inner = kSqrt2OverPi * (x + 0.044715f * x * x * x);
-        result->data[i] = 0.5f * x * (1.0f + tanhf(inner));
+        result->data[i] = 0.5f * x * (1.0f + fastmath::tanh(inner));
     }
 
     if (a->requires_grad) {
@@ -911,10 +916,11 @@ TensorPtr gelu(TensorPtr a) {
         node->backward_fn = [a, result]() {
             constexpr float k = 0.7978845608f;
             int m = a->num_el();
+            #pragma omp parallel for schedule(static) if(m >= 32768)
             for (int i = 0; i < m; i++) {
                 float x = a->data[i];
                 float inner = k * (x + 0.044715f * x * x * x);
-                float t = tanhf(inner);
+                float t = fastmath::tanh(inner);
                 float d_inner = k * (1.0f + 3.0f * 0.044715f * x * x);
                 float grad = 0.5f * (1.0f + t) + 0.5f * x * (1.0f - t * t) * d_inner;
                 a->grad[i] += result->grad[i] * grad;

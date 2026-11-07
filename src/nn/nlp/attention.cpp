@@ -2,6 +2,7 @@
 #include "ml/autograd.hpp"
 #include "ml/matmul_backend.hpp"
 #include <cmath>
+#include "ml/fastmath.hpp"
 #include <cstring>
 #include <utility>
 #include <algorithm>
@@ -135,6 +136,10 @@ TensorPtr MultiHeadAttention::forward(TensorPtr input, int batch) {
     // of it scalar work that was running on a single core while the matmuls
     // around it used all 16. Flattened into one loop because MSVC's OpenMP
     // 2.0 has no collapse(2).
+    {
+    // BLAS pinned to one thread for the per-head gemms only; the projections
+    // either side are large and want every core
+    SerialBlasScope serial_blas;
     const int HB = H * B;
     #pragma omp parallel for schedule(static) if(HB > 1)
     for (int hb = 0; hb < HB; hb++) {
@@ -161,14 +166,18 @@ TensorPtr MultiHeadAttention::forward(TensorPtr input, int batch) {
                         scores[i*S + j] = -1e9f;
 
             // Row-wise softmax → A_b [S, S]
+            // exp, sum and scale as three separate loops: a float sum in the
+            // same loop as the exp is a reduction the compiler will not
+            // reorder, and it would hold the exp back to one lane too
             for (int i = 0; i < S; i++) {
-                float max_v = *max_element(scores.data() + i*S, scores.data() + (i+1)*S);
+                const float max_v = *max_element(scores.data() + i*S, scores.data() + (i+1)*S);
+                float* row = A_b + i*S;
+                const float* sc = scores.data() + i*S;
+                for (int j = 0; j < S; j++) row[j] = fastmath::exp(sc[j] - max_v);
                 float sum = 0.0f;
-                for (int j = 0; j < S; j++) {
-                    A_b[i*S + j] = expf(scores[i*S + j] - max_v);
-                    sum += A_b[i*S + j];
-                }
-                for (int j = 0; j < S; j++) A_b[i*S + j] /= sum;
+                for (int j = 0; j < S; j++) sum += row[j];
+                const float inv = 1.0f / sum;
+                for (int j = 0; j < S; j++) row[j] *= inv;
             }
 
             // O_b = A_b @ V_b  [S, D]
@@ -180,6 +189,8 @@ TensorPtr MultiHeadAttention::forward(TensorPtr input, int batch) {
                     concat_all[(b*S + t)*E + start + d] = O_b[t*D + d];
         }
     }
+
+    }   // serial BLAS scope ends
 
     // output = concat @ W_o  [S, E]
     auto result = make_shared<Tensor>(vector<int>{rows, E});
@@ -228,6 +239,8 @@ TensorPtr MultiHeadAttention::forward(TensorPtr input, int batch) {
             // ── Per-head backward ─────────────────────────────────────────
             // Same independence as the forward: every (head, sequence) pair
             // writes only its own slice of grad_QKV.
+            {
+            SerialBlasScope serial_blas;
             const int HB = H * B;
             #pragma omp parallel for schedule(static) if(HB > 1)
             for (int hb = 0; hb < HB; hb++) {
@@ -298,6 +311,8 @@ TensorPtr MultiHeadAttention::forward(TensorPtr input, int batch) {
                     }
               }
             }
+
+            }   // serial BLAS scope ends
 
             // ── Input projection backward ─────────────────────────────────
             // Q = input @ W_q:
