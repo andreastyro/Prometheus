@@ -83,6 +83,8 @@ PYBIND11_MODULE(prometheus, m) {
         .def("fill",      &Tensor::fill)
         .def("print",     &Tensor::print)
         .def("num_el",    &Tensor::num_el)
+        .def("is_view",        &Tensor::is_view)
+        .def("is_contiguous",  &Tensor::is_contiguous)
         .def("transpose", &Tensor::transpose)
         .def("reshape",   &Tensor::reshape)
         .def("backward",  &Tensor::backward)
@@ -128,6 +130,13 @@ PYBIND11_MODULE(prometheus, m) {
     m.def("reshape_op",    &reshape_op, py::arg("a"), py::arg("new_shape"));
     m.def("transpose_op",  &transpose_op, py::arg("a"));
     m.def("concat_op",     &concat_op, py::arg("inputs"), py::arg("axis") = 0);
+    m.def("transpose_view", &transpose_view, py::arg("a"),
+          "O(1) transpose sharing storage. Non-contiguous; use contiguous() "
+          "for ops that read data directly.");
+    m.def("reshape_view",   &reshape_view, py::arg("a"), py::arg("new_shape"),
+          "O(1) reshape sharing storage.");
+    m.def("contiguous",     &contiguous, py::arg("a"),
+          "Materialise a view; returns the input unchanged if it owns its data.");
     m.def("matmul_bt",     &matmul_bt, py::arg("a"), py::arg("b"),
           "a @ b^T without building b^T. a is [m, k], b is [n, k].");
 

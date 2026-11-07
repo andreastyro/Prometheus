@@ -937,3 +937,103 @@ TensorPtr matmul_bt(TensorPtr a, TensorPtr b) {
 
     return result;
 }
+
+// ── Views ────────────────────────────────────────────────────────────────────
+//
+// See the gradient convention in tensor.hpp: a view's grad is row-major over
+// the view's own shape. That is what makes the backward passes below simple --
+// contiguous() is a straight element-for-element accumulate, and the only one
+// that rearranges anything is the transpose, which rearranges exactly as the
+// forward did.
+
+TensorPtr transpose_view(TensorPtr a) {
+    if (a->shape.size() != 2)
+        throw runtime_error("transpose_view: only 2-D tensors are supported");
+
+    auto base = a->is_view() ? a->base : a;
+    auto in_strides = a->is_view() ? a->strides
+                                   : Tensor::contiguous_strides(a->shape);
+
+    const int rows = a->shape[0], cols = a->shape[1];
+
+    auto v = make_shared<Tensor>();         // no storage allocated
+    v->shape   = {cols, rows};
+    v->base    = base;
+    v->offset  = a->offset;
+    v->strides = {in_strides[1], in_strides[0]};
+
+    if (a->requires_grad) {
+        auto node = make_node(v, {a});
+        node->backward_fn = [a, v, rows, cols]() {
+            // v->grad is row-major over [cols, rows]; a->grad over [rows, cols]
+            for (int i = 0; i < rows; i++)
+                for (int j = 0; j < cols; j++)
+                    a->grad[i * cols + j] += v->grad[j * rows + i];
+        };
+    }
+    return v;
+}
+
+TensorPtr reshape_view(TensorPtr a, vector<int> new_shape) {
+    if (!a->is_contiguous())
+        throw runtime_error("reshape_view: the input is a non-contiguous view; "
+                            "pass it through contiguous() first");
+
+    int total = 1;
+    for (int d : new_shape) total *= d;
+    if (total != a->num_el())
+        throw runtime_error("reshape_view: cannot reshape " + to_string(a->num_el())
+                            + " elements into a shape of " + to_string(total));
+
+    auto base = a->is_view() ? a->base : a;
+    auto v = make_shared<Tensor>();         // no storage allocated
+    v->shape   = new_shape;
+    v->base    = base;
+    v->offset  = a->offset;
+    v->strides = Tensor::contiguous_strides(new_shape);
+
+    if (a->requires_grad) {
+        auto node = make_node(v, {a});
+        node->backward_fn = [a, v]() {
+            // element order is unchanged, so this is one to one
+            const int n = a->num_el();
+            for (int i = 0; i < n; i++)
+                a->grad[i] += v->grad[i];
+        };
+    }
+    return v;
+}
+
+TensorPtr contiguous(TensorPtr a) {
+    if (!a->is_view())
+        return a;
+
+    const int n  = a->num_el();
+    const int nd = (int)a->shape.size();
+
+    auto out = make_shared<Tensor>(a->shape);
+
+    // gather in row-major order of the shape, stepping through the strides
+    vector<int> idx(nd, 0);
+    for (int i = 0; i < n; i++) {
+        out->data[i] = a->view_at(idx);
+        for (int d = nd - 1; d >= 0; d--) {
+            if (++idx[d] < a->shape[d]) break;
+            idx[d] = 0;
+        }
+    }
+
+    if (a->requires_grad) {
+        auto node = make_node(out, {a});
+        node->backward_fn = [a, out, n]() {
+            // Both gradients are row-major over the same shape, so this is a
+            // straight accumulate. Walking the strides here was the defect in
+            // the first attempt: it wrote the view's gradient in storage order
+            // while transpose_view read it in row-major order.
+            a->ensure_grad();
+            for (int i = 0; i < n; i++)
+                a->grad[i] += out->grad[i];
+        };
+    }
+    return out;
+}

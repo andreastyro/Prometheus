@@ -92,6 +92,10 @@ int main() {
         check("transpose_op", [&]{ return transpose_op(x); },       {x});
         auto bt = tin({2, 4});
         check("matmul_bt", [&]{ return matmul_bt(x, bt); }, {x, bt});
+        check("transpose_view + contiguous",
+              [&]{ return contiguous(transpose_view(x)); }, {x});
+        check("reshape_view + contiguous",
+              [&]{ return contiguous(reshape_view(x, {4, 3})); }, {x});
         check("reshape_op",   [&]{ return reshape_op(x, {4, 3}); }, {x});
         check("exp_op",       [&]{ return exp_op(x); },             {x});
 

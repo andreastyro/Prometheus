@@ -109,3 +109,18 @@ TensorPtr concat_op(std::vector<TensorPtr> inputs, int axis = 0);
 /// becomes a flag to BLAS, or a different loop order in the tiled kernel.
 /// Prefer this wherever a weight is stored [out, in] and applied as x @ W^T.
 TensorPtr matmul_bt(TensorPtr a, TensorPtr b);
+
+/// O(1) transpose: a 2-D view with the strides swapped, sharing storage.
+/// Nothing is copied. The result is non-contiguous, so pass it through
+/// contiguous() before an op that reads `data` directly. To apply a weight
+/// transposed, prefer matmul_bt, which needs neither.
+TensorPtr transpose_view(TensorPtr a);
+
+/// O(1) reshape: a view with the same element order and a new shape. A
+/// reshape of contiguous storage stays contiguous.
+TensorPtr reshape_view(TensorPtr a, std::vector<int> new_shape);
+
+/// Materialise a view into owned, contiguous storage. Returns the input
+/// unchanged when it already owns its data, so calling it is free in the
+/// common case.
+TensorPtr contiguous(TensorPtr a);

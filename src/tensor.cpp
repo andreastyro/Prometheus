@@ -119,7 +119,7 @@ void Tensor::backward(){
             "either a leaf, or it was produced while gradients were disabled "
             "(NoGrad / no_grad()).");
 
-    grad.assign(data.size(), 1.0f);
+    grad.assign((size_t)num_el(), 1.0f);
 
     vector<TensorPtr> order;
     unordered_set<TensorPtr> visited;

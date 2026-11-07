@@ -708,6 +708,63 @@ def test_batching():
           np.array([1.0]), atol=0)
 
 
+def test_views():
+    print("\n=== strided views ===\n")
+    A = spread(12).reshape(3, 4)
+    a = tensor([3, 4], A)
+
+    v = p.transpose_view(a)
+    check("transpose_view shape", np.array(v.shape), np.array([4, 3]), atol=0)
+    check("transpose_view is a view",
+          np.array([1.0 if v.is_view() else 0.0]), np.array([1.0]), atol=0)
+    check("and is non-contiguous",
+          np.array([0.0 if v.is_contiguous() else 1.0]), np.array([1.0]), atol=0)
+    check("materialises to numpy .T", arr(p.contiguous(v)), A.T)
+
+    r = p.reshape_view(a, [4, 3])
+    check("reshape_view stays contiguous",
+          np.array([1.0 if r.is_contiguous() else 0.0]), np.array([1.0]), atol=0)
+    check("reshape_view materialises correctly", arr(p.contiguous(r)), A.reshape(4, 3))
+
+    # transposing twice must return the original
+    check("transpose_view twice is the identity",
+          arr(p.contiguous(p.transpose_view(p.transpose_view(a)))), A)
+
+    # contiguous() on an owned tensor must not copy
+    check("contiguous() is a no-op on owned storage",
+          np.array([0.0 if p.contiguous(a).is_view() else 1.0]),
+          np.array([1.0]), atol=0)
+
+    # The gradient convention: a view's grad is row-major over the view's own
+    # shape, not indexed through the strides. Getting this wrong was a real
+    # defect -- one backward wrote in storage order while another read
+    # row-major, which disagreed silently wherever it did not crash. The test
+    # is that the view route gives exactly what the copying route gives.
+    x = tensor([3, 4], spread(12))
+    x.requires_grad = True
+    x.reset_grad()
+    y = p.contiguous(p.transpose_view(x))
+    p.mean(p.multiply(y, y), -1).backward()
+    via_view = list(x.grad)
+
+    x.reset_grad()
+    z = p.transpose_op(x)
+    p.mean(p.multiply(z, z), -1).backward()
+    via_copy = list(x.grad)
+
+    check("view gradients equal transpose_op gradients",
+          np.array(via_view), np.array(via_copy), atol=1e-6)
+
+    # a non-contiguous view cannot be reshaped without materialising first
+    threw = False
+    try:
+        p.reshape_view(p.transpose_view(a), [12])
+    except Exception:
+        threw = True
+    check("reshaping a non-contiguous view raises",
+          np.array([1.0 if threw else 0.0]), np.array([1.0]), atol=0)
+
+
 def main():
     print("Forward-pass verification against numpy reference implementations")
     test_ops()
@@ -721,6 +778,7 @@ def main():
     test_losses()
     test_attention()
     test_batching()
+    test_views()
     test_optimizers()
     test_rmsprop_and_clip()
     test_metrics()

@@ -26,6 +26,12 @@ public:
     /// nullptr for leaf tensors (inputs and weights). Used by backward() to walk the graph.
     std::shared_ptr<GradNode> grad_fn = nullptr;
 
+    /// Default: an empty shell. Used for views, which describe elements they
+    /// do not own, so allocating storage for them would defeat the purpose --
+    /// constructing then clearing a 6.1M-element buffer made transpose_view
+    /// only 4x faster than the copy it replaces instead of free.
+    Tensor() = default;
+
     /// Create a tensor from existing data.
     ///
     /// `grad` is deliberately left empty. Both constructors used to size it
@@ -45,6 +51,52 @@ public:
         for (int i : shape)
             total *= i;
         data.resize(total, 0.0f);
+    }
+
+    // ── Views ────────────────────────────────────────────────────────────
+    //
+    // A view shares another tensor's storage and describes a different way of
+    // walking it. strides[d] is how many elements to step to advance one along
+    // dimension d, so a transpose is a swap of two strides and costs nothing,
+    // where copying a 16000x384 table costs 24.6 MB.
+    //
+    // THE GRADIENT CONVENTION, which is the part that is easy to get wrong:
+    // a view's `grad` is row-major over the VIEW's own shape, exactly as it
+    // would be for an owned tensor of that shape. It is not indexed through
+    // the strides. Every backward_fn in the library writes `grad[i]` in
+    // row-major order, so this is the only convention that lets views and
+    // owned tensors share that code. A first attempt at this indexed a view's
+    // gradient by storage offset in one place and row-major in another, which
+    // disagreed silently wherever it did not crash.
+    //
+    // Views own no `data`, so an op that reads `data` directly must take
+    // contiguous() first. Ops that can walk strides consume the view as is.
+    std::shared_ptr<Tensor> base;   ///< storage owner, null when this owns its data
+    std::vector<int> strides;       ///< element stride per dimension
+    int offset = 0;                 ///< index of the first element in base->data
+
+    bool is_view() const { return base != nullptr; }
+
+    /// Row-major strides for a shape, which is what an owned tensor has.
+    static std::vector<int> contiguous_strides(const std::vector<int>& shape) {
+        std::vector<int> st(shape.size(), 1);
+        for (int d = (int)shape.size() - 2; d >= 0; d--)
+            st[d] = st[d + 1] * shape[d + 1];
+        return st;
+    }
+
+    /// True when the elements can be read straight out of storage in order.
+    bool is_contiguous() const {
+        if (!is_view()) return true;
+        return offset == 0 && strides == contiguous_strides(shape);
+    }
+
+    /// Element at a multi-dimensional index, honouring strides.
+    float view_at(const std::vector<int>& idx) const {
+        int flat = offset;
+        for (std::size_t d = 0; d < idx.size(); d++)
+            flat += idx[d] * strides[d];
+        return is_view() ? base->data[flat] : data[flat];
     }
 
     /// Total number of elements — product of all dimension sizes.
