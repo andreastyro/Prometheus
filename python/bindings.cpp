@@ -287,12 +287,13 @@ PYBIND11_MODULE(prometheus, m) {
     m.def("pow_op",        &pow_op);
     m.def("sqrt_op",       &sqrt_op);
     m.def("abs_op",        &abs_op);
-    m.def("sum",           &sum,     py::arg("a"), py::arg("axis") = -1);
-    m.def("mean",          &mean,    py::arg("a"), py::arg("axis") = -1);
+    m.def("sum",           &sum,     py::arg("a"), py::arg("dim") = -1, py::arg("keepdim") = false,
+          "Sum over dim, or over everything when dim is -1 (unlike PyTorch, where -1 is the last dim).");
+    m.def("mean",          &mean,    py::arg("a"), py::arg("dim") = -1, py::arg("keepdim") = false,
+          "Mean over dim, or over everything when dim is -1 (unlike PyTorch, where -1 is the last dim).");
     m.def("max_op",        &max_op);
     m.def("min_op",        &min_op);
     m.def("clip",           &clip);
-    m.def("broadcast_add", &broadcast_add);
     m.def("argmax",         &argmax);
     m.def("clip_grad_norm", &clip_grad_norm,
           py::arg("params"), py::arg("max_norm"));
@@ -468,12 +469,6 @@ PYBIND11_MODULE(prometheus, m) {
         .def("forward",
              static_cast<TensorPtr (MultiHeadAttention::*)(TensorPtr)>(
                  &MultiHeadAttention::forward))
-        .def("forward",
-             static_cast<TensorPtr (MultiHeadAttention::*)(TensorPtr, int)>(
-                 &MultiHeadAttention::forward),
-             py::arg("input"), py::arg("batch"),
-             "Batched forward. input is [batch * seq, embed]; the batch is "
-             "folded into the row dimension.")
         .def("parameters", &MultiHeadAttention::parameters)
         .def_readonly("W_q", &MultiHeadAttention::W_q)
         .def_readonly("W_k", &MultiHeadAttention::W_k)
@@ -487,10 +482,6 @@ PYBIND11_MODULE(prometheus, m) {
         .def("forward",
              static_cast<TensorPtr (TransformerBlock::*)(TensorPtr)>(
                  &TransformerBlock::forward))
-        .def("forward",
-             static_cast<TensorPtr (TransformerBlock::*)(TensorPtr, int)>(
-                 &TransformerBlock::forward),
-             py::arg("input"), py::arg("batch"))
         .def("parameters", &TransformerBlock::parameters)
         .def_readonly("attn",  &TransformerBlock::attn)
         .def_readonly("norm1", &TransformerBlock::norm1)
@@ -509,11 +500,6 @@ PYBIND11_MODULE(prometheus, m) {
              py::arg("ff_dim") = 0, py::arg("rope") = false)
         .def("forward",
              static_cast<TensorPtr (GPT::*)(TensorPtr)>(&GPT::forward))
-        .def("forward",
-             static_cast<TensorPtr (GPT::*)(TensorPtr, int)>(&GPT::forward),
-             py::arg("token_ids"), py::arg("batch"),
-             "Batched forward. token_ids holds batch*seq ids; the result is "
-             "[batch*seq, vocab_size].")
         .def("forward_cached",  &GPT::forward_cached,
              py::arg("token_id"), py::arg("cache"))
         .def("make_kv_cache",   &GPT::make_kv_cache)

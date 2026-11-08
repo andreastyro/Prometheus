@@ -240,8 +240,13 @@ TensorPtr cross_entropy_sparse(TensorPtr logits, int target_idx) {
 // logits: [seq_len, vocab_size],  targets: seq_len ints.
 // Returns mean loss (scalar) with proper backward to all logit positions.
 TensorPtr cross_entropy_sparse_seq(TensorPtr logits, const std::vector<int>& targets) {
-    int seq_len  = logits->shape()[0];
-    int vocab    = logits->shape()[1];
+    // logits are [..., vocab]: every leading dimension is a position
+    logits = checked_input("cross_entropy_sparse_seq", logits);
+    int vocab    = (int)logits->shape().back();
+    int seq_len  = (int)(logits->numel() / vocab);
+    if ((int)targets.size() != seq_len)
+        throw runtime_error("cross_entropy_sparse_seq: " + to_string(targets.size()) +
+                            " targets for " + to_string(seq_len) + " positions");
 
     // Forward: accumulate loss per position
     // 1024 positions x 16000 vocab is 16M exps per step, and this ran them

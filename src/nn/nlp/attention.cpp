@@ -1,4 +1,5 @@
 #include "ml/nn/nlp/attention.hpp"
+#include "ml/ops.hpp"
 #include "ml/autograd.hpp"
 #include "ml/matmul_backend.hpp"
 #include <cmath>
@@ -67,10 +68,17 @@ MultiHeadAttention::MultiHeadAttention(int embed_dim, int num_heads, bool causal
 // the backward, and attaches a single GradNode that implements the full
 // attention gradient in one lambda.
 TensorPtr MultiHeadAttention::forward(TensorPtr input) {
-    return forward(input, 1);
+    if (input->dim() == 3) {
+        const int64_t B = input->size(0), S = input->size(1);
+        auto rows = reshape(checked_input("MultiHeadAttention", input), {B * S, input->size(2)});
+        return reshape(forward_rows(rows, (int)B), {B, S, (int64_t)embed_dim});
+    }
+    if (input->dim() == 2)
+        return forward_rows(checked_input("MultiHeadAttention", input), 1);
+    throw runtime_error("MultiHeadAttention: input must be [batch, seq, embed] or [seq, embed]");
 }
 
-TensorPtr MultiHeadAttention::forward(TensorPtr input, int batch) {
+TensorPtr MultiHeadAttention::forward_rows(TensorPtr input, int batch) {
     int rows = input->shape()[0];
     if (batch <= 0 || rows % batch != 0)
         throw runtime_error("MultiHeadAttention: row count " + to_string(rows) +

@@ -655,7 +655,10 @@ def test_batching():
                 alone += list(mha.forward(tensor([S, E], row)).data)
 
             flat = [v for row in seqs for v in row]
-            together = list(mha.forward(tensor([B * S, E], flat), B).data)
+            out = mha.forward(tensor([B, S, E], flat))
+            together = list(out.data)
+            check("attention causal=%s rope=%s: output is [B, S, E]" % (causal, rope),
+                  np.array(out.shape), np.array([B, S, E]), atol=0)
 
             check("attention causal=%s rope=%s: batched == per-sequence"
                   % (causal, rope),
@@ -672,7 +675,10 @@ def test_batching():
         for row in ids:
             alone += list(gpt.forward(tensor([S], row)).data)
         flat = [t for row in ids for t in row]
-        together = list(gpt.forward(tensor([B * S], flat), B).data)
+        out = gpt.forward(tensor([B, S], flat))
+        together = list(out.data)
+        check("GPT rope=%s: logits are [B, S, V]" % rope,
+              np.array(out.shape), np.array([B, S, V]), atol=0)
 
         check("GPT rope=%s: batched logits == per-sequence" % rope,
               np.array(together), np.array(alone), atol=1e-4)
@@ -694,8 +700,7 @@ def test_batching():
         t.reset_grad()
     flat = [x for row in ids for x in row]
     tflat = [x for tg in tgts for x in tg]
-    p.cross_entropy_sparse_seq(gpt.forward(tensor([B * S], flat), B),
-                               tflat).backward()
+    p.cross_entropy_sparse_seq(gpt.forward(tensor([B, S], flat)), tflat).backward()
     together = [list(t.grad) for t in gpt.parameters()]
 
     # The two routes multiply matrices of different shapes -- 20 rows at once
@@ -718,14 +723,116 @@ def test_batching():
     check("GPT batched gradients == per-sequence sum / B (rel. to scale)",
           np.array([worst]), np.array([0.0]), atol=1e-5)
 
-    # a batch that does not divide the token count must be refused
+    # int64 ids give exactly what integer-valued float ids give
+    ids64 = p.Tensor([B, S], [float(x) for x in flat], p.int64)
+    check("GPT takes int64 token ids", arr(gpt.forward(ids64)),
+          arr(gpt.forward(tensor([B, S], flat))), atol=0)
+
+    # a 3-D id tensor has no meaning and must be refused
     threw = False
     try:
-        gpt.forward(tensor([S * 3], [1.0] * (S * 3)), 2)
+        gpt.forward(tensor([2, 2, S], [1.0] * (4 * S)))
     except Exception:
         threw = True
-    check("an indivisible batch raises", np.array([1.0 if threw else 0.0]),
+    check("3-D token ids raise", np.array([1.0 if threw else 0.0]),
           np.array([1.0]), atol=0)
+
+
+def unbroadcast(g, shape):
+    """Sum a gradient back down to `shape`: over leading dims it lacks, and
+    over dims where it was broadcast from size 1. What autograd must do."""
+    while g.ndim > len(shape):
+        g = g.sum(axis=0)
+    for i, d in enumerate(shape):
+        if d == 1 and g.shape[i] != 1:
+            g = g.sum(axis=i, keepdims=True)
+    return g
+
+
+def nd_tensor(arr_):
+    t = p.Tensor(list(arr_.shape), [float(v) for v in arr_.reshape(-1)])
+    t.requires_grad = True
+    t.reset_grad()
+    return t
+
+
+def test_nd():
+    print("\n=== n-d: broadcasting, batched matmul, reductions ===\n")
+    rng = np.random.default_rng(3)
+
+    cases = [((3, 4), (4,)), ((4,), (3, 4)), ((2, 3, 4), (3, 1)),
+             ((2, 1, 4), (1, 3, 1)), ((2, 3, 4), (2, 3, 4)), ((5,), (1,))]
+    ops = [("add", p.add, lambda x, y: x + y, lambda g, x, y: (g, g)),
+           ("subtract", p.subtract, lambda x, y: x - y, lambda g, x, y: (g, -g)),
+           ("multiply", p.multiply, lambda x, y: x * y, lambda g, x, y: (g * y, g * x)),
+           ("divide", p.divide, lambda x, y: x / y, lambda g, x, y: (g / y, -g * x / y ** 2))]
+    for sa, sb in cases:
+        A = rng.uniform(-1, 1, sa)
+        Bv = rng.uniform(0.5, 1.5, sb)              # away from 0 for divide
+        for name, fn, ref, dref in ops:
+            a, b = nd_tensor(A), nd_tensor(Bv)
+            out = fn(a, b)
+            want = ref(A, Bv)
+            check("%s %s %s" % (name, list(sa), list(sb)), arr(out), want)
+            # loss = sum(W * out): its gradient is W pushed back through the op
+            W = rng.uniform(-1, 1, want.shape)
+            p.sum(p.multiply(out, nd_tensor(W)), -1).backward()
+            ga, gb = dref(W, np.broadcast_to(A, want.shape), np.broadcast_to(Bv, want.shape))
+            check("  grad a", np.array(a.grad).reshape(sa), unbroadcast(ga, sa))
+            check("  grad b", np.array(b.grad).reshape(sb), unbroadcast(gb, sb))
+
+    threw = False
+    try:
+        p.add(nd_tensor(np.zeros((3, 4))), nd_tensor(np.zeros((3,))))
+    except Exception:
+        threw = True
+    check("incompatible shapes raise", np.array([1.0 if threw else 0.0]), np.array([1.0]), atol=0)
+
+    for sa, sb in [((2, 3, 4), (4, 5)), ((2, 3, 4), (2, 4, 5)),
+                   ((2, 1, 3, 4), (3, 4, 2)), ((3, 4), (2, 4, 5))]:
+        A, Bm = rng.uniform(-1, 1, sa), rng.uniform(-1, 1, sb)
+        a, b = nd_tensor(A), nd_tensor(Bm)
+        out = p.matmul(a, b)
+        want = np.matmul(A, Bm)
+        check("matmul %s @ %s" % (list(sa), list(sb)), arr(out), want)
+        W = rng.uniform(-1, 1, want.shape)
+        p.sum(p.multiply(out, nd_tensor(W)), -1).backward()
+        ga = unbroadcast(np.matmul(W, np.swapaxes(np.broadcast_to(Bm, want.shape[:-2] + Bm.shape[-2:]), -1, -2)), sa)
+        gb = unbroadcast(np.matmul(np.swapaxes(np.broadcast_to(A, want.shape[:-2] + A.shape[-2:]), -1, -2), W), sb)
+        check("  grad a", np.array(a.grad).reshape(sa), ga)
+        check("  grad b", np.array(b.grad).reshape(sb), gb)
+
+    X, Wt = rng.uniform(-1, 1, (3, 5)), rng.uniform(-1, 1, (4, 5))
+    check("matmul by a transpose view == x @ W.T",
+          arr(p.matmul(nd_tensor(X), p.transpose(nd_tensor(Wt)))), X @ Wt.T)
+
+    threw = False
+    try:
+        p.matmul(nd_tensor(np.zeros((3, 4))), nd_tensor(np.zeros((3, 4))))
+    except Exception:
+        threw = True
+    check("mismatched matmul raises (no silent operand swap)",
+          np.array([1.0 if threw else 0.0]), np.array([1.0]), atol=0)
+
+    T = rng.uniform(-1, 1, (2, 3, 4))
+    for dim in (0, 1, 2):
+        check("sum over dim %d" % dim, arr(p.sum(nd_tensor(T), dim)), T.sum(axis=dim))
+        check("mean over dim %d, keepdim" % dim, arr(p.mean(nd_tensor(T), dim, True)),
+              T.mean(axis=dim, keepdims=True))
+    check("sum with dim -1 is everything", arr(p.sum(nd_tensor(T), -1)), np.array([T.sum()]))
+    sm = np.exp(T - T.max(axis=-1, keepdims=True))
+    check("softmax over the last dim of [2,3,4]", arr(p.softmax(nd_tensor(T))),
+          sm / sm.sum(axis=-1, keepdims=True))
+    check("argmax over the last dim of [2,3,4]", arr(p.argmax(nd_tensor(T))),
+          T.argmax(axis=-1).astype(np.float64), atol=0)
+
+    lin = p.Linear(4, 3)
+    Wl, bl = np.array(lin.weights.data).reshape(4, 3), np.array(lin.bias.data)
+    check("Linear on [2, 3, 4] input", arr(lin.forward(nd_tensor(T))), T @ Wl + bl)
+    ln = p.LayerNorm(4)
+    mu, var = T.mean(axis=-1, keepdims=True), T.var(axis=-1, keepdims=True)
+    check("LayerNorm on [2, 3, 4] input", arr(ln.forward(nd_tensor(T))),
+          (T - mu) / np.sqrt(var + 1e-5), atol=1e-5)
 
 
 def flag(b):
@@ -839,6 +946,7 @@ def main():
     test_batching()
     test_views()
     test_dtypes()
+    test_nd()
     test_optimizers()
     test_rmsprop_and_clip()
     test_metrics()

@@ -34,7 +34,7 @@ pair<TensorPtr, TensorPtr> RNN::forward(TensorPtr input, TensorPtr h0){
         auto x_t = rnn_slice_step(input, t);
 
         // h_t = tanh(x_t @ W_x + h_{t-1} @ W_h + bias)
-        auto h_t = tanh_op(broadcast_add(add(matmul(x_t, W_x), matmul(h, W_h)), bias));
+        auto h_t = tanh_op(add(add(matmul(x_t, W_x), matmul(h, W_h)), bias));
 
         steps.push_back(h_t);
 

@@ -1,4 +1,5 @@
 #include "ml/nn/nlp/embedding.hpp"
+#include "ml/ops.hpp"
 #include "ml/autograd.hpp"
 #include <stdexcept>
 #include <string>
@@ -12,15 +13,21 @@ Embedding::Embedding(int vocab_size, int embed_dim)
 }
 
 TensorPtr Embedding::forward(TensorPtr input) {
-    int batch   = input->shape()[0];
-    int seq_len = input->shape()[1];
+    if (input->dim() != 1 && input->dim() != 2)
+        throw runtime_error("Embedding: ids must be [batch, seq] or [seq]");
+    const bool batched = input->dim() == 2;
+    int batch   = batched ? (int)input->shape()[0] : 1;
+    int seq_len = (int)input->shape().back();
+    // exact for any dtype: int64 ids are not rounded through a float
+    const vector<int64_t> ids = index_values(input, "Embedding");
 
-    auto output = make_shared<Tensor>(Shape{batch, seq_len, embed_dim});
+    auto output = batched ? make_shared<Tensor>(Shape{batch, seq_len, embed_dim})
+                          : make_shared<Tensor>(Shape{seq_len, embed_dim});
 
     vector<int> token_ids(batch * seq_len);
     for (int b = 0; b < batch; b++) {
         for (int t = 0; t < seq_len; t++) {
-            int id = static_cast<int>(input->data()[b * seq_len + t]);
+            int id = static_cast<int>(ids[b * seq_len + t]);
             if (id < 0 || id >= vocab_size)
                 throw runtime_error("Embedding: token id " + to_string(id)
                                     + " out of range [0, " + to_string(vocab_size) + ")");

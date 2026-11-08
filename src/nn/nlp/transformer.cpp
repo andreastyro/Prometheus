@@ -15,15 +15,11 @@ TransformerBlock::TransformerBlock(int embed_dim, int num_heads, int ff_dim, boo
 // This is more stable at depth and is the standard for modern language models.
 // FFN uses GELU instead of ReLU — the standard in GPT-2/3/4.
 TensorPtr TransformerBlock::forward(TensorPtr input) {
-    return forward(input, 1);
-}
-
-TensorPtr TransformerBlock::forward(TensorPtr input, int batch) {
-    // Attention sub-layer: x = input + attn(norm1(input))
-    auto x = add(input, attn.forward(norm1.forward(input), batch));
+    // Attention sub-layer: x = input + attn(norm1(input)). Attention reads
+    // the batch from the shape; everything else here is per-token over the
+    // last dimension, so any leading dims pass straight through.
+    auto x = add(input, attn.forward(norm1.forward(input)));
     // FFN sub-layer:       x = x + ff2(gelu(ff1(norm2(x))))
-    // LayerNorm, Linear and GELU are all per-token, so the folded batch needs
-    // no special handling here.
     // The residual is folded into ff2's gemm: one op instead of a gemm, a
     // bias pass and an add pass, each over the full [rows, embed] buffer.
     auto h = gelu(ff1.forward(norm2.forward(x)));

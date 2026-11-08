@@ -121,6 +121,48 @@ int main() {
         check("matmul", [&]{ return matmul(x, m); }, {x, m});
     }
 
+    printf("\n=== n-d: broadcasting, batched matmul, reductions ===\n");
+    {
+        // Every output is weighted by distinct values before the mean, so
+        // each position carries a different gradient. For a broadcast input
+        // that is what proves the sum back over the broadcast dims is right.
+        auto a34 = tin({3, 4}), b4 = tin({4}), w34 = tin({3, 4});
+        check("add [3,4] + [4] (bias)",
+              [&]{ return multiply(add(a34, b4), w34); }, {a34, b4});
+        auto a4 = tin({4});
+        check("subtract [4] - [3,4]",
+              [&]{ return multiply(subtract(a4, a34), w34); }, {a4, a34});
+        auto x234 = tin({2, 3, 4}), y31 = tin({3, 1}), w234 = tin({2, 3, 4});
+        check("multiply [2,3,4] * [3,1]",
+              [&]{ return multiply(multiply(x234, y31), w234); }, {x234, y31});
+        auto d14 = tprob({1, 4});   // denominators safely away from zero
+        check("divide [3,4] / [1,4]",
+              [&]{ return multiply(divide(a34, d14), w34); }, {a34, d14});
+
+        auto m234 = tin({2, 3, 4}), k45 = tin({4, 5}), w235 = tin({2, 3, 5});
+        check("matmul [2,3,4] @ [4,5] (one folded gemm)",
+              [&]{ return multiply(matmul(m234, k45), w235); }, {m234, k45});
+        auto k245 = tin({2, 4, 5});
+        check("matmul [2,3,4] @ [2,4,5] (batched)",
+              [&]{ return multiply(matmul(m234, k245), w235); }, {m234, k245});
+        auto p2134 = tin({2, 1, 3, 4}), q342 = tin({3, 4, 2}), w2332 = tin({2, 3, 3, 2});
+        check("matmul [2,1,3,4] @ [3,4,2] (batch broadcast)",
+              [&]{ return multiply(matmul(p2134, q342), w2332); }, {p2134, q342});
+        auto x35 = tin({3, 5}), W45 = tin({4, 5}), w34b = tin({3, 4});
+        check("matmul by a transpose view (no copy)",
+              [&]{ return multiply(matmul(x35, transpose(W45)), w34b); }, {x35, W45});
+
+        auto w24 = tin({2, 4}), w214 = tin({2, 1, 4}), w34c = tin({3, 4});
+        check("sum over dim 1 of [2,3,4]",
+              [&]{ return multiply(sum(x234, 1), w24); }, {x234});
+        check("mean over dim 1, keepdim",
+              [&]{ return multiply(mean(x234, 1, true), w214); }, {x234});
+        check("sum over dim 0",
+              [&]{ return multiply(sum(x234, 0), w34c); }, {x234});
+        check("softmax over the last dim of [2,3,4]",
+              [&]{ return multiply(softmax(x234), w234); }, {x234});
+    }
+
     printf("\n=== losses ===\n");
     {
         // target must genuinely differ from pred: with pred == target the loss

@@ -26,41 +26,187 @@ TensorPtr checked_input(const char* op, TensorPtr t) {
     return t->is_contiguous() ? t : contiguous(t);
 }
 
+// ── Broadcasting ─────────────────────────────────────────────────────────────
+//
+// Two shapes broadcast when, aligned from the right, each pair of sizes is
+// equal or one of them is 1; a missing leading dimension counts as 1. The
+// result takes the larger size in every position. This is numpy's rule and
+// PyTorch's, so [rows, n] + [n] adds a bias to every row and [b, 1, n] *
+// [m, 1] gives [b, m, n].
 
+static string shape_str(const Shape& s) {
+    string r = "[";
+    for (size_t i = 0; i < s.size(); i++) r += (i ? ", " : "") + to_string(s[i]);
+    return r + "]";
+}
 
-// Element-wise addition: a + b
-TensorPtr add(TensorPtr a, TensorPtr b) {
-    a = checked_input("add", a);
-    b = checked_input("add", b);
-    if (a->shape() == b->shape()){
+Shape broadcast_shapes(const Shape& a, const Shape& b) {
+    const size_t nd = max(a.size(), b.size());
+    Shape out(nd);
+    for (size_t i = 0; i < nd; i++) {
+        const int64_t da = i < nd - a.size() ? 1 : a[i - (nd - a.size())];
+        const int64_t db = i < nd - b.size() ? 1 : b[i - (nd - b.size())];
+        if (da != db && da != 1 && db != 1)
+            throw runtime_error("cannot broadcast shapes " + shape_str(a) + " and " + shape_str(b));
+        out[i] = da == 1 ? db : da;
+    }
+    return out;
+}
 
-        auto result = make_shared<Tensor>(a->shape());
+// Strides that read a contiguous tensor of shape `in` at the positions of
+// `out`: its own row-major strides, and 0 wherever it is being broadcast.
+// The same numbers are its row-major index for each output element, which
+// is what the backward pass needs to sum a gradient back down.
+static Shape broadcast_strides(const Shape& in, const Shape& out) {
+    const size_t nd = out.size(), off = nd - in.size();
+    const Shape rm = Tensor::contiguous_strides(in);
+    Shape st(nd, 0);
+    for (size_t i = off; i < nd; i++)
+        st[i] = in[i - off] == 1 ? 0 : rm[i - off];
+    return st;
+}
 
-        const int n_1 = a->num_el();
-        #pragma omp parallel for schedule(static) if(n_1 >= 32768)
-        for (int i = 0; i < n_1; i++){
-            result->data()[i] = a->data()[i] + b->data()[i];
+// Calls f(i, ia, ib) for every output element: i its row-major index, ia and
+// ib the matching elements of the two inputs. Rows (everything but the last
+// dimension) are independent and run in parallel when `parallel` is set; a
+// caller that scatters into a broadcast input must not set it.
+template <class F>
+static void broadcast_walk(const Shape& out, const Shape& sa, const Shape& sb,
+                          bool parallel, F f) {
+    const int nd = (int)out.size();
+    if (nd == 0) { f(0, 0, 0); return; }
+    const int64_t inner = out[nd - 1];
+    int64_t total = 1;
+    for (int64_t d : out) total *= d;
+    if (total == 0) return;
+    const int rows = (int)(total / inner);
+    const int64_t sai = sa[nd - 1], sbi = sb[nd - 1];
+    #pragma omp parallel for schedule(static) if(parallel && total >= 32768)
+    for (int r = 0; r < rows; r++) {
+        int64_t ia = 0, ib = 0, rr = r;
+        for (int d = nd - 2; d >= 0; d--) {
+            const int64_t i = rr % out[d];
+            rr /= out[d];
+            ia += i * sa[d];
+            ib += i * sb[d];
         }
-
-        if (a->requires_grad() || b->requires_grad()) {
-            auto node = make_node(result, {a, b});
-
-            node->backward_fn = [a, b, result](){
-                const int n_2 = result->num_el();
-                #pragma omp parallel for schedule(static) if(n_2 >= 32768)
-                for (int i = 0; i < n_2; i++){
-                    if (a->requires_grad()) a->grad()[i] += result->grad()[i];
-                    if (b->requires_grad()) b->grad()[i] += result->grad()[i];
-                }
-            };
-        }
-
-        return result;
-
-    } else {
-        throw runtime_error("Tensors must have the same shape for element-wise addition.");
+        const int64_t base = (int64_t)r * inner;
+        for (int64_t j = 0; j < inner; j++)
+            f(base + j, ia + j * sai, ib + j * sbi);
     }
 }
+
+enum class BinOp { Add, Sub, Mul, Div };
+
+template <BinOp OP> static inline float bin_fwd(float x, float y) {
+    if constexpr (OP == BinOp::Add) return x + y;
+    else if constexpr (OP == BinOp::Sub) return x - y;
+    else if constexpr (OP == BinOp::Mul) return x * y;
+    else return x / y;
+}
+// dL/dx and dL/dy for one element, given the upstream gradient g
+template <BinOp OP> static inline float bin_dx(float g, float, float y) {
+    if constexpr (OP == BinOp::Add || OP == BinOp::Sub) return g;
+    else if constexpr (OP == BinOp::Mul) return g * y;
+    else return g / y;
+}
+template <BinOp OP> static inline float bin_dy(float g, float x, float y) {
+    if constexpr (OP == BinOp::Add) return g;
+    else if constexpr (OP == BinOp::Sub) return -g;
+    else if constexpr (OP == BinOp::Mul) return g * x;
+    else return -g * x / (y * y);
+}
+
+template <BinOp OP>
+static TensorPtr binary_op(const char* name, TensorPtr a, TensorPtr b) {
+    a = checked_input(name, a);
+    b = checked_input(name, b);
+    const Shape out_shape = broadcast_shapes(a->shape(), b->shape());
+    const bool same = a->shape() == b->shape();
+
+    if constexpr (OP == BinOp::Div) {
+        const float* Bv = b->data();
+        for (int64_t i = 0; i < b->numel(); i++)
+            if (Bv[i] == 0.0f)
+                throw runtime_error("Division by zero at index " + to_string(i));
+    }
+
+    auto result = make_shared<Tensor>(out_shape);
+    const float* A = a->data();
+    const float* Bv = b->data();
+    float* C = result->data();
+
+    if (same) {
+        const int n = (int)result->numel();
+        #pragma omp parallel for schedule(static) if(n >= 32768)
+        for (int i = 0; i < n; i++) C[i] = bin_fwd<OP>(A[i], Bv[i]);
+    } else {
+        const Shape sa = broadcast_strides(a->shape(), out_shape);
+        const Shape sb = broadcast_strides(b->shape(), out_shape);
+        broadcast_walk(out_shape, sa, sb, true,
+                       [&](int64_t i, int64_t ia, int64_t ib) { C[i] = bin_fwd<OP>(A[ia], Bv[ib]); });
+    }
+
+    if (a->requires_grad() || b->requires_grad()) {
+        auto node = make_node(result, {a, b});
+        node->backward_fn = [a, b, result, same, out_shape]() {
+            const float* G  = result->grad();
+            const float* A  = a->data();
+            const float* Bv = b->data();
+            if (same) {
+                const int n = (int)result->numel();
+                if (a->requires_grad()) {
+                    float* GA = a->grad();
+                    #pragma omp parallel for schedule(static) if(n >= 32768)
+                    for (int i = 0; i < n; i++) GA[i] += bin_dx<OP>(G[i], A[i], Bv[i]);
+                }
+                if (b->requires_grad()) {
+                    float* GB = b->grad();
+                    #pragma omp parallel for schedule(static) if(n >= 32768)
+                    for (int i = 0; i < n; i++) GB[i] += bin_dy<OP>(G[i], A[i], Bv[i]);
+                }
+                return;
+            }
+            // A broadcast input received the same element many times, so its
+            // gradient is the sum over every place it was used. Walking the
+            // output and adding into its index does exactly that; it runs in
+            // parallel only for an input that was not broadcast, where every
+            // output element maps to a different slot.
+            const Shape sa = broadcast_strides(a->shape(), out_shape);
+            const Shape sb = broadcast_strides(b->shape(), out_shape);
+            if (a->requires_grad()) {
+                float* GA = a->grad();
+                broadcast_walk(out_shape, sa, sb, a->shape() == out_shape,
+                               [&](int64_t i, int64_t ia, int64_t ib) {
+                                   GA[ia] += bin_dx<OP>(G[i], A[ia], Bv[ib]); });
+            }
+            if (b->requires_grad()) {
+                float* GB = b->grad();
+                broadcast_walk(out_shape, sa, sb, b->shape() == out_shape,
+                               [&](int64_t i, int64_t ia, int64_t ib) {
+                                   GB[ib] += bin_dy<OP>(G[i], A[ia], Bv[ib]); });
+            }
+        };
+    }
+    return result;
+}
+
+vector<int64_t> index_values(TensorPtr t, const char* op) {
+    auto c = contiguous(t);
+    vector<int64_t> out((size_t)c->numel());
+    const void* base = c->storage()->data();
+    for (int64_t i = 0; i < c->numel(); i++) {
+        const double v = strided::load(base, c->dtype(), c->offset() + i);
+        if (v != std::floor(v))
+            throw runtime_error(string(op) + ": index " + to_string(v) + " is not an integer");
+        out[(size_t)i] = (int64_t)v;
+    }
+    return out;
+}
+
+
+
+TensorPtr add(TensorPtr a, TensorPtr b) { return binary_op<BinOp::Add>("add", a, b); }
 
 // Scalar + tensor
 TensorPtr add(float scalar, TensorPtr a) {
@@ -84,39 +230,7 @@ TensorPtr add(float scalar, TensorPtr a) {
     return result;
 }
 
-// Element-wise multiplication: a * b
-TensorPtr multiply(TensorPtr a, TensorPtr b) {
-    a = checked_input("multiply", a);
-    b = checked_input("multiply", b);
-
-    if (a->shape() == b->shape()){
-
-        auto result = make_shared<Tensor>(a->shape());
-
-        const int n_5 = a->num_el();
-        #pragma omp parallel for schedule(static) if(n_5 >= 32768)
-        for (int i = 0; i < n_5; i++){
-            result->data()[i] = a->data()[i] * b->data()[i];
-        }
-
-        if (a->requires_grad() || b->requires_grad()) {
-            auto node = make_node(result, {a, b});
-            node->backward_fn = [a, b, result](){
-                const int n_6 = result->num_el();
-                #pragma omp parallel for schedule(static) if(n_6 >= 32768)
-                for (int i = 0; i < n_6; i++){
-                    if (a->requires_grad()) a->grad()[i] += b->data()[i] * result->grad()[i];
-                    if (b->requires_grad()) b->grad()[i] += a->data()[i] * result->grad()[i];
-                }
-            };
-        }
-
-        return result;
-
-    } else{
-        throw runtime_error("Tensors must have the same shape for element-wise multiplication.");
-    }
-}
+TensorPtr multiply(TensorPtr a, TensorPtr b) { return binary_op<BinOp::Mul>("multiply", a, b); }
 
 // Scalar * tensor
 TensorPtr multiply(float scalar, TensorPtr a) {
@@ -140,43 +254,98 @@ TensorPtr multiply(float scalar, TensorPtr a) {
     return result;
 }
 
-// Matrix multiplication: a x b
+// a @ b for a [..., m, k] and b [..., k, n].
+//
+// The leading (batch) dimensions broadcast like any other op. When b is a
+// plain matrix -- a weight -- every leading dimension of a folds into the row
+// count and the whole thing is one gemm, which is the case that matters for
+// speed. A b that is the transpose view of a contiguous matrix is multiplied
+// with the transpose as a BLAS flag, so x @ W.transpose() copies nothing.
+//
+// This used to swap the operands when their shapes did not line up, which
+// silently computed b @ a; mismatched shapes now raise.
 TensorPtr matmul(TensorPtr a, TensorPtr b) {
+    if (a->dim() < 2 || b->dim() < 2)
+        throw runtime_error("matmul: operands must be at least 2-D, got " + shape_str(a->shape()) +
+                            " and " + shape_str(b->shape()) + "; reshape a vector to [1, k] or [k, 1]");
+    const int64_t m = a->size(-2), k = a->size(-1), n = b->size(-1);
+    if (b->size(-2) != k)
+        throw runtime_error("matmul: inner dimensions differ: " + shape_str(a->shape()) + " @ " +
+                            shape_str(b->shape()));
+
     a = checked_input("matmul", a);
-    b = checked_input("matmul", b);
 
-    if (a->shape()[1] == b->shape()[0]){
+    if (b->dim() == 2) {
+        // b viewed as W^T for a contiguous W [n, k]: strides [1, k]
+        const bool b_is_wt = !b->is_contiguous() && b->dtype() == DType::Float32 &&
+                             b->strides()[0] == 1 && b->strides()[1] == k;
+        if (!b_is_wt) b = checked_input("matmul", b);
 
-        auto result = make_shared<Tensor>(Shape{a->shape()[0], b->shape()[1]});
+        const int rows = (int)(a->numel() / k);
+        Shape out_shape = a->shape();
+        out_shape.back() = n;
+        auto result = make_shared<Tensor>(out_shape);
+        if (b_is_wt) matmul_forward_bt(rows, (int)n, (int)k, a->data(), b->data(), result->data());
+        else         matmul_forward(rows, (int)n, (int)k, a->data(), b->data(), result->data());
 
-        matmul_forward(a->shape()[0], b->shape()[1], a->shape()[1],
-                       a->data(), b->data(), result->data());
-
-        if (a->requires_grad() || b->requires_grad()){
+        if (a->requires_grad() || b->requires_grad()) {
             auto node = make_node(result, {a, b});
-
-            node->backward_fn = [a, b, result](){
-                int a_rows = a->shape()[0], inner = a->shape()[1], b_cols = b->shape()[1];
-
-                if (a->requires_grad())
-                    matmul_backward_a(a_rows, inner, b_cols,
-                                      result->grad(), b->data(), a->grad());
-
+            node->backward_fn = [a, b, result, rows, n, k, b_is_wt]() {
+                const float* g = result->grad();
+                if (a->requires_grad()) {
+                    if (b_is_wt) matmul_accumulate(rows, (int)k, (int)n, g, b->data(), a->grad());
+                    else matmul_backward_a(rows, (int)k, (int)n, g, b->data(), a->grad());
+                }
+                // b's gradient is row-major over its own [k, n] shape either way
                 if (b->requires_grad())
-                    matmul_backward_b(a_rows, inner, b_cols,
-                                      result->grad(), a->data(), b->grad());
+                    matmul_backward_b(rows, (int)k, (int)n, g, a->data(), b->grad());
             };
         }
-
         return result;
-
-    } else if (b->shape()[1] == a->shape()[0]) {
-        // user passed them in the wrong order, swap and retry
-        return matmul(b, a);
-
-    } else {
-        throw runtime_error("matmul: a.cols must equal b.rows, got " + to_string(a->shape()[1]) + " and " + to_string(b->shape()[0]));
     }
+
+    // batched: one gemm per pair of matrices, batch dims broadcast
+    b = checked_input("matmul", b);
+    const Shape batch_a(a->shape().begin(), a->shape().end() - 2);
+    const Shape batch_b(b->shape().begin(), b->shape().end() - 2);
+    const Shape batch = broadcast_shapes(batch_a, batch_b);
+    Shape out_shape = batch;
+    out_shape.push_back(m);
+    out_shape.push_back(n);
+    auto result = make_shared<Tensor>(out_shape);
+
+    // index of each output matrix's a and b matrices
+    int64_t nb = 1;
+    for (int64_t d : batch) nb *= d;
+    vector<int64_t> ia((size_t)nb), ib((size_t)nb);
+    {
+        const Shape sa = broadcast_strides(batch_a, batch), sb = broadcast_strides(batch_b, batch);
+        if (batch.empty()) { ia[0] = ib[0] = 0; }
+        else broadcast_walk(batch, sa, sb, false,
+                            [&](int64_t i, int64_t x, int64_t y) { ia[i] = x; ib[i] = y; });
+    }
+    const int64_t sz_a = m * k, sz_b = k * n, sz_c = m * n;
+    for (int64_t i = 0; i < nb; i++)
+        matmul_forward((int)m, (int)n, (int)k, a->data() + ia[i] * sz_a, b->data() + ib[i] * sz_b,
+                       result->data() + i * sz_c);
+
+    if (a->requires_grad() || b->requires_grad()) {
+        auto node = make_node(result, {a, b});
+        node->backward_fn = [a, b, result, ia, ib, nb, m, n, k, sz_a, sz_b, sz_c]() {
+            const float* g = result->grad();
+            // serial over the batch: a broadcast operand accumulates from
+            // several output matrices into the same gradient
+            for (int64_t i = 0; i < nb; i++) {
+                if (a->requires_grad())
+                    matmul_backward_a((int)m, (int)k, (int)n, g + i * sz_c, b->data() + ib[i] * sz_b,
+                                      a->grad() + ia[i] * sz_a);
+                if (b->requires_grad())
+                    matmul_backward_b((int)m, (int)k, (int)n, g + i * sz_c, a->data() + ia[i] * sz_a,
+                                      b->grad() + ib[i] * sz_b);
+            }
+        };
+    }
+    return result;
 }
 
 // ReLU activation: max(0, x) for each element
@@ -229,38 +398,7 @@ TensorPtr sigmoid(TensorPtr a) {
     return result;
 }
 
-// Element-wise subtraction: a - b
-TensorPtr subtract(TensorPtr a, TensorPtr b) {
-    a = checked_input("subtract", a);
-    b = checked_input("subtract", b);
-
-    if (a->shape() == b->shape()){
-
-        auto difference = make_shared<Tensor>(a->shape());
-
-        const int n_13 = a->num_el();
-        #pragma omp parallel for schedule(static) if(n_13 >= 32768)
-        for (int i = 0; i < n_13; i++){
-            difference->data()[i] = a->data()[i] - b->data()[i];
-        }
-
-        if (a->requires_grad() || b->requires_grad()) {
-            auto node = make_node(difference, {a, b});
-            node->backward_fn = [a, b, difference]() {
-                const int n_14 = difference->num_el();
-                #pragma omp parallel for schedule(static) if(n_14 >= 32768)
-                for (int i = 0; i < n_14; i++) {
-                    if (a->requires_grad()) a->grad()[i] += difference->grad()[i];
-                    if (b->requires_grad()) b->grad()[i] -= difference->grad()[i];
-                }
-            };
-        }
-
-        return difference;
-    } else{
-        throw runtime_error("Tensors must have the same shape for element-wise subtraction.");
-    }
-}
+TensorPtr subtract(TensorPtr a, TensorPtr b) { return binary_op<BinOp::Sub>("subtract", a, b); }
 
 // Scalar - tensor  (d/da = -1)
 TensorPtr subtract(float scalar, TensorPtr a) {
@@ -306,47 +444,7 @@ TensorPtr subtract(TensorPtr a, float scalar) {
     return result;
 }
 
-// Element-wise division: a / b
-TensorPtr divide(TensorPtr a, TensorPtr b) {
-    a = checked_input("divide", a);
-    b = checked_input("divide", b);
-    if (a->shape() == b->shape()){
-
-        auto result = make_shared<Tensor>(a->shape());
-
-        const int n_19 = a->num_el();
-        #pragma omp parallel for schedule(static) if(n_19 >= 32768)
-        for (int i = 0; i < n_19; i++){
-
-            if (b->data()[i] == 0){
-                int row = i / a->shape()[1];
-                int col = i % a->shape()[1];
-                throw runtime_error("Division by zero at row " + to_string(row) + ", col " + to_string(col));
-            }
-
-            result->data()[i] = a->data()[i] / b->data()[i];
-        }
-
-        if (a->requires_grad() || b->requires_grad()){
-
-            auto node = make_node(result, {a, b});
-
-            node->backward_fn = [a, b, result](){
-                const int n_20 = result->num_el();
-                #pragma omp parallel for schedule(static) if(n_20 >= 32768)
-                for (int i = 0; i < n_20; i++){
-                    if (a->requires_grad()) a->grad()[i] += result->grad()[i] / b->data()[i];
-                    if (b->requires_grad()) b->grad()[i] += -result->grad()[i] * a->data()[i] / (b->data()[i] * b->data()[i]);
-                }
-            };
-        }
-
-        return result;
-
-    } else{
-        throw runtime_error("Tensors must have the same shape for element-wise division.");
-    }
-}
+TensorPtr divide(TensorPtr a, TensorPtr b) { return binary_op<BinOp::Div>("divide", a, b); }
 
 // Scalar / tensor  dL/da = -scalar * result.grad / a^2
 TensorPtr divide(float scalar, TensorPtr a) {
@@ -422,71 +520,51 @@ TensorPtr tanh_op(TensorPtr a) {
     return result;
 }
 
-// Softmax: converts logits to probabilities along each row
+// Softmax over the last dimension, for any rank.
+//
+// Subtracting the row maximum before exponentiating changes nothing
+// mathematically -- softmax(x + c) = softmax(x) -- and keeps every exponent at
+// or below zero. Without it a logit of 90 already overflows to inf and the
+// result is NaN, which attention scores and an untrained output layer reach.
 TensorPtr softmax(TensorPtr a) {
     a = checked_input("softmax", a);
-
+    if (a->dim() < 1) throw runtime_error("softmax: needs at least one dimension");
+    const int64_t cols = a->shape().back();
+    const int rows = (int)(cols ? a->numel() / cols : 0);
     auto result = make_shared<Tensor>(a->shape());
+    const float* A = a->data();
+    float* R = result->data();
 
-    // Subtract the row maximum before exponentiating. softmax(x + c) equals
-    // softmax(x) for any constant c, so this changes nothing mathematically
-    // while keeping every exponent at or below zero.
-    //
-    // Without it exp() overflows to inf and the result is NaN: measured here,
-    // a row whose largest logit was 90 already produced NaN, and attention
-    // scores or an untrained output layer reach that easily. The backward pass
-    // is unaffected, since it is written in terms of the output probabilities.
-    const int cols = a->shape()[1];
-
-    for (int i = 0; i < a->shape()[0]; i++){
-
-        float row_max = a->data()[i * cols];
-        for (int j = 1; j < cols; j++)
-            if (a->data()[i * cols + j] > row_max)
-                row_max = a->data()[i * cols + j];
-
-        float s = 0;
-
-        for (int j = 0; j < cols; j++){
-            result->data()[i * cols + j] = exp(a->data()[i * cols + j] - row_max);
-            s += result->data()[i * cols + j];
-        }
-
-        for (int j = 0; j < cols; j++){
-            result->data()[i * cols + j] = result->data()[i * cols + j] / s;
-        }
+    #pragma omp parallel for schedule(static) if((int64_t)rows * cols >= 32768)
+    for (int i = 0; i < rows; i++) {
+        const float* x = A + (int64_t)i * cols;
+        float* y = R + (int64_t)i * cols;
+        float mx = x[0];
+        for (int64_t j = 1; j < cols; j++) mx = max(mx, x[j]);
+        double total = 0.0;
+        for (int64_t j = 0; j < cols; j++) { y[j] = std::exp(x[j] - mx); total += y[j]; }
+        const float inv = (float)(1.0 / total);
+        for (int64_t j = 0; j < cols; j++) y[j] *= inv;
     }
 
-    if (a->requires_grad()){
-
+    if (a->requires_grad()) {
         auto node = make_node(result, {a});
-        int rows = a->shape()[0], cols = a->shape()[1];
-
-        node->backward_fn = [a, result, cols, rows](){
-
-            Tensor jacobian({cols, cols});
-
-            for (int i = 0; i < rows; i++){
-
-                // fill jacobian for row i
-                for (int j = 0; j < cols; j++){
-                    for (int k = 0; k < cols; k++){
-                        float s_j = result->data()[i * cols + j];
-                        float s_k = result->data()[i * cols + k];
-
-                        jacobian.data()[j * cols + k] = s_j * ((j == k ? 1.0f : 0.0f) - s_k);
-                    }
-                }
-
-                for (int j = 0; j < cols; j++){
-                    for (int k = 0; k < cols; k++){
-                        a->grad()[i * cols + j] += jacobian.data()[j * cols + k] * result->grad()[i * cols + k];
-                    }
-                }
+        node->backward_fn = [a, result, rows, cols]() {
+            // dL/dx_j = y_j * (g_j - sum_k g_k y_k), per row
+            const float* Y = result->data();
+            const float* G = result->grad();
+            float* GA = a->grad();
+            #pragma omp parallel for schedule(static) if((int64_t)rows * cols >= 32768)
+            for (int i = 0; i < rows; i++) {
+                const float* y = Y + (int64_t)i * cols;
+                const float* g = G + (int64_t)i * cols;
+                float dot = 0.0f;
+                for (int64_t j = 0; j < cols; j++) dot += g[j] * y[j];
+                float* ga = GA + (int64_t)i * cols;
+                for (int64_t j = 0; j < cols; j++) ga[j] += y[j] * (g[j] - dot);
             }
         };
     }
-
     return result;
 }
 
@@ -613,146 +691,80 @@ TensorPtr abs_op(TensorPtr a) {
     return result;
 }
 
-// Sum all elements (axis=-1) or along a given axis
-TensorPtr sum(TensorPtr a, int axis) {
-    a = checked_input("sum", a);
+// Reduction over one dimension, or over everything.
+//
+// dim = -1 reduces every element to a [1] tensor -- unlike PyTorch, where -1
+// means the last dimension. Existing code, the gradcheck harness included,
+// relies on -1 meaning "all", and quietly changing it would change numbers
+// without raising. Any other negative dim is refused rather than guessed at.
+static TensorPtr reduce_sum(const char* name, TensorPtr a, int dim, bool keepdim, bool mean) {
+    a = checked_input(name, a);
+    const int nd = a->dim();
 
-    // A 1-D tensor has no shape[1]. Reading it unconditionally was an
-    // out-of-bounds vector access: harmless-looking in release builds, where it
-    // returns whatever follows the shape vector, and caught immediately by a
-    // debug standard library. mean(x, -1) and sum(x, -1) are legitimate on a
-    // 1-D tensor and must not need a column count at all.
-    const int rows = a->shape()[0];
-    const int cols = (a->shape().size() > 1) ? a->shape()[1] : 1;
-    if (axis != -1 && a->shape().size() < 2)
-        throw runtime_error("axis " + to_string(axis) +
-                            " requires a 2-D tensor; this tensor is 1-D");
-
-    // global sum — returns a single value
-    if (axis == -1) {
-        auto result = make_shared<Tensor>(Shape{1});
-        const int n_37 = a->num_el();
-        for (int i = 0; i < n_37; i++)
-            result->data()[0] += a->data()[i];
-
+    if (dim == -1) {
+        Shape out_shape = keepdim ? Shape(max(nd, 1), 1) : Shape{1};
+        auto result = make_shared<Tensor>(out_shape);
+        const int64_t n = a->numel();
+        double acc = 0.0;                       // a float sum of millions drifts
+        const float* A = a->data();
+        for (int64_t i = 0; i < n; i++) acc += A[i];
+        result->data()[0] = (float)(mean ? acc / (double)n : acc);
         if (a->requires_grad()) {
             auto node = make_node(result, {a});
-            node->backward_fn = [a, result]() {
-                const int n_38 = a->num_el();
-                for (int i = 0; i < n_38; i++)
-                    a->grad()[i] += result->grad()[0];  // every element gets the same gradient
+            node->backward_fn = [a, result, n, mean]() {
+                const float g = result->grad()[0] / (mean ? (float)n : 1.0f);
+                float* GA = a->grad();
+                for (int64_t i = 0; i < n; i++) GA[i] += g;
             };
         }
         return result;
-
-    // sum down rows — one sum per column e.g. {2,3} -> {3}
-    } else if (axis == 0) {
-        auto result = make_shared<Tensor>(Shape{cols});
-        for (int i = 0; i < rows; i++)
-            for (int j = 0; j < cols; j++)
-                result->data()[j] += a->data()[i * cols + j];
-
-        if (a->requires_grad()) {
-            auto node = make_node(result, {a});
-            node->backward_fn = [a, result, rows, cols]() {
-                for (int i = 0; i < rows; i++)
-                    for (int j = 0; j < cols; j++)
-                        a->grad()[i * cols + j] += result->grad()[j];  // each element gets its column's gradient
-            };
-        }
-        return result;
-
-    // sum across columns — one sum per row e.g. {2,3} -> {2}
-    } else if (axis == 1) {
-        auto result = make_shared<Tensor>(Shape{rows});
-        for (int i = 0; i < rows; i++)
-            for (int j = 0; j < cols; j++)
-                result->data()[i] += a->data()[i * cols + j];
-
-        if (a->requires_grad()) {
-            auto node = make_node(result, {a});
-            node->backward_fn = [a, result, rows, cols]() {
-                for (int i = 0; i < rows; i++)
-                    for (int j = 0; j < cols; j++)
-                        a->grad()[i * cols + j] += result->grad()[i];  // each element gets its row's gradient
-            };
-        }
-        return result;
-
-    } else {
-        throw runtime_error("Invalid axis " + to_string(axis) + ", must be -1, 0, or 1");
     }
-}
 
-// Mean of all elements (axis=-1) or along a given axis
-TensorPtr mean(TensorPtr a, int axis) {
-    a = checked_input("mean", a);
+    if (dim < 0 || dim >= nd)
+        throw runtime_error(string(name) + ": dim " + to_string(dim) + " is out of range for a " +
+                            to_string(nd) + "-D tensor (-1 reduces everything)");
 
-    // A 1-D tensor has no shape[1]. Reading it unconditionally was an
-    // out-of-bounds vector access: harmless-looking in release builds, where it
-    // returns whatever follows the shape vector, and caught immediately by a
-    // debug standard library. mean(x, -1) and sum(x, -1) are legitimate on a
-    // 1-D tensor and must not need a column count at all.
-    const int rows = a->shape()[0];
-    const int cols = (a->shape().size() > 1) ? a->shape()[1] : 1;
-    if (axis != -1 && a->shape().size() < 2)
-        throw runtime_error("axis " + to_string(axis) +
-                            " requires a 2-D tensor; this tensor is 1-D");
+    // view as [outer, len, inner] and reduce the middle
+    int64_t outer = 1, inner = 1;
+    for (int d = 0; d < dim; d++) outer *= a->shape()[d];
+    for (int d = dim + 1; d < nd; d++) inner *= a->shape()[d];
+    const int64_t len = a->shape()[dim];
 
-    float count;
-    if      (axis == -1) count = (float)a->num_el();
-    else if (axis == 0)  count = (float)rows;
-    else if (axis == 1)  count = (float)cols;
-    else throw runtime_error("Invalid axis " + to_string(axis) + ", must be -1, 0, or 1");
+    Shape out_shape;
+    for (int d = 0; d < nd; d++)
+        if (d != dim) out_shape.push_back(a->shape()[d]);
+        else if (keepdim) out_shape.push_back(1);
+    if (out_shape.empty()) out_shape = {1};
 
-    // compute directly without calling sum to keep a single clean grad node
-    shared_ptr<Tensor> result;
-    if (axis == -1) {
-        result = make_shared<Tensor>(Shape{1});
-        const int n_39 = a->num_el();
-        for (int i = 0; i < n_39; i++)
-            result->data()[0] += a->data()[i];
-        result->data()[0] /= count;
-    } else if (axis == 0) {
-        result = make_shared<Tensor>(Shape{cols});
-        for (int i = 0; i < rows; i++)
-            for (int j = 0; j < cols; j++)
-                result->data()[j] += a->data()[i * cols + j];
-        for (int j = 0; j < cols; j++)
-            result->data()[j] /= count;
-    } else {
-        result = make_shared<Tensor>(Shape{rows});
-        for (int i = 0; i < rows; i++)
-            for (int j = 0; j < cols; j++)
-                result->data()[i] += a->data()[i * cols + j];
-        for (int i = 0; i < rows; i++)
-            result->data()[i] /= count;
-    }
+    auto result = make_shared<Tensor>(out_shape);
+    const float* A = a->data();
+    float* R = result->data();
+    const float scale = mean ? 1.0f / (float)len : 1.0f;
+    for (int64_t o = 0; o < outer; o++)
+        for (int64_t k = 0; k < len; k++) {
+            const float* row = A + (o * len + k) * inner;
+            float* out = R + o * inner;
+            for (int64_t j = 0; j < inner; j++) out[j] += row[j];
+        }
+    if (mean) for (int64_t i = 0; i < result->numel(); i++) R[i] *= scale;
 
     if (a->requires_grad()) {
         auto node = make_node(result, {a});
-
-        node->backward_fn = [a, result, axis, count, rows, cols]() {
-            if (axis == -1) {
-                const int n_40 = a->num_el();
-                for (int i = 0; i < n_40; i++)
-                    a->grad()[i] += result->grad()[0] / count;
-
-            } else if (axis == 0) {
-                for (int i = 0; i < rows; i++)
-                    for (int j = 0; j < cols; j++)
-                        a->grad()[i * cols + j] += result->grad()[j] / count;
-
-            } else if (axis == 1) {
-                for (int i = 0; i < rows; i++)
-                    for (int j = 0; j < cols; j++)
-                        a->grad()[i * cols + j] += result->grad()[i] / count;
-            }
+        node->backward_fn = [a, result, outer, len, inner, scale]() {
+            const float* G = result->grad();
+            float* GA = a->grad();
+            for (int64_t o = 0; o < outer; o++)
+                for (int64_t k = 0; k < len; k++)
+                    for (int64_t j = 0; j < inner; j++)
+                        GA[(o * len + k) * inner + j] += G[o * inner + j] * scale;
         };
     }
-
     return result;
 }
+
+TensorPtr sum(TensorPtr a, int dim, bool keepdim)  { return reduce_sum("sum", a, dim, keepdim, false); }
+
+TensorPtr mean(TensorPtr a, int dim, bool keepdim) { return reduce_sum("mean", a, dim, keepdim, true); }
 
 // Max element — returns a scalar tensor
 // Max element. The gradient reaches only the element that attained the
@@ -834,69 +846,26 @@ TensorPtr clip(TensorPtr a, float min_val, float max_val) {
     return result;
 }
 
-// Broadcast add — adds a 1D bias tensor to every row of a 2D tensor
-// e.g. a={32,64} + b={64} -> {32,64}
-TensorPtr broadcast_add(TensorPtr a, TensorPtr b) {
-    a = checked_input("broadcast_add", a);
-    b = checked_input("broadcast_add", b);
 
-    if (a->shape().size() != 2)
-        throw runtime_error("broadcast_add: 'a' must be a 2D tensor, got " + to_string(a->shape().size()) + "D");
-
-    if (b->shape().size() != 1)
-        throw runtime_error("broadcast_add: 'b' must be a 1D tensor, got " + to_string(b->shape().size()) + "D");
-
-    if (b->shape()[0] != a->shape()[1])
-        throw runtime_error("broadcast_add: 'b' size " + to_string(b->shape()[0]) +
-                            " must match a's columns " + to_string(a->shape()[1]));
-
-    auto result = make_shared<Tensor>(a->shape());
-
-    for (int i = 0; i < a->shape()[0]; i++){
-        for (int j = 0; j < a->shape()[1]; j++){
-            result->data()[i * a->shape()[1] + j] = a->data()[i * a->shape()[1] + j] + b->data()[j];
-        }
-    }
-
-    if (a->requires_grad() || b->requires_grad()) {
-        auto node = make_node(result, {a, b});
-        node->backward_fn = [a, b, result]() {
-            int rows = a->shape()[0], cols = a->shape()[1];
-
-            for (int i = 0; i < rows; i++) {
-                for (int j = 0; j < cols; j++) {
-                    if (a->requires_grad())
-                        a->grad()[i * cols + j] += result->grad()[i * cols + j];
-
-                    if (b->requires_grad())
-                        b->grad()[j] += result->grad()[i * cols + j];  // accumulate over all rows
-                }
-            }
-        };
-    }
-
-    return result;
-}
-
-// Argmax — returns a 1D tensor of class indices, one per row
+// Index of the largest value along the last dimension, for any rank. The
+// result drops that dimension ([rows, cols] -> [rows]) and holds the indices
+// as float32, which is what every caller here reads.
 TensorPtr argmax(TensorPtr a) {
     a = checked_input("argmax", a);
-    int rows = a->shape()[0];
-    int cols = a->shape()[1];
-    auto result = make_shared<Tensor>(Shape{rows});
-
-    for (int i = 0; i < rows; i++){
-        int best = 0;
-        float max_val = a->data()[i * cols];
-        for (int j = 1; j < cols; j++){
-            if (a->data()[i * cols + j] > max_val){
-                max_val = a->data()[i * cols + j];
-                best = j;
-            }
-        }
+    if (a->dim() < 1) throw runtime_error("argmax: needs at least one dimension");
+    const int64_t cols = a->shape().back();
+    const int64_t rows = cols ? a->numel() / cols : 0;
+    Shape out_shape(a->shape().begin(), a->shape().end() - 1);
+    if (out_shape.empty()) out_shape = {1};
+    auto result = make_shared<Tensor>(out_shape);
+    const float* A = a->data();
+    for (int64_t i = 0; i < rows; i++) {
+        const float* x = A + i * cols;
+        int64_t best = 0;
+        for (int64_t j = 1; j < cols; j++)
+            if (x[j] > x[best]) best = j;
         result->data()[i] = (float)best;
     }
-
     return result;
 }
 
@@ -1176,16 +1145,20 @@ TensorPtr linear_op(TensorPtr x, TensorPtr W, TensorPtr bias, TensorPtr residual
     bias = checked_input("linear_op", bias);
     residual = checked_input("linear_op", residual);
 
-    if (x->shape().size() != 2 || W->shape().size() != 2 || x->shape()[1] != W->shape()[0])
-        throw runtime_error("linear_op: x must be [rows, in] and W [in, out]");
-    const int rows = x->shape()[0], in = x->shape()[1], out = W->shape()[1];
+    if (x->dim() < 1 || W->dim() != 2 || x->shape().back() != W->shape()[0])
+        throw runtime_error("linear_op: x must be [..., in] and W [in, out], got " +
+                            shape_str(x->shape()) + " and " + shape_str(W->shape()));
+    const int in = (int)W->shape()[0], out = (int)W->shape()[1];
+    const int rows = (int)(x->numel() / in);
+    Shape out_shape = x->shape();
+    out_shape.back() = out;
     if (bias && bias->num_el() != out)
         throw runtime_error("linear_op: bias must have " + to_string(out) + " elements");
-    if (residual && (residual->shape().size() != 2 || residual->shape()[0] != rows
-                                                  || residual->shape()[1] != out))
-        throw runtime_error("linear_op: residual must be [rows, out]");
+    if (residual && residual->shape() != out_shape)
+        throw runtime_error("linear_op: residual must be " + shape_str(out_shape) +
+                            ", got " + shape_str(residual->shape()));
 
-    auto result = make_shared<Tensor>(Shape{rows, out});
+    auto result = make_shared<Tensor>(out_shape);
     float* y = result->data();
     const float* rd = residual ? residual->data() : nullptr;
     const float* bd = bias ? bias->data() : nullptr;

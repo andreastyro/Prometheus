@@ -1,4 +1,5 @@
 #include "ml/nn/nlp/gpt.hpp"
+#include "ml/ops.hpp"
 #include "ml/autograd.hpp"
 #include "ml/matmul_backend.hpp"
 #include <cmath>
@@ -89,17 +90,13 @@ GPT::GPT(int vocab_size, int max_seq_len, int embed_dim,
 }
 
 TensorPtr GPT::forward(TensorPtr token_ids) {
-    return forward(token_ids, 1);
-}
-
-TensorPtr GPT::forward(TensorPtr token_ids, int batch) {
-    int total = token_ids->num_el();
-    if (batch <= 0 || total % batch != 0)
-        throw runtime_error("GPT::forward: token count " + to_string(total)
-                            + " is not divisible by batch " + to_string(batch));
-
-    const int B = batch;
-    const int S = total / B;
+    if (token_ids->dim() != 1 && token_ids->dim() != 2)
+        throw runtime_error("GPT::forward: token ids must be [batch, seq] or [seq]");
+    const bool batched = token_ids->dim() == 2;
+    const int B = batched ? (int)token_ids->size(0) : 1;
+    const int S = (int)token_ids->size(-1);
+    // exact for any dtype: int64 ids are not rounded through a float
+    const vector<int64_t> ids = index_values(token_ids, "GPT::forward");
     int E = embed_dim_;
     int V = vocab_size_;
 
@@ -111,11 +108,11 @@ TensorPtr GPT::forward(TensorPtr token_ids, int batch) {
     // Out[b, t, d] = tok_emb.weight[tok_id, d] + pos_emb.weight[t, d]
     // Position restarts at every sequence, so pos_emb is indexed by t, not by
     // the folded row.
-    auto x = make_shared<Tensor>(Shape{B * S, E});
+    auto x = batched ? make_shared<Tensor>(Shape{B, S, E}) : make_shared<Tensor>(Shape{S, E});
     vector<int> tok_ids(B * S);
     for (int r = 0; r < B * S; r++) {
         const int t = r % S;
-        tok_ids[r] = (int)token_ids->data()[r];
+        tok_ids[r] = (int)ids[r];
         int tid    = tok_ids[r];
         if (tid < 0 || tid >= V)
             throw runtime_error("GPT: token id " + to_string(tid) + " out of range");
@@ -143,7 +140,7 @@ TensorPtr GPT::forward(TensorPtr token_ids, int batch) {
 
     // ── Transformer blocks ────────────────────────────────────────────────────
     for (auto& blk : blocks)
-        x = blk.forward(x, B);
+        x = blk.forward(x);
 
     // ── Final LayerNorm ───────────────────────────────────────────────────────
     x = ln_f.forward(x);
@@ -153,7 +150,8 @@ TensorPtr GPT::forward(TensorPtr token_ids, int batch) {
     //              = x @ tok_emb.weight^T,   tok_emb.weight [V, E]
     // Implemented as: logits = x @ W_T  where W_T = tok_emb.weight^T [E, V]
     const int rows = B * S;
-    auto logits = make_shared<Tensor>(Shape{rows, V});
+    auto logits = batched ? make_shared<Tensor>(Shape{B, S, V})
+                          : make_shared<Tensor>(Shape{S, V});
 
     auto tw = tok_emb.weight;
 

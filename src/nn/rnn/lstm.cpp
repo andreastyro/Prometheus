@@ -40,13 +40,13 @@ tuple<TensorPtr, TensorPtr, TensorPtr> LSTM::forward(TensorPtr input, TensorPtr 
         auto x_t = rnn_slice_step(input, t);
 
         // i_t = sigmoid(x_t @ W_xi + h @ W_hi + b_i)
-        auto i_t = sigmoid(broadcast_add(add(matmul(x_t, W_xi), matmul(h, W_hi)), b_i));
+        auto i_t = sigmoid(add(add(matmul(x_t, W_xi), matmul(h, W_hi)), b_i));
         // f_t = sigmoid(x_t @ W_xf + h @ W_hf + b_f)
-        auto f_t = sigmoid(broadcast_add(add(matmul(x_t, W_xf), matmul(h, W_hf)), b_f));
+        auto f_t = sigmoid(add(add(matmul(x_t, W_xf), matmul(h, W_hf)), b_f));
         // o_t = sigmoid(x_t @ W_xo + h @ W_ho + b_o)
-        auto o_t = sigmoid(broadcast_add(add(matmul(x_t, W_xo), matmul(h, W_ho)), b_o));
+        auto o_t = sigmoid(add(add(matmul(x_t, W_xo), matmul(h, W_ho)), b_o));
         // g_t = tanh(x_t @ W_xg + h @ W_hg + b_g)
-        auto g_t = tanh_op(broadcast_add(add(matmul(x_t, W_xg), matmul(h, W_hg)), b_g));
+        auto g_t = tanh_op(add(add(matmul(x_t, W_xg), matmul(h, W_hg)), b_g));
 
         // c_t = f_t * c + i_t * g_t
         c = add(multiply(f_t, c), multiply(i_t, g_t));

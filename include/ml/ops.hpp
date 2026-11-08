@@ -58,10 +58,10 @@ TensorPtr abs_op(TensorPtr a);
 
 /// Sum along an axis. axis=-1 reduces all elements to a scalar.
 /// axis=0 sums across rows; axis=1 sums across columns.
-TensorPtr sum(TensorPtr a, int axis = -1);
+TensorPtr sum(TensorPtr a, int dim = -1, bool keepdim = false);
 
 /// Mean along an axis. axis=-1 averages all elements to a scalar.
-TensorPtr mean(TensorPtr a, int axis = -1);
+TensorPtr mean(TensorPtr a, int dim = -1, bool keepdim = false);
 
 /// Single maximum value across all elements.
 TensorPtr max_op(TensorPtr a);
@@ -73,9 +73,6 @@ TensorPtr min_op(TensorPtr a);
 /// Gradient passes through where value was not clamped, zero otherwise.
 TensorPtr clip(TensorPtr a, float min_val, float max_val);
 
-/// Add a 1D bias to every row of a 2D tensor.
-/// a: [batch, features]  b: [features]  ->  [batch, features]
-TensorPtr broadcast_add(TensorPtr a, TensorPtr b);
 
 /// Returns a tensor where each value is the index of the max along the last axis.
 /// Used to convert softmax output into class predictions.
@@ -133,3 +130,10 @@ TensorPtr contiguous(TensorPtr a);
 /// materialise a non-contiguous view, and raise for a dtype or device the
 /// kernels cannot read. Exposed for kernels outside ops.cpp.
 TensorPtr checked_input(const char* op, TensorPtr t);
+
+/// The shape two shapes broadcast to (numpy's rule), or raise.
+Shape broadcast_shapes(const Shape& a, const Shape& b);
+
+/// The integer values of an index tensor -- token ids, class labels -- for
+/// any dtype, exactly. A float holding a non-integer raises.
+std::vector<int64_t> index_values(TensorPtr t, const char* op);

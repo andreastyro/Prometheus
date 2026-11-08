@@ -46,12 +46,8 @@ public:
     // rope:   if true, use Rotary Position Embedding in the attention layer
     TransformerBlock(int embed_dim, int num_heads, int ff_dim, bool causal = false, bool rope = false);
 
+    /// input is [batch, seq, embed] or [seq, embed]; the result has its shape.
     TensorPtr forward(TensorPtr input) override;
-
-    /// Batched forward. input is [batch * seq, embed]; the batch is passed
-    /// through to attention, which is the only sub-layer that must not look
-    /// across a sequence boundary. Everything else here is per-token.
-    TensorPtr forward(TensorPtr input, int batch);
 
     // Collects parameters from attn, norm1, norm2, ff1, ff2 (12 tensors total)
     std::vector<TensorPtr> parameters() override;

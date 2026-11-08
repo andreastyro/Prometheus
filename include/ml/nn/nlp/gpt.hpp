@@ -39,8 +39,9 @@ struct KVCache {
 // inside each attention head. pos_emb is still allocated but not used — set
 // rope=true to discard it from the parameter count too.
 //
-// forward() input:  flat TensorPtr of shape [seq_len] with float-encoded token IDs
-// forward() output: [seq_len, vocab_size] raw logits (feed to cross_entropy_sparse_seq)
+// forward() input:  token ids [batch, seq] or [seq], int64 (or integer-valued float32)
+// forward() output: logits [batch, seq, vocab_size] or [seq, vocab_size]
+//                   (feed to cross_entropy_sparse_seq)
 //
 // forward_cached() processes one token at a time using a KVCache for O(n) inference.
 class GPT : public Module {
@@ -62,20 +63,14 @@ public:
     GPT(int vocab_size, int max_seq_len, int embed_dim,
         int num_heads, int num_layers, int ff_dim = 0, bool rope = false);
 
-    // Full-sequence training forward. Returns [seq_len, vocab_size] logits.
-    TensorPtr forward(TensorPtr token_ids) override;
-
-    /// Batched forward.
-    ///
-    /// token_ids is [batch, seq] (or [batch * seq] with batch given), and the
-    /// result is [batch * seq, vocab_size] -- the batch folded into the row
-    /// dimension, which is the layout cross_entropy_sparse_seq already takes.
+    /// Training forward. token_ids is [batch, seq] or [seq]; the result is
+    /// [batch, seq, vocab_size] or [seq, vocab_size].
     ///
     /// Batching is what makes the matmuls large enough to be worth splitting
     /// across cores: a single sequence at width 384 gives 384x384 products,
     /// too small to parallelise, while a batch of 32 gives the same weights
     /// 32x the rows of work per call.
-    TensorPtr forward(TensorPtr token_ids, int batch);
+    TensorPtr forward(TensorPtr token_ids) override;
 
     // Incremental inference forward — processes one token, updates cache.
     // Returns [vocab_size] logits for the new position.

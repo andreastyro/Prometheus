@@ -36,11 +36,11 @@ pair<TensorPtr, TensorPtr> GRU::forward(TensorPtr input, TensorPtr h0) {
         auto x_t = rnn_slice_step(input, t);
 
         // r_t = sigmoid(x_t @ W_xr + h @ W_hr + b_r)
-        auto r_t = sigmoid(broadcast_add(add(matmul(x_t, W_xr), matmul(h, W_hr)), b_r));
+        auto r_t = sigmoid(add(add(matmul(x_t, W_xr), matmul(h, W_hr)), b_r));
         // z_t = sigmoid(x_t @ W_xz + h @ W_hz + b_z)
-        auto z_t = sigmoid(broadcast_add(add(matmul(x_t, W_xz), matmul(h, W_hz)), b_z));
+        auto z_t = sigmoid(add(add(matmul(x_t, W_xz), matmul(h, W_hz)), b_z));
         // n_t = tanh(x_t @ W_xn + (r_t * h) @ W_hn + b_n)
-        auto n_t = tanh_op(broadcast_add(add(matmul(x_t, W_xn), matmul(multiply(r_t, h), W_hn)), b_n));
+        auto n_t = tanh_op(add(add(matmul(x_t, W_xn), matmul(multiply(r_t, h), W_hn)), b_n));
         // h_t = (1 - z_t) * n_t + z_t * h
         h = add(multiply(subtract(1.0f, z_t), n_t), multiply(z_t, h));
 
