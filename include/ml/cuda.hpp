@@ -63,4 +63,23 @@ void launch(const Kernel& k, unsigned grid_x, unsigned grid_y, unsigned grid_z,
             unsigned block_x, unsigned block_y, unsigned block_z,
             unsigned shared_bytes, void** args);
 
+// ── cuBLAS ───────────────────────────────────────────────────────────────────
+//
+// Loaded like NVRTC (pip install nvidia-cublas-cu12). Row-major interface:
+// C[m, n] = alpha * op(A) @ op(B) + beta * C, where op(A) is m x k and lda /
+// ldb / ldc are row strides, as in gemm_serial. The column-major library is
+// driven with the operands swapped, which is the same product transposed.
+
+bool blas_available();
+/// Why cuBLAS cannot be used, or the library loaded.
+std::string blas_status();
+
+void sgemm(bool trans_a, bool trans_b, int m, int n, int k, float alpha,
+           const float* a, int lda, const float* b, int ldb, float beta, float* c, int ldc);
+/// `batch` products, the i-th using a + i*stride_a, b + i*stride_b, c + i*stride_c.
+void sgemm_batched(bool trans_a, bool trans_b, int m, int n, int k, float alpha,
+                   const float* a, int lda, long long stride_a,
+                   const float* b, int ldb, long long stride_b, float beta,
+                   float* c, int ldc, long long stride_c, int batch);
+
 } // namespace cuda

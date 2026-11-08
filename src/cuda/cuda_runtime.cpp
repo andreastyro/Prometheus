@@ -413,6 +413,92 @@ void synchronize() {
     check(g.d.cuCtxSynchronize(), "cuCtxSynchronize");
 }
 
+// ── cuBLAS ───────────────────────────────────────────────────────────────────
+
+namespace {
+using cublasHandle_t = void*;
+struct Cublas {
+    int (*create)(cublasHandle_t*);
+    int (*sgemm)(cublasHandle_t, int, int, int, int, int, const float*, const float*, int,
+                 const float*, int, const float*, float*, int);
+    int (*sgemm_batched)(cublasHandle_t, int, int, int, int, int, const float*, const float*, int,
+                         long long, const float*, int, long long, const float*, float*, int,
+                         long long, int);
+};
+Cublas         g_blas{};
+cublasHandle_t g_handle = nullptr;
+bool           g_blas_tried = false, g_blas_ok = false;
+string         g_blas_why;
+
+void init_blas_locked() {
+    if (g_blas_tried) return;
+    g_blas_tried = true;
+    init_locked();
+    if (!g.ok) { g_blas_why = g.why; return; }
+#ifdef _WIN32
+    void* lib = open_first({"cublas64_12.dll", "cublas64_13.dll", "cublas64_11.dll"});
+#else
+    void* lib = open_first({"libcublas.so.12", "libcublas.so.13", "libcublas.so.11", "libcublas.so"});
+#endif
+    if (!lib) { g_blas_why = "cuBLAS not found; pip install nvidia-cublas-cu12"; return; }
+    if (!bind(lib, g_blas.create, "cublasCreate_v2") || !bind(lib, g_blas.sgemm, "cublasSgemm_v2") ||
+        !bind(lib, g_blas.sgemm_batched, "cublasSgemmStridedBatched")) {
+        g_blas_why = "cuBLAS is missing an entry point";
+        return;
+    }
+    // the handle belongs to the current context
+    if (g.d.cuCtxSetCurrent(g.ctx) != 0 || g_blas.create(&g_handle) != 0) {
+        g_blas_why = "cublasCreate failed";
+        return;
+    }
+    g_blas_ok = true;
+}
+
+cublasHandle_t blas_handle() {
+    bind_context();
+    lock_guard<mutex> lock(g_mu);
+    init_blas_locked();
+    if (!g_blas_ok) throw runtime_error("cuda: matmul needs cuBLAS: " + g_blas_why);
+    return g_handle;
+}
+
+void check_blas(int status, const char* what) {
+    if (status != 0) throw runtime_error(string("cuBLAS ") + what + " failed with status " + to_string(status));
+}
+} // namespace
+
+bool blas_available() {
+    if (!available()) return false;
+    lock_guard<mutex> lock(g_mu);
+    init_blas_locked();
+    return g_blas_ok;
+}
+
+string blas_status() {
+    if (!available()) return "unavailable: " + state().why;
+    lock_guard<mutex> lock(g_mu);
+    init_blas_locked();
+    return g_blas_ok ? "cuBLAS loaded" : "unavailable: " + g_blas_why;
+}
+
+// Row-major C = op(A) op(B) is column-major C^T = op(B)^T op(A)^T: the same
+// call with the operands, their flags and m / n swapped.
+void sgemm(bool ta, bool tb, int m, int n, int k, float alpha, const float* a, int lda,
+           const float* b, int ldb, float beta, float* c, int ldc) {
+    if (m == 0 || n == 0) return;
+    auto h = blas_handle();
+    check_blas(g_blas.sgemm(h, tb ? 1 : 0, ta ? 1 : 0, n, m, k, &alpha, b, ldb, a, lda, &beta, c, ldc), "sgemm");
+}
+
+void sgemm_batched(bool ta, bool tb, int m, int n, int k, float alpha, const float* a, int lda,
+                   long long sa, const float* b, int ldb, long long sb, float beta, float* c, int ldc,
+                   long long sc, int batch) {
+    if (m == 0 || n == 0 || batch == 0) return;
+    auto h = blas_handle();
+    check_blas(g_blas.sgemm_batched(h, tb ? 1 : 0, ta ? 1 : 0, n, m, k, &alpha, b, ldb, sb, a, lda, sa,
+                                    &beta, c, ldc, sc, batch), "sgemm (batched)");
+}
+
 void launch(const Kernel& k, int64_t n, void** args, unsigned block) {
     if (n <= 0) return;
     const int64_t grid = (n + block - 1) / block;

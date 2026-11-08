@@ -306,6 +306,7 @@ TensorPtr matmul(TensorPtr a, TensorPtr b) {
 
     a = autocast_input(a);
     b = autocast_input(b);
+    if (a->device() == Device::CUDA || b->device() == Device::CUDA) return cuda_ops::matmul(a, b);
     if (auto r = dispatch::matmul(a, b, [](TensorPtr x, TensorPtr y) { return matmul(x, y); })) return r;
     a = checked_input("matmul", a);
 
@@ -945,6 +946,7 @@ TensorPtr mean(TensorPtr a, int dim, bool keepdim) { return reduce_sum("mean", a
 // maximum; every other element has no influence on the result. Ties go to the
 // first occurrence, matching the forward scan.
 TensorPtr max_op(TensorPtr a) {
+    if (a->device() == Device::CUDA) return cuda_ops::extreme("max_op", a, true);
     if (auto r = dispatch::extreme("max_op", a, true, nullptr)) return r;
     a = checked_input("max_op", a);
     auto result = make_shared<Tensor>(Shape{1});
@@ -975,6 +977,7 @@ TensorPtr max_op(TensorPtr a) {
 // Min element — returns a scalar tensor
 // Min element — mirror of max_op, gradient reaches only the arg-min.
 TensorPtr min_op(TensorPtr a) {
+    if (a->device() == Device::CUDA) return cuda_ops::extreme("min_op", a, false);
     if (auto r = dispatch::extreme("min_op", a, false, nullptr)) return r;
     a = checked_input("min_op", a);
     auto result = make_shared<Tensor>(Shape{1});
@@ -1052,6 +1055,7 @@ TensorPtr clip(TensorPtr a, float min_val, float max_val) {
 // result drops that dimension ([rows, cols] -> [rows]) and holds the indices
 // as float32, which is what every caller here reads.
 TensorPtr argmax(TensorPtr a) {
+    if (a->device() == Device::CUDA) return cuda_ops::argmax(a);
     if (auto r = dispatch::argmax(a)) return r;
     a = checked_input("argmax", a);
     if (a->dim() < 1) throw runtime_error("argmax: needs at least one dimension");
@@ -1135,6 +1139,8 @@ TensorPtr gelu(TensorPtr a) {
 }
 
 TensorPtr concat_op(vector<TensorPtr> inputs, int axis) {
+    for (auto& t : inputs)
+        if (t && t->device() == Device::CUDA) return cuda_ops::concat(inputs, axis);
     if (auto r = dispatch::concat(inputs, axis, [](vector<TensorPtr> v, int ax) { return concat_op(v, ax); }))
         return r;
     for (auto& t_ : inputs) t_ = checked_input("concat_op", t_);
@@ -1229,7 +1235,8 @@ TensorPtr concat_op(vector<TensorPtr> inputs, int axis) {
 TensorPtr matmul_bt(TensorPtr a, TensorPtr b) {
     a = autocast_input(a);
     b = autocast_input(b);
-    if (a->dtype() != DType::Float32 || b->dtype() != DType::Float32)
+    if (a->dtype() != DType::Float32 || b->dtype() != DType::Float32 ||
+        a->device() == Device::CUDA || b->device() == Device::CUDA)
         return matmul(a, transpose(b));
     a = checked_input("matmul_bt", a);
     b = checked_input("matmul_bt", b);
@@ -1427,7 +1434,7 @@ TensorPtr linear_op(TensorPtr x, TensorPtr W, TensorPtr bias, TensorPtr residual
     {
         bool all32 = true;
         for (auto* t : {&x, &W, &bias, &residual})
-            all32 = all32 && (!*t || (*t)->dtype() == DType::Float32);
+            all32 = all32 && (!*t || ((*t)->dtype() == DType::Float32 && (*t)->device() == Device::CPU));
         if (!all32) {        // any other dtype: the same op composed, which routes by dtype
             auto y = matmul(x, W);
             if (bias) y = add(y, bias);
@@ -1632,6 +1639,7 @@ static void check_indices(const vector<int64_t>& idx, int64_t n, const char* op)
 }
 
 TensorPtr gather_flat(TensorPtr x, shared_ptr<const vector<int64_t>> idx, ShapeArg out_shape) {
+    if (x->device() == Device::CUDA) return cuda_ops::gather(x, idx, out_shape);
     if (auto r = dispatch::gather(x, idx, out_shape)) return r;
     x = checked_input("gather_flat", x);
     auto result = make_shared<Tensor>(out_shape);
@@ -1666,6 +1674,7 @@ TensorPtr gather_flat(TensorPtr x, shared_ptr<const vector<int64_t>> idx, ShapeA
 }
 
 TensorPtr scatter_add_flat(TensorPtr g, shared_ptr<const vector<int64_t>> idx, ShapeArg out_shape) {
+    if (g->device() == Device::CUDA) return cuda_ops::scatter_add(g, idx, out_shape);
     if (auto r = dispatch::scatter_add(g, idx, out_shape)) return r;
     g = checked_input("scatter_add_flat", g);
     if ((int64_t)idx->size() != g->numel())

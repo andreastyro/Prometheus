@@ -7,6 +7,7 @@
 // keep in step with the forward, and the gradients are differentiable again.
 #include "../ops_internal.hpp"
 #include "ml/cuda.hpp"
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -504,6 +505,280 @@ void fill(void* dst, int64_t n, float value) {
     long long nn = n;
     void* args[] = {&p, &nn, &value};
     cuda::launch(K("k_fill", CAST_SRC()), nn, args);
+}
+
+} // namespace cuda_ops
+
+// ── indexing: extremes, argmax, gather / scatter, concatenation ──────────────
+
+namespace {
+
+const string& INDEX_SRC() {
+    static const string s = src(R"(
+// is (v, i) better than (bv, bi)? ties go to the lower index, as on the CPU
+__device__ bool better(float v, long long i, float bv, long long bi, int is_max) {
+    if (i < 0) return false;
+    if (bi < 0) return true;
+    if (v == bv) return i < bi;
+    return is_max ? v > bv : v < bv;
+}
+// arg max / min of n values; one block
+extern "C" __global__ void i_extreme(const float* a, long long n, int is_max, long long* out) {
+    __shared__ float sv[1024];
+    __shared__ long long si[1024];
+    float bv = 0.0f; long long bi = -1;
+    for (long long i = threadIdx.x; i < n; i += blockDim.x)
+        if (better(a[i], i, bv, bi, is_max)) { bv = a[i]; bi = i; }
+    sv[threadIdx.x] = bv; si[threadIdx.x] = bi;
+    __syncthreads();
+    for (int w = blockDim.x / 2; w > 0; w >>= 1) {
+        if (threadIdx.x < w && better(sv[threadIdx.x + w], si[threadIdx.x + w], sv[threadIdx.x], si[threadIdx.x], is_max)) {
+            sv[threadIdx.x] = sv[threadIdx.x + w]; si[threadIdx.x] = si[threadIdx.x + w];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[0] = si[0];
+}
+// index of the largest value in each row; one block per row; float32 out
+extern "C" __global__ void i_argmax_rows(const float* a, long long cols, float* out) {
+    __shared__ float sv[256];
+    __shared__ long long si[256];
+    const float* x = a + (long long)blockIdx.x * cols;
+    float bv = 0.0f; long long bi = -1;
+    for (long long j = threadIdx.x; j < cols; j += blockDim.x)
+        if (better(x[j], j, bv, bi, 1)) { bv = x[j]; bi = j; }
+    sv[threadIdx.x] = bv; si[threadIdx.x] = bi;
+    __syncthreads();
+    for (int w = blockDim.x / 2; w > 0; w >>= 1) {
+        if (threadIdx.x < w && better(sv[threadIdx.x + w], si[threadIdx.x + w], sv[threadIdx.x], si[threadIdx.x], 1)) {
+            sv[threadIdx.x] = sv[threadIdx.x + w]; si[threadIdx.x] = si[threadIdx.x + w];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[blockIdx.x] = (float)si[0];
+}
+// y[i] = x[idx[i]], any element size; a negative index reads as zero
+extern "C" __global__ void i_gather(const unsigned char* x, const long long* idx, unsigned char* y,
+                                    long long n, int es) {
+    long long i = gid(); if (i >= n) return;
+    long long j = idx[i];
+    for (int b = 0; b < es; b++) y[i * es + b] = j < 0 ? 0 : x[j * es + b];
+}
+// y[idx[i]] += g[i]; an index can repeat, hence the atomic
+extern "C" __global__ void i_scatter_add(const float* g, const long long* idx, float* y, long long n) {
+    long long i = gid(); if (i >= n) return;
+    long long j = idx[i];
+    if (j >= 0) atomicAdd(&y[j], g[i]);
+}
+// one input's slab of a concatenation viewed as [outer, total, inner]
+extern "C" __global__ void i_slab(const unsigned char* src, unsigned char* dst, long long outer,
+                                  long long span, long long row, long long offset, int es) {
+    long long i = gid(); if (i >= outer * span) return;
+    long long o = i / span, j = i % span;
+    for (int b = 0; b < es; b++) dst[(o * row + offset + j) * es + b] = src[i * es + b];
+}
+)");
+    return s;
+}
+
+TensorPtr upload_indices(const shared_ptr<const vector<int64_t>>& idx) {
+    auto t = make_shared<Tensor>(Shape{(int64_t)idx->size()}, DType::Int64);
+    if (!idx->empty()) memcpy(t->storage()->data(), idx->data(), idx->size() * sizeof(int64_t));
+    return t->to(Device::CUDA);
+}
+
+TensorPtr contiguous_on_device(const TensorPtr& t) { return t->is_contiguous() ? t : contiguous(t); }
+
+} // namespace
+
+namespace cuda_ops {
+
+TensorPtr extreme(const char* name, const TensorPtr& a0, bool is_max) {
+    auto a = contiguous_on_device(f32(a0, name));
+    if (a->numel() == 0) throw runtime_error(string(name) + ": empty tensor");
+    auto where_t = empty_cuda({1}, DType::Int64);
+    const void* pa = base(a);
+    void* pi = where_t->storage()->data();
+    long long n = a->numel();
+    int mx = is_max ? 1 : 0;
+    void* args[] = {&pa, &n, &mx, &pi};
+    cuda::launch(K("i_extreme", INDEX_SRC()), 1, 1, 1, 1024, 1, 1, 0, args);
+    int64_t arg = 0;
+    cuda::copy_to_host(&arg, pi, sizeof arg);
+    auto idx = make_shared<const vector<int64_t>>(1, arg);
+    TensorPtr out;
+    {
+        NoGrad off;
+        out = gather_flat(a, idx, Shape{1});
+    }
+    attach(out, {a}, name, [a, idx](const TensorPtr&, const TensorPtr& G) -> vector<TensorPtr> {
+        return {scatter_add_flat(reshape(G, {1}), idx, a->shape())};
+    });
+    return out;
+}
+
+TensorPtr argmax(const TensorPtr& a0) {
+    auto a = contiguous_on_device(f32(a0, "argmax"));
+    if (a->dim() < 1) throw runtime_error("argmax: needs at least one dimension");
+    long long cols = a->shape().back();
+    const long long rows = cols ? a->numel() / cols : 0;
+    Shape out_shape(a->shape().begin(), a->shape().end() - 1);
+    if (out_shape.empty()) out_shape = {1};
+    auto out = empty_cuda(out_shape);
+    const void* pa = base(a);
+    void* py = out->storage()->data();
+    void* args[] = {&pa, &cols, &py};
+    if (rows) cuda::launch(K("i_argmax_rows", INDEX_SRC()), (unsigned)rows, 1, 1, 256, 1, 1, 0, args);
+    return out;
+}
+
+TensorPtr gather(const TensorPtr& x0, const shared_ptr<const vector<int64_t>>& idx, const Shape& out_shape) {
+    auto x = contiguous_on_device(on_device(x0, "gather_flat"));
+    auto out = empty_cuda(out_shape, x->dtype());
+    if ((int64_t)idx->size() != out->numel())
+        throw runtime_error("gather_flat: " + to_string(idx->size()) + " indices for " +
+                            to_string(out->numel()) + " outputs");
+    for (int64_t j : *idx)
+        if (j >= x->numel()) throw runtime_error("gather_flat: index " + to_string(j) + " out of range");
+    auto di = upload_indices(idx);
+    const void* px = base(x);
+    const void* pi = di->storage()->data();
+    void* py = out->storage()->data();
+    long long n = out->numel();
+    int es = (int)dtype_size(x->dtype());
+    void* args[] = {&px, &pi, &py, &n, &es};
+    cuda::launch(K("i_gather", INDEX_SRC()), n, args);
+    attach(out, {x}, "gather", [x, idx](const TensorPtr&, const TensorPtr& G) -> vector<TensorPtr> {
+        return {scatter_add_flat(G, idx, x->shape())};
+    });
+    return out;
+}
+
+TensorPtr scatter_add(const TensorPtr& g0, const shared_ptr<const vector<int64_t>>& idx, const Shape& out_shape) {
+    auto g = contiguous_on_device(f32(g0, "scatter_add_flat"));
+    if ((int64_t)idx->size() != g->numel())
+        throw runtime_error("scatter_add_flat: " + to_string(idx->size()) + " indices for " +
+                            to_string(g->numel()) + " values");
+    auto out = make_shared<Tensor>(out_shape, F32, Device::CUDA);      // zeroed
+    for (int64_t j : *idx)
+        if (j >= out->numel()) throw runtime_error("scatter_add_flat: index " + to_string(j) + " out of range");
+    auto di = upload_indices(idx);
+    const void* pg = base(g);
+    const void* pi = di->storage()->data();
+    void* py = out->storage()->data();
+    long long n = g->numel();
+    void* args[] = {&pg, &pi, &py, &n};
+    cuda::launch(K("i_scatter_add", INDEX_SRC()), n, args);
+    attach(out, {g}, "scatter_add", [g, idx](const TensorPtr&, const TensorPtr& G) -> vector<TensorPtr> {
+        return {gather_flat(G, idx, g->shape())};
+    });
+    return out;
+}
+
+TensorPtr concat(const vector<TensorPtr>& inputs0, int axis) {
+    if (inputs0.empty()) throw runtime_error("concat_op: no inputs");
+    DType d = inputs0[0]->dtype();
+    for (auto& t : inputs0) d = promote_types(d, t->dtype());
+    vector<TensorPtr> c;
+    for (auto& t : inputs0) c.push_back(contiguous_on_device(cast_op(on_device(t, "concat_op"), d)));
+    const Shape shape0 = c[0]->shape();
+    const int ndim = (int)shape0.size();
+    if (axis < 0) axis += ndim;
+    if (axis < 0 || axis >= ndim) throw runtime_error("concat_op: axis out of range");
+    int64_t total = 0;
+    for (auto& t : c) {
+        if (t->dim() != ndim) throw runtime_error("concat_op: inputs differ in rank");
+        for (int k = 0; k < ndim; k++)
+            if (k != axis && t->shape()[k] != shape0[k])
+                throw runtime_error("concat_op: inputs differ on axis " + to_string(k));
+        total += t->shape()[axis];
+    }
+    Shape out_shape = shape0;
+    out_shape[axis] = total;
+    auto out = empty_cuda(out_shape, d);
+    long long outer = 1, inner = 1;
+    for (int k = 0; k < axis; k++) outer *= shape0[k];
+    for (int k = axis + 1; k < ndim; k++) inner *= shape0[k];
+    long long offset = 0, row = total * inner;
+    int es = (int)dtype_size(d);
+    void* py = out->storage()->data();
+    for (auto& t : c) {
+        long long span = t->shape()[axis] * inner;
+        const void* ps = base(t);
+        void* args[] = {&ps, &py, &outer, &span, &row, &offset, &es};
+        cuda::launch(K("i_slab", INDEX_SRC()), outer * span, args);
+        offset += span;
+    }
+    attach(out, c, "concat_op", [c, outer, inner, total, axis](const TensorPtr&, const TensorPtr& G) -> vector<TensorPtr> {
+        vector<TensorPtr> parts;
+        int64_t off = 0;
+        for (auto& t : c) {
+            const int64_t len = t->shape()[axis];
+            if (t->requires_grad()) {
+                auto idx = make_shared<vector<int64_t>>();
+                idx->reserve((size_t)t->numel());
+                for (int64_t o = 0; o < outer; o++)
+                    for (int64_t j = 0; j < len; j++)
+                        for (int64_t r = 0; r < inner; r++)
+                            idx->push_back((o * total + off + j) * inner + r);
+                parts.push_back(gather_flat(G, idx, t->shape()));
+            } else {
+                parts.push_back(nullptr);
+            }
+            off += len;
+        }
+        return parts;
+    });
+    return out;
+}
+
+// ── matmul on cuBLAS ─────────────────────────────────────────────────────────
+
+TensorPtr matmul(const TensorPtr& a0, const TensorPtr& b0) {
+    auto a = contiguous_on_device(f32(a0, "matmul"));
+    auto b = contiguous_on_device(f32(b0, "matmul"));
+    const int64_t m = a->size(-2), k = a->size(-1), n = b->size(-1);
+    TensorPtr out;
+    if (b->dim() == 2) {
+        // every leading dimension of a folds into the rows: one gemm
+        Shape out_shape = a->shape();
+        out_shape.back() = n;
+        out = make_shared<Tensor>(out_shape, F32, Device::CUDA);
+        if (k > 0)
+            cuda::sgemm(false, false, (int)(a->numel() / k), (int)n, (int)k, 1.0f,
+                        static_cast<const float*>(base(a)), (int)k, static_cast<const float*>(base(b)), (int)n,
+                        0.0f, static_cast<float*>(out->storage()->data()), (int)n);
+    } else {
+        const Shape batch_a(a->shape().begin(), a->shape().end() - 2);
+        const Shape batch_b(b->shape().begin(), b->shape().end() - 2);
+        const Shape batch = broadcast_shapes(batch_a, batch_b);
+        Shape out_shape = batch;
+        out_shape.push_back(m);
+        out_shape.push_back(n);
+        out = make_shared<Tensor>(out_shape, F32, Device::CUDA);
+        int64_t nb = 1;
+        for (int64_t v : batch) nb *= v;
+        const float* pa = static_cast<const float*>(base(a));
+        const float* pb = static_cast<const float*>(base(b));
+        float* pc = static_cast<float*>(out->storage()->data());
+        if (k > 0 && batch_a == batch && batch_b == batch) {
+            cuda::sgemm_batched(false, false, (int)m, (int)n, (int)k, 1.0f, pa, (int)k, m * k, pb, (int)n, k * n,
+                                0.0f, pc, (int)n, m * n, (int)nb);
+        } else if (k > 0) {
+            // broadcast batch dims: one product per output matrix
+            vector<int64_t> ia((size_t)nb, 0), ib((size_t)nb, 0);
+            broadcast_walk(batch, broadcast_strides(batch_a, batch), broadcast_strides(batch_b, batch), false,
+                           [&](int64_t i, int64_t x, int64_t y) { ia[i] = x; ib[i] = y; });
+            for (int64_t q = 0; q < nb; q++)
+                cuda::sgemm(false, false, (int)m, (int)n, (int)k, 1.0f, pa + ia[q] * m * k, (int)k,
+                            pb + ib[q] * k * n, (int)n, 0.0f, pc + q * m * n, (int)n);
+        }
+    }
+    attach(out, {a, b}, "matmul", [a, b](const TensorPtr&, const TensorPtr& G) -> vector<TensorPtr> {
+        return {a->requires_grad() ? sum_to(::matmul(G, transpose(b)), a->shape()) : nullptr,
+                b->requires_grad() ? sum_to(::matmul(transpose(a), G), b->shape()) : nullptr};
+    });
+    return out;
 }
 
 } // namespace cuda_ops

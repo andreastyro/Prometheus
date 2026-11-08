@@ -147,6 +147,66 @@ int main() {
         auto m = mean(multiply(a, b), 1, true);
         return where(gt(a, 1.0), multiply(a, m), b); }, 1e-5f);
 
+    // ── indexing: extremes, argmax, gather / scatter, concat ──
+    CHECK_TRUE("max_op",  max_diff(max_op(zg), max_op(z)) == 0.0f);
+    CHECK_TRUE("min_op",  max_diff(min_op(zg), min_op(z)) == 0.0f);
+    CHECK_TRUE("max_op over 1M", max_diff(max_op(G(big)), max_op(big)) == 0.0f);
+    CHECK_TRUE("argmax per row", max_diff(argmax(r3g), argmax(r3)) == 0.0f);
+    auto idx = std::make_shared<std::vector<int64_t>>(std::vector<int64_t>{4, 0, -1, 14, 4, 7});
+    CHECK_TRUE("gather_flat (repeat, padding)",
+               max_diff(gather_flat(xg, idx, Shape{2, 3}), gather_flat(x, idx, Shape{2, 3})) == 0.0f);
+    auto vals = random_tensor({6}, 9);
+    CHECK_NEAR("scatter_add_flat (repeated index adds)",
+               max_diff(scatter_add_flat(G(vals), idx, Shape{15}), scatter_add_flat(vals, idx, Shape{15})), 0.0f, 1e-6f);
+    CHECK_TRUE("concat axis 0", max_diff(concat_op({xg, yg}, 0), concat_op({x, y}, 0)) == 0.0f);
+    CHECK_TRUE("concat axis 1", max_diff(concat_op({xg, yg, xg}, 1), concat_op({x, y, x}, 1)) == 0.0f);
+
+    // ── matmul on cuBLAS: summation order differs from the CPU, so relative ──
+    auto rel = [&](const TensorPtr& gpu, const TensorPtr& cpu) {
+        const auto a = gpu->to_vector(), b = cpu->to_vector();
+        float m = 0.0f, s = 0.0f;
+        for (size_t i = 0; i < b.size(); i++) { m = std::max(m, std::fabs(a[i] - b[i])); s = std::max(s, std::fabs(b[i])); }
+        return a.size() == b.size() ? m / std::max(s, 1e-12f) : INFINITY;
+    };
+    std::printf("cuBLAS: %s\n", cuda::blas_status().c_str());
+    auto A = random_tensor({64, 96}, 21), B = random_tensor({96, 48}, 22);
+    CHECK_NEAR("matmul 64x96 @ 96x48", rel(matmul(G(A), G(B)), matmul(A, B)), 0.0f, 1e-6f);
+    auto A3 = random_tensor({3, 17, 33}, 23), B3 = random_tensor({3, 33, 9}, 24);
+    CHECK_NEAR("batched matmul (strided batched)", rel(matmul(G(A3), G(B3)), matmul(A3, B3)), 0.0f, 1e-6f);
+    auto B1 = random_tensor({1, 33, 9}, 25);
+    CHECK_NEAR("batched matmul, broadcast batch", rel(matmul(G(A3), G(B1)), matmul(A3, B1)), 0.0f, 1e-6f);
+    auto W = random_tensor({33, 9}, 26);
+    CHECK_NEAR("N-D @ weight (one gemm)", rel(matmul(G(A3), G(W)), matmul(A3, W)), 0.0f, 1e-6f);
+    CHECK_NEAR("matmul with a transposed view", rel(matmul(G(B), transpose(G(B))), matmul(B, transpose(B))), 0.0f, 1e-6f);
+    auto Wt = random_tensor({9, 33}, 27);
+    CHECK_NEAR("matmul_bt", rel(matmul_bt(G(random_tensor({5, 33}, 28)), G(Wt)),
+                                matmul_bt(random_tensor({5, 33}, 28), Wt)), 0.0f, 1e-6f);
+    auto bias = random_tensor({9}, 29);
+    CHECK_NEAR("linear_op x @ W + b", rel(linear_op(G(A3), G(W), G(bias)), linear_op(A3, W, bias)), 0.0f, 1e-6f);
+    auto L1 = random_tensor({512, 512}, 30), L2 = random_tensor({512, 512}, 31);
+    CHECK_NEAR("matmul 512x512x512", rel(matmul(G(L1), G(L2)), matmul(L1, L2)), 0.0f, 1e-5f);
+
+    // gradients through matmul, linear, gather and concat
+    {
+        auto a = random_tensor({2, 4, 6}, 41), w = random_tensor({6, 3}, 42), b = random_tensor({3}, 43);
+        auto ag = G(a), wg = G(w), bg = G(b);
+        for (auto* t : {&a, &w, &b, &ag, &wg, &bg}) (*t)->set_requires_grad(true);
+        auto f = [&](TensorPtr x, TensorPtr W_, TensorPtr b_) {
+            auto h = tanh_op(linear_op(x, W_, b_));
+            auto cat = concat_op({h, multiply(2.0f, h)}, 2);
+            auto picked = gather_flat(cat, idx, Shape{6});
+            return add(sum(matmul(h, transpose(W_)), -1), sum(picked, -1));
+        };
+        f(a, w, b)->backward();
+        f(ag, wg, bg)->backward();
+        double m = 0;
+        for (auto pr : {std::make_pair(ag, a), std::make_pair(wg, w), std::make_pair(bg, b)}) {
+            const auto g1 = pr.first->grad_doubles(), g2 = pr.second->grad_doubles();
+            for (size_t i = 0; i < g2.size(); i++) m = std::max(m, std::fabs(g1[i] - g2[i]) / std::max(1.0, std::fabs(g2[i])));
+        }
+        CHECK_NEAR("gradients through linear, matmul, concat, gather", (float)m, 0.0f, 1e-5f);
+    }
+
     // a CPU leaf that goes to the GPU and back gets its gradient on the CPU
     auto leaf = random_tensor({4}, 13);
     leaf->set_requires_grad(true);

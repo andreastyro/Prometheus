@@ -112,4 +112,11 @@ TensorPtr on_device(const TensorPtr& t, const char* op);
 /// float32 grad[0..n) += g (any float dtype, any layout, on either device)
 void accumulate(void* grad, int64_t n, const TensorPtr& g);
 void fill(void* dst, int64_t n, float value);
+TensorPtr extreme(const char* name, const TensorPtr& a, bool is_max);
+TensorPtr argmax(const TensorPtr& a);
+TensorPtr gather(const TensorPtr& x, const std::shared_ptr<const std::vector<int64_t>>& idx, const Shape& out_shape);
+TensorPtr scatter_add(const TensorPtr& g, const std::shared_ptr<const std::vector<int64_t>>& idx, const Shape& out_shape);
+TensorPtr concat(const std::vector<TensorPtr>& inputs, int axis);
+/// cuBLAS; batch dims broadcast as on the CPU
+TensorPtr matmul(const TensorPtr& a, const TensorPtr& b);
 }
