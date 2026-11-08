@@ -391,8 +391,8 @@ def test_gradient_connectivity():
     p.Tensor.manual_seed(4)
 
     # a correctly trained model must come back clean: a panel that cries wolf
-    # on a healthy model is worse than no panel
-    m = CNN(1, 4, (8,), image_size=8)
+    # on a healthy model is worse than no panel. No BatchNorm here: see below.
+    m = CNN(1, 4, (8,), image_size=8, norm=None)
     x = tensor([2, 1, 8, 8])
     opt = p.Adam(m.parameters(), 0.01)
     for _ in range(4):
@@ -408,6 +408,19 @@ def test_gradient_connectivity():
           str([r for r in res if r[1] is False][:2]))
     check("no false DEAD on a trained model",
           not [r for r in res if r[1] is None and "no effect" in (r[2] or "")])
+
+    # A conv bias straight before BatchNorm genuinely has no effect -- the
+    # normalisation subtracts each channel's mean, cancelling it exactly --
+    # and the panel should say so. It used to depend on rounding: exactly
+    # zero under one BLAS library's summation order, 1e-4 under another.
+    p.Tensor.manual_seed(4)
+    mb = CNN(1, 4, (8,), image_size=8, norm="batch")
+    resb = run_gradcheck(mb, tensor([2, 1, 8, 8]))
+    check("a conv bias feeding BatchNorm is reported as dead weight",
+          any(r[0] == 1 and r[1] is None and "no effect" in (r[2] or "") for r in resb),
+          str(resb[:3]))
+    check("and nothing else in that model is",
+          not [r for r in resb if r[0] != 1 and r[1] is None and "no effect" in (r[2] or "")])
 
     # a parameter genuinely left out of forward() must be caught. gradcheck
     # alone cannot: both its analytical and numeric gradients are zero, so they

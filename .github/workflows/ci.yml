@@ -95,6 +95,11 @@ jobs:
       - name: Higher-order gradients
         run: python tests/test_higher_order.py
 
+      # Every parallelised layer at full size, multi- vs single-threaded:
+      # catches a data race that the small-shape tests never reach.
+      - name: Parallel paths agree with single-threaded
+        run: python tests/test_parallel_consistency.py
+
       - name: README matches the API
         run: python tests/check_readme_api.py
 

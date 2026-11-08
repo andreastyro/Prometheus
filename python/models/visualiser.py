@@ -714,7 +714,14 @@ def _numeric_influence(forward, t, eps, probes=3):
         data[idx] = orig
         t.data = data
 
-        worst = max(worst, abs(hi - lo) / (2.0 * eps))
+        # A difference within a few float32 ulps of the output is rounding,
+        # not influence. Without this floor, a parameter that truly has no
+        # effect -- a conv bias straight before BatchNorm, whose mean
+        # subtraction cancels it exactly -- came out "alive" or "dead"
+        # depending on the order the BLAS library happened to sum in.
+        noise = 8 * 2.0 ** -23 * max(abs(hi), abs(lo))
+        if abs(hi - lo) > noise:
+            worst = max(worst, abs(hi - lo) / (2.0 * eps))
     return worst
 
 

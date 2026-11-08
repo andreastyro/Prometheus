@@ -164,7 +164,29 @@ the same session, interleaved with Prometheus:
 | PyTorch 2.15 (MKL) | 1917-1976 |
 
 Absolute numbers on a laptop move with power and thermal state by as much as
-40%, which is why the comparison is interleaved. Benchmark with
+40%, which is why the comparison is interleaved.
+
+Per layer, forward + backward, against PyTorch 2.15 on the same shapes
+(best of three interleaved rounds):
+
+| Layer | Shape | Prometheus | PyTorch | |
+|---|---|---|---|---|
+| Conv2D | [16,32,32,32] -> 64, k3 | 9.13 ms | 2.91 ms | 3.1x slower |
+| ConvTranspose2D | [16,64,16,16] -> 32, k4 s2 | 4.07 ms | 1.48 ms | 2.8x slower |
+| MaxPool2D | [16,64,32,32], k2 | 0.72 ms | 1.03 ms | 1.4x faster |
+| AvgPool2D | [16,64,32,32], k2 | 0.24 ms | 0.52 ms | 2.2x faster |
+| BatchNorm | [16,64,32,32] | 1.47 ms | 0.89 ms | 1.7x slower |
+| GroupNorm | [16,64,32,32], 8 groups | 1.34 ms | 0.45 ms | 3.0x slower |
+| RNN | seq 64, batch 32, 128 -> 256 | 6.24 ms | 5.92 ms | 1.1x slower |
+| LSTM | seq 64, batch 32, 128 -> 256 | 24.12 ms | 10.59 ms | 2.3x slower |
+| GRU | seq 64, batch 32, 128 -> 256 | 15.98 ms | 18.82 ms | 1.2x faster |
+| Embedding | [32,128] ids, 16000 x 384 | 0.89 ms | 2.82 ms | 3.2x faster |
+| SGD (momentum) | 16.8M parameters | 5.60 ms | 8.07 ms | 1.4x faster |
+| AdamW | 16.8M parameters | 8.06 ms | 22.89 ms | 2.8x faster |
+| RMSprop | 16.8M parameters | 5.53 ms | 14.81 ms | 2.7x faster |
+
+PyTorch runs its convolutions through oneDNN's direct-convolution kernels;
+against its own im2col path (oneDNN off) the convolutions here are 1.3-1.6x. Benchmark with
 [tests/benchmark_matmul.cpp](tests/benchmark_matmul.cpp).
 
 ---
