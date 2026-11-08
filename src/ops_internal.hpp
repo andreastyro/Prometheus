@@ -141,4 +141,11 @@ TensorPtr gelu_backward(const TensorPtr& x, const TensorPtr& G);
 TensorPtr embedding(const TensorPtr& W, const std::vector<int64_t>& ids, const Shape& out_shape);
 /// softmax(Q K^T / sqrt(D) + causal mask) V per head; q, k, v and the result [B, S, E]
 TensorPtr attention(const TensorPtr& q, const TensorPtr& k, const TensorPtr& v, int heads, bool causal);
+/// gelu(z + b), b along the last dim, one kernel each way
+TensorPtr bias_gelu(const TensorPtr& z, const TensorPtr& b);
+/// y + b + r in one kernel
+TensorPtr add_bias_residual(const TensorPtr& y, const TensorPtr& b, const TensorPtr& r);
+/// {a + c, LayerNorm(a + c)} in one pass
+std::pair<TensorPtr, TensorPtr> add_layernorm(const TensorPtr& a, const TensorPtr& c, const TensorPtr& gamma,
+                                              const TensorPtr& beta, float eps);
 }

@@ -259,8 +259,8 @@ the sizes involved. `cuda_set_device(i)` or `PROMETHEUS_CUDA_DEVICE` picks a
 GPU. `PROMETHEUS_PROFILE_BACKWARD=1` prints the backward pass's time by op.
 
 GPT training step on a GTX 970 (4 layers x 256, batch 8 x 128,
-[tests/bench_gpu_gpt.py](tests/bench_gpu_gpt.py)): Prometheus 29.4 ms
-(34.8k tokens/s), PyTorch 2.14 19.3 ms (53.0k tokens/s), the same step on a
+[tests/bench_gpu_gpt.py](tests/bench_gpu_gpt.py)): Prometheus 26.6 ms
+(38.4k tokens/s), PyTorch 2.14 19.8 ms (51.8k tokens/s), the same step on a
 Ryzen AI 7 350 CPU 208 ms. The GPU suite is
 [tests/test_cuda.cpp](tests/test_cuda.cpp) and
 [tests/test_cuda.py](tests/test_cuda.py): every op and layer against the CPU,

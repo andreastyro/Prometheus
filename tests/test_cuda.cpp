@@ -31,6 +31,7 @@
 #include "ml/nn/nlp/gpt.hpp"
 #include "ml/nn/nlp/layernorm.hpp"
 #include "ml/nn/nlp/positional_encoding.hpp"
+#include "ml/nn/nlp/transformer.hpp"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -282,6 +283,26 @@ int main() {
             xa->set_requires_grad(true);
             xb->set_requires_grad(true);
             CHECK_NEAR("second derivative through the fused attention", rel(second(xb, mg), second(xa, mc)), 0.0f, 1e-4f);
+        }
+        {
+            // a whole transformer block: residual + norm, bias + GELU and bias + residual fused;
+            // first derivative through the fused kernels, second through their op form
+            auto block = [](const TensorPtr& x, TransformerBlock& tb, bool second) {
+                auto y = sum(tanh_op(tb.forward(x)), -1);
+                auto g = autograd::grad(y, {x}, second)[0];
+                return second ? autograd::grad(sum(multiply(g, g), -1), {x})[0] : g;
+            };
+            Tensor::manual_seed(41);
+            TransformerBlock tc(16, 4, 32, true, false);
+            Tensor::manual_seed(41);
+            TransformerBlock tg(16, 4, 32, true, false);
+            tg.to(Device::CUDA);
+            auto xa = x3->detach(), xb = G(x3);
+            xa->set_requires_grad(true);
+            xb->set_requires_grad(true);
+            CHECK_NEAR("TransformerBlock output (fused kernels)", rel(tg.forward(xb), tc.forward(xa)), 0.0f, 1e-5f);
+            CHECK_NEAR("TransformerBlock gradient (fused backward)", rel(block(xb, tg, false), block(xa, tc, false)), 0.0f, 1e-4f);
+            CHECK_NEAR("TransformerBlock second derivative (op form)", rel(block(xb, tg, true), block(xa, tc, true)), 0.0f, 1e-4f);
         }
         {
             // Dropout on the GPU: Philox masks. Not the CPU's mask, so check

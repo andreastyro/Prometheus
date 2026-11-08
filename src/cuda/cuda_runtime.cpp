@@ -60,6 +60,12 @@ struct Driver {
                                unsigned, unsigned, CUstream, void**, void**);
     CUresult (*cuGetErrorString)(CUresult, const char**);
     CUresult (*cuMemGetInfo)(size_t*, size_t*);
+    CUresult (*cuStreamCreate)(CUstream*, unsigned);
+    CUresult (*cuStreamSynchronize)(CUstream);
+    CUresult (*cuMemcpyHtoDAsync)(CUdeviceptr, const void*, size_t, CUstream);
+    CUresult (*cuMemcpyDtoHAsync)(void*, CUdeviceptr, size_t, CUstream);
+    CUresult (*cuMemcpyDtoDAsync)(CUdeviceptr, CUdeviceptr, size_t, CUstream);
+    CUresult (*cuMemsetD8Async)(CUdeviceptr, unsigned char, size_t, CUstream);
 };
 
 // NVRTC: the runtime compiler
@@ -83,6 +89,11 @@ struct State {
     Driver      d{};
     CUdevice    dev = 0;
     CUcontext   ctx = nullptr;
+    // All work goes on one non-blocking stream, in order. Kernels and cuBLAS
+    // calls were already asynchronous; the copies and memsets on the legacy
+    // default stream were not, and each made the CPU wait for the GPU to
+    // drain. Now the CPU only waits when it reads a value back.
+    CUstream    stream = nullptr;
     string      name;
     int         cc = 0;
     size_t      mem = 0;
@@ -184,7 +195,10 @@ void init_locked() {
         bind(lib, d.cuModuleLoadData, "cuModuleLoadData") &&
         bind(lib, d.cuModuleGetFunction, "cuModuleGetFunction") &&
         bind(lib, d.cuLaunchKernel, "cuLaunchKernel") && bind(lib, d.cuGetErrorString, "cuGetErrorString") &&
-        bind(lib, d.cuMemGetInfo, "cuMemGetInfo_v2");
+        bind(lib, d.cuMemGetInfo, "cuMemGetInfo_v2") &&
+        bind(lib, d.cuStreamCreate, "cuStreamCreate") && bind(lib, d.cuStreamSynchronize, "cuStreamSynchronize") &&
+        bind(lib, d.cuMemcpyHtoDAsync, "cuMemcpyHtoDAsync_v2") && bind(lib, d.cuMemcpyDtoHAsync, "cuMemcpyDtoHAsync_v2") &&
+        bind(lib, d.cuMemcpyDtoDAsync, "cuMemcpyDtoDAsync_v2") && bind(lib, d.cuMemsetD8Async, "cuMemsetD8Async");
     if (!all) { g.why = "the NVIDIA driver is too old (a driver API entry point is missing)"; return; }
     CUresult r = d.cuInit(0);
     if (r != 0) { g.why = "cuInit failed: " + err(r); return; }
@@ -209,6 +223,10 @@ void init_locked() {
     g.cc = major * 10 + minor;
     d.cuDeviceTotalMem(&g.mem, g.dev);
     if ((r = d.cuDevicePrimaryCtxRetain(&g.ctx, g.dev)) != 0) { g.why = "no CUDA context: " + err(r); return; }
+    if ((r = d.cuCtxSetCurrent(g.ctx)) != 0 || (r = d.cuStreamCreate(&g.stream, 1 /* non-blocking */)) != 0) {
+        g.why = "no CUDA stream: " + err(r);
+        return;
+    }
     g.ok = true;
     g.why.clear();
 }
@@ -471,30 +489,34 @@ void empty_cache() {
 void memset_zero(void* dst, size_t nbytes) {
     if (!nbytes) return;
     bind_context();
-    check(g.d.cuMemsetD8((CUdeviceptr)dst, 0, nbytes), "cuMemsetD8");
+    check(g.d.cuMemsetD8Async((CUdeviceptr)dst, 0, nbytes, g.stream), "cuMemsetD8");
 }
 
 void copy_to_device(void* dst, const void* src, size_t nbytes) {
     if (!nbytes) return;
     bind_context();
-    check(g.d.cuMemcpyHtoD((CUdeviceptr)dst, src, nbytes), "cuMemcpyHtoD");
+    // from pageable memory this returns once the bytes are staged, so the
+    // caller may free its buffer straight away
+    check(g.d.cuMemcpyHtoDAsync((CUdeviceptr)dst, src, nbytes, g.stream), "cuMemcpyHtoD");
 }
 
 void copy_to_host(void* dst, const void* src, size_t nbytes) {
     if (!nbytes) return;
     bind_context();
-    check(g.d.cuMemcpyDtoH(dst, (CUdeviceptr)src, nbytes), "cuMemcpyDtoH");
+    // the CPU needs the bytes: wait for the stream, and only it
+    check(g.d.cuMemcpyDtoHAsync(dst, (CUdeviceptr)src, nbytes, g.stream), "cuMemcpyDtoH");
+    check(g.d.cuStreamSynchronize(g.stream), "cuStreamSynchronize");
 }
 
 void copy_device(void* dst, const void* src, size_t nbytes) {
     if (!nbytes) return;
     bind_context();
-    check(g.d.cuMemcpyDtoD((CUdeviceptr)dst, (CUdeviceptr)src, nbytes), "cuMemcpyDtoD");
+    check(g.d.cuMemcpyDtoDAsync((CUdeviceptr)dst, (CUdeviceptr)src, nbytes, g.stream), "cuMemcpyDtoD");
 }
 
 void synchronize() {
     bind_context();
-    check(g.d.cuCtxSynchronize(), "cuCtxSynchronize");
+    check(g.d.cuStreamSynchronize(g.stream), "cuStreamSynchronize");
 }
 
 // ── cuBLAS ───────────────────────────────────────────────────────────────────
@@ -512,6 +534,7 @@ struct Cublas {
     int (*gemm_ex)(cublasHandle_t, int, int, int, int, int, const void*, const void*, int, int,
                    long long, const void*, int, int, long long, const void*, void*, int, int,
                    long long, int, int, int);
+    int (*set_stream)(cublasHandle_t, void*);
 };
 Cublas         g_blas{};
 cublasHandle_t g_handle = nullptr;
@@ -531,12 +554,14 @@ void init_blas_locked() {
     if (!lib) { g_blas_why = "cuBLAS not found; pip install nvidia-cublas-cu12"; return; }
     if (!bind(lib, g_blas.create, "cublasCreate_v2") || !bind(lib, g_blas.sgemm, "cublasSgemm_v2") ||
         !bind(lib, g_blas.sgemm_batched, "cublasSgemmStridedBatched") ||
-        !bind(lib, g_blas.gemm_ex, "cublasGemmStridedBatchedEx")) {
+        !bind(lib, g_blas.gemm_ex, "cublasGemmStridedBatchedEx") ||
+        !bind(lib, g_blas.set_stream, "cublasSetStream_v2")) {
         g_blas_why = "cuBLAS is missing an entry point";
         return;
     }
     // the handle belongs to the current context
-    if (g.d.cuCtxSetCurrent(g.ctx) != 0 || g_blas.create(&g_handle) != 0) {
+    if (g.d.cuCtxSetCurrent(g.ctx) != 0 || g_blas.create(&g_handle) != 0 ||
+        g_blas.set_stream(g_handle, g.stream) != 0) {
         g_blas_why = "cublasCreate failed";
         return;
     }
@@ -614,7 +639,7 @@ void launch(const Kernel& k, int64_t n, void** args, unsigned block) {
 void launch(const Kernel& k, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by,
             unsigned bz, unsigned shared, void** args) {
     CUfunction fn = function(k);
-    check(g.d.cuLaunchKernel(fn, gx, gy, gz, bx, by, bz, shared, nullptr, args, nullptr),
+    check(g.d.cuLaunchKernel(fn, gx, gy, gz, bx, by, bz, shared, g.stream, args, nullptr),
           (string("launching ") + k.name).c_str());
 }
 

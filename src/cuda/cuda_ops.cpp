@@ -1482,4 +1482,151 @@ TensorPtr attention(const TensorPtr& q0, const TensorPtr& k0, const TensorPtr& v
     return O;
 }
 
+// ── fused transformer pieces: bias + GELU, bias + residual, residual + LayerNorm ──
+//
+// What a transformer block does between its gemms, each in one kernel instead
+// of two or three. Gradients as for the other fused kernels: one kernel for a
+// plain backward, the op form when the gradient is itself recorded.
+
+static const string& BLOCK_SRC() {
+    static const string s = src(R"(
+__device__ float gelu_f(float v) { return 0.5f * v * (1.0f + tanhf(0.7978845608f * (v + 0.044715f * v * v * v))); }
+__device__ float gelu_d(float v) {
+    const float k = 0.7978845608f, c = 0.044715f, t = tanhf(k * (v + c * v * v * v));
+    return 0.5f * (1.0f + t) + 0.5f * v * (1.0f - t * t) * k * (1.0f + 3.0f * c * v * v);
+}
+// y = gelu(z + b), b broadcast along the last dim
+extern "C" __global__ void k_bias_gelu(const float* z, const float* b, float* y, long long n, long long cols) {
+    long long i = gid(); if (i >= n) return;
+    y[i] = gelu_f(z[i] + b[i % cols]);
+}
+extern "C" __global__ void k_bias_gelu_back(const float* z, const float* b, const float* dy, float* dz,
+                                            long long n, long long cols) {
+    long long i = gid(); if (i >= n) return;
+    dz[i] = dy[i] * gelu_d(z[i] + b[i % cols]);
+}
+// out = y + b + r, b broadcast along the last dim
+extern "C" __global__ void k_add_bias_residual(const float* y, const float* b, const float* r, float* out,
+                                               long long n, long long cols) {
+    long long i = gid(); if (i >= n) return;
+    out[i] = y[i] + b[i % cols] + r[i];
+}
+// s = a + c and y = LayerNorm(s) per row, one block per row
+extern "C" __global__ void k_add_layernorm(const float* a, const float* c, float* s_out, const float* g,
+                                           const float* bt, float* y, long long cols, float eps) {
+    __shared__ float sh[256];
+    const long long off = (long long)blockIdx.x * cols;
+    float t = 0.0f;
+    for (long long j = threadIdx.x; j < cols; j += blockDim.x) { float v = a[off + j] + c[off + j]; s_out[off + j] = v; t += v; }
+    sh[threadIdx.x] = t;
+    __syncthreads();
+    for (int w = blockDim.x / 2; w > 0; w >>= 1) { if (threadIdx.x < w) sh[threadIdx.x] += sh[threadIdx.x + w]; __syncthreads(); }
+    const float mean = sh[0] / (float)cols;
+    __syncthreads();
+    t = 0.0f;
+    for (long long j = threadIdx.x; j < cols; j += blockDim.x) { float d = s_out[off + j] - mean; t += d * d; }
+    sh[threadIdx.x] = t;
+    __syncthreads();
+    for (int w = blockDim.x / 2; w > 0; w >>= 1) { if (threadIdx.x < w) sh[threadIdx.x] += sh[threadIdx.x + w]; __syncthreads(); }
+    const float inv = rsqrtf(sh[0] / (float)cols + eps);
+    for (long long j = threadIdx.x; j < cols; j += blockDim.x) y[off + j] = (s_out[off + j] - mean) * inv * g[j] + bt[j];
+}
+)");
+    return s;
+}
+
+TensorPtr bias_gelu(const TensorPtr& z0, const TensorPtr& b0) {
+    auto z = contiguous_on_device(f32(z0, "bias_gelu")), b = contiguous_on_device(f32(b0, "bias_gelu"));
+    long long cols = z->shape().back(), n = z->numel();
+    if (b->numel() != cols) throw runtime_error("bias_gelu: bias must have " + to_string(cols) + " elements");
+    auto y = empty_cuda(z->shape());
+    const void* pz = base(z);
+    const void* pb = base(b);
+    void* py = y->storage()->data();
+    void* args[] = {&pz, &pb, &py, &n, &cols};
+    cuda::launch(K("k_bias_gelu", BLOCK_SRC()), n, args);
+    if (z->requires_grad() || b->requires_grad()) {
+        auto node = make_node(y, {z, b});
+        node->name = "bias_gelu";
+        autograd::attach_reference(*node, [](const vector<TensorPtr>& in) -> TensorPtr { return gelu(add(in[0], in[1])); });
+        auto reference = node->backward_graph;
+        node->backward_graph = [reference, z, b, n, cols](const TensorPtr& out, const TensorPtr& G0) -> vector<TensorPtr> {
+            if (grad_enabled()) return reference(out, G0);
+            auto G = contiguous_on_device(f32(G0, "bias_gelu"));
+            auto dz = empty_cuda(z->shape());
+            const void* pz = base(z);
+            const void* pb = base(b);
+            const void* pg = base(G);
+            void* pd = dz->storage()->data();
+            long long nn = n, cc = cols;
+            void* a[] = {&pz, &pb, &pg, &pd, &nn, &cc};
+            cuda::launch(K("k_bias_gelu_back", BLOCK_SRC()), nn, a);
+            TensorPtr db = b->requires_grad() ? ::sum(reshape(dz, {n / cols, cols}), 0) : nullptr;
+            return {z->requires_grad() ? dz : nullptr, db};
+        };
+    }
+    return y;
+}
+
+TensorPtr add_bias_residual(const TensorPtr& y0, const TensorPtr& b0, const TensorPtr& r0) {
+    auto y = contiguous_on_device(f32(y0, "add_bias_residual")), b = contiguous_on_device(f32(b0, "add_bias_residual"));
+    auto r = contiguous_on_device(f32(r0, "add_bias_residual"));
+    long long cols = y->shape().back(), n = y->numel();
+    if (b->numel() != cols || r->shape() != y->shape())
+        throw runtime_error("add_bias_residual: bias must be [cols] and the residual the shape of y");
+    auto out = empty_cuda(y->shape());
+    const void* py = base(y);
+    const void* pb = base(b);
+    const void* pr = base(r);
+    void* po = out->storage()->data();
+    void* args[] = {&py, &pb, &pr, &po, &n, &cols};
+    cuda::launch(K("k_add_bias_residual", BLOCK_SRC()), n, args);
+    attach(out, {y, b, r}, "add_bias_residual", [y, b, r](const TensorPtr&, const TensorPtr& G) -> vector<TensorPtr> {
+        return {y->requires_grad() ? G : nullptr, b->requires_grad() ? sum_to(G, b->shape()) : nullptr,
+                r->requires_grad() ? G : nullptr};
+    });
+    return out;
+}
+
+pair<TensorPtr, TensorPtr> add_layernorm(const TensorPtr& a0, const TensorPtr& c0, const TensorPtr& g0,
+                                         const TensorPtr& bt0, float eps) {
+    auto a = contiguous_on_device(f32(a0, "add_layernorm")), c = contiguous_on_device(f32(c0, "add_layernorm"));
+    auto g = contiguous_on_device(f32(g0, "add_layernorm")), bt = contiguous_on_device(f32(bt0, "add_layernorm"));
+    if (a->shape() != c->shape()) throw runtime_error("add_layernorm: the two inputs differ in shape");
+    long long cols = a->shape().back();
+    const long long rows = cols ? a->numel() / cols : 0;
+    auto s = empty_cuda(a->shape()), y = empty_cuda(a->shape());
+    const void* pa = base(a);
+    const void* pc = base(c);
+    const void* pg = base(g);
+    const void* pbt = base(bt);
+    void* ps = s->storage()->data();
+    void* py = y->storage()->data();
+    void* args[] = {&pa, &pc, &ps, &pg, &pbt, &py, &cols, &eps};
+    if (rows) cuda::launch(K("k_add_layernorm", BLOCK_SRC()), (unsigned)rows, 1, 1, 256, 1, 1, 0, args);
+    // s is a + c; y is LayerNorm(s), with the LayerNorm gradient: fused, or the op form
+    attach(s, {a, c}, "add", [a, c](const TensorPtr&, const TensorPtr& G) -> vector<TensorPtr> {
+        return {a->requires_grad() ? G : nullptr, c->requires_grad() ? G : nullptr};
+    });
+    if (s->requires_grad() || g->requires_grad() || bt->requires_grad()) {
+        auto node = make_node(y, {s, g, bt});
+        node->name = "LayerNorm::forward";
+        autograd::attach_reference(*node, [eps](const vector<TensorPtr>& in) -> TensorPtr {
+            const int last = in[0]->dim() - 1;
+            auto m = mean(in[0], last, true);
+            auto d = subtract(in[0], m);
+            auto var = mean(multiply(d, d), last, true);
+            return add(multiply(divide(d, sqrt_op(add(eps, var))), in[1]), in[2]);
+        });
+        auto reference = node->backward_graph;
+        node->backward_graph = [reference, s, g, bt, eps](const TensorPtr& out, const TensorPtr& G) -> vector<TensorPtr> {
+            if (grad_enabled()) return reference(out, G);
+            auto r = layernorm_backward(s, g, G, eps);
+            return {s->requires_grad() ? r[0] : nullptr, g->requires_grad() ? r[1] : nullptr,
+                    bt->requires_grad() ? r[2] : nullptr};
+        };
+    }
+    return {s, y};
+}
+
 } // namespace cuda_ops

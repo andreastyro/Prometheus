@@ -1,3 +1,4 @@
+#include "../../ops_internal.hpp"
 #include "ml/nn/nlp/transformer.hpp"
 #include "ml/ops.hpp"
 
@@ -15,6 +16,14 @@ TransformerBlock::TransformerBlock(int embed_dim, int num_heads, int ff_dim, boo
 // This is more stable at depth and is the standard for modern language models.
 // FFN uses GELU instead of ReLU — the standard in GPT-2/3/4.
 TensorPtr TransformerBlock::forward(TensorPtr input) {
+    if (input->device() == Device::CUDA) {
+        // the same block with the work between gemms fused: residual + norm2,
+        // bias + GELU, bias + residual -- one kernel each
+        auto [x, h2] = cuda_ops::add_layernorm(input, attn.forward(norm1.forward(input)),
+                                               norm2.gamma, norm2.beta, norm2.eps);
+        auto h = cuda_ops::bias_gelu(matmul(h2, ff1.weights), ff1.bias);
+        return cuda_ops::add_bias_residual(matmul(h, ff2.weights), ff2.bias, x);
+    }
     // Attention sub-layer: x = input + attn(norm1(input)). Attention reads
     // the batch from the shape; everything else here is per-token over the
     // last dimension, so any leading dims pass straight through.
