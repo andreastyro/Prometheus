@@ -1,6 +1,8 @@
 #include "ml/nn/batchnorm.hpp"
 #include "ml/tensor.hpp"
 #include <cmath>
+#include <cstdint>
+#include <utility>
 #include <stdexcept>
 #include <string>   // to_string; MSVC does not get it transitively
 #include <vector>
@@ -57,23 +59,28 @@ TensorPtr BatchNorm::forward(TensorPtr input) {
 
     const int count = N * S;
 
+    // Every channel is independent -- its statistics, its running averages,
+    // its slice of the output and its gamma/beta gradient -- so they run in
+    // parallel. They ran one at a time on one core: 10x slower than PyTorch.
+    #pragma omp parallel for schedule(static) if((int64_t)C * count >= 65536)
     for (int c = 0; c < C; c++) {
         float mean, var;
 
         if (training) {
-            mean = 0.0f;
-            for (int n = 0; n < N; n++)
-                for (int s = 0; s < S; s++)
-                    mean += input->data()[(n * C + c) * S + s];
-            mean /= count;
+            const float* X = input->data();
+            double acc = 0.0;
+            for (int n = 0; n < N; n++) {
+                const float* row = X + ((int64_t)n * C + c) * S;
+                for (int s = 0; s < S; s++) acc += row[s];
+            }
+            mean = (float)(acc / count);
 
-            var = 0.0f;
-            for (int n = 0; n < N; n++)
-                for (int s = 0; s < S; s++) {
-                    float diff = input->data()[(n * C + c) * S + s] - mean;
-                    var += diff * diff;
-                }
-            var /= count;
+            acc = 0.0;
+            for (int n = 0; n < N; n++) {
+                const float* row = X + ((int64_t)n * C + c) * S;
+                for (int s = 0; s < S; s++) { const float d = row[s] - mean; acc += (double)d * d; }
+            }
+            var = (float)(acc / count);
 
             // exponential moving average, as PyTorch does
             running_mean[c] = (1.0f - momentum) * running_mean[c] + momentum * mean;
@@ -103,43 +110,54 @@ TensorPtr BatchNorm::forward(TensorPtr input) {
         auto beta_  = beta;
         const bool was_training = training;
 
-        node->backward_fn = [input, gamma_, beta_, x_hat, inv_std_all,
+        // moved, not copied: x_hat is the size of the whole activation
+        node->backward_fn = [input, gamma_, beta_, x_hat = std::move(x_hat),
+                             inv_std_all = std::move(inv_std_all),
                              N, C, S, count, was_training](const TensorPtr& output) {
+            // Pointers hoisted and every per-channel sum kept in a register.
+            // The loop used to add into gamma->grad()[c] and beta->grad()[c]
+            // on every element, re-checking requires_grad each time: a store
+            // to memory the compiler could not keep in a register, which made
+            // this backward 3.9 ms against PyTorch's 1 ms for the whole layer.
+            const float* G  = output->grad();
+            const float* XH = x_hat.data();
+            const float* gm = gamma_->data();
+            float* GX = input->requires_grad() ? input->grad() : nullptr;
+            float* GG = gamma_->requires_grad() ? gamma_->grad() : nullptr;
+            float* GB = beta_->requires_grad() ? beta_->grad() : nullptr;
+
+            #pragma omp parallel for schedule(static) if((int64_t)C * count >= 65536)
             for (int c = 0; c < C; c++) {
                 const float inv_std = inv_std_all[c];
+                const float g_c = gm[c];
 
-                float sum_g = 0.0f, sum_g_xhat = 0.0f;
-                if (was_training) {
-                    for (int n = 0; n < N; n++)
-                        for (int s = 0; s < S; s++) {
-                            const int idx = (n * C + c) * S + s;
-                            const float gi = gamma_->data()[c] * output->grad()[idx];
-                            sum_g      += gi;
-                            sum_g_xhat += gi * x_hat[idx];
-                        }
-                }
-
-                const float mean_g      = was_training ? sum_g / count : 0.0f;
-                const float mean_g_xhat = was_training ? sum_g_xhat / count : 0.0f;
-
-                for (int n = 0; n < N; n++)
+                // sum(dy) and sum(dy * x_hat) over the channel: they give the
+                // beta and gamma gradients and the input gradient's two means
+                float sum_dy = 0.0f, sum_dy_xhat = 0.0f;
+                for (int n = 0; n < N; n++) {
+                    const int64_t base = ((int64_t)n * C + c) * S;
+                    const float* gy = G + base;
+                    const float* xh = XH + base;
                     for (int s = 0; s < S; s++) {
-                        const int idx = (n * C + c) * S + s;
-                        const float gi = gamma_->data()[c] * output->grad()[idx];
-
-                        if (input->requires_grad()) {
-                            if (was_training)
-                                input->grad()[idx] +=
-                                    inv_std * (gi - mean_g - x_hat[idx] * mean_g_xhat);
-                            else
-                                input->grad()[idx] += inv_std * gi;
-                        }
-
-                        if (gamma_->requires_grad())
-                            gamma_->grad()[c] += output->grad()[idx] * x_hat[idx];
-                        if (beta_->requires_grad())
-                            beta_->grad()[c] += output->grad()[idx];
+                        sum_dy      += gy[s];
+                        sum_dy_xhat += gy[s] * xh[s];
                     }
+                }
+                if (GG) GG[c] += sum_dy_xhat;
+                if (GB) GB[c] += sum_dy;
+                if (!GX) continue;
+
+                // dx = inv_std * (g*dy - mean(g*dy) - x_hat * mean(g*dy*x_hat))
+                const float mean_g      = was_training ? g_c * sum_dy / count : 0.0f;
+                const float mean_g_xhat = was_training ? g_c * sum_dy_xhat / count : 0.0f;
+                for (int n = 0; n < N; n++) {
+                    const int64_t base = ((int64_t)n * C + c) * S;
+                    const float* gy = G + base;
+                    const float* xh = XH + base;
+                    float* gx = GX + base;
+                    for (int s = 0; s < S; s++)
+                        gx[s] += inv_std * (g_c * gy[s] - mean_g - xh[s] * mean_g_xhat);
+                }
             }
         };
     }
