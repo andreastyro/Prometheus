@@ -298,7 +298,7 @@ PYBIND11_MODULE(_C, m) {
     m.def("masked_fill",  &masked_fill, py::arg("a"), py::arg("mask"), py::arg("value"),
           "a with value wherever mask is true; differentiable in a.");
     m.def("floor_divide", &floor_divide);
-    m.def("remainder",    &remainder);
+    m.def("remainder",    static_cast<TensorPtr (*)(TensorPtr, TensorPtr)>(&remainder));
     m.def("autocast_dtype",     &autocast_dtype);
     m.def("_set_autocast_dtype", &set_autocast_dtype);
     // Where pip and conda put shared libraries, so `pip install mkl` is found
