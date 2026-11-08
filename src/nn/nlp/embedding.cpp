@@ -56,6 +56,12 @@ TensorPtr Embedding::forward(TensorPtr input) {
         auto w = weight;
         auto node = make_node(output, {w});
         node->name = "Embedding";
+        autograd::attach_reference(*node, [tok = token_ids, E = embed_dim, oshape = output->shape()](const std::vector<TensorPtr>& in) -> TensorPtr {
+            auto idx = make_shared<vector<int64_t>>(tok.size() * (size_t)E);
+            for (size_t r = 0; r < tok.size(); r++)
+                for (int d = 0; d < E; d++) (*idx)[r * E + d] = (int64_t)tok[r] * E + d;
+            return gather_flat(in[0], idx, oshape);
+        });
         node->backward_fn = [w, token_ids = std::move(token_ids), rows, E = embed_dim]
                             (const TensorPtr& output) {
             const float* G = output->grad();

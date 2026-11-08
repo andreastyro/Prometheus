@@ -1,4 +1,5 @@
 #include "ml/nn/flatten.hpp"
+#include "ml/ops.hpp"
 #include "ml/tensor.hpp"
 
 using namespace std;
@@ -21,6 +22,9 @@ TensorPtr Flatten::forward(TensorPtr input){
     if (input->requires_grad()) {
         auto node = make_node(result, {input});
         node->name = "Flatten::forward";
+        autograd::attach_reference(*node, [n, flat_size](const std::vector<TensorPtr>& in) -> TensorPtr {
+            return reshape(in[0], {(int64_t)n, (int64_t)flat_size});
+        });
 
         node->backward_fn = [input](const TensorPtr& result) {
             for (int i = 0; i < result->num_el(); i++)

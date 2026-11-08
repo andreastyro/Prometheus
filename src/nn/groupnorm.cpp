@@ -1,4 +1,5 @@
 #include "ml/nn/groupnorm.hpp"
+#include "ml/ops.hpp"
 #include "ml/tensor.hpp"
 #include <cmath>
 #include <cstdint>
@@ -93,6 +94,16 @@ TensorPtr GroupNorm::forward(TensorPtr input) {
     if (input->requires_grad() || gamma->requires_grad() || beta->requires_grad()) {
         auto node = make_node(output, {input, gamma, beta});
         node->name = "GroupNorm::forward";
+        autograd::attach_reference(*node, [batch, channels, spatial, groups = num_groups, eps = eps](const std::vector<TensorPtr>& in) -> TensorPtr {
+            auto xg  = reshape(in[0], {(int64_t)batch, (int64_t)groups, (int64_t)(channels / groups) * spatial});
+            auto m   = mean(xg, 2, true);
+            auto d   = subtract(xg, m);
+            auto var = mean(multiply(d, d), 2, true);
+            auto xh  = reshape(divide(d, sqrt_op(add(eps, var))), {(int64_t)batch, (int64_t)channels, (int64_t)spatial});
+            auto out = add(multiply(xh, reshape(in[1], {1, (int64_t)channels, 1})),
+                           reshape(in[2], {1, (int64_t)channels, 1}));
+            return reshape(out, in[0]->shape());
+        });
 
         auto gamma_ = gamma;
         auto beta_  = beta;

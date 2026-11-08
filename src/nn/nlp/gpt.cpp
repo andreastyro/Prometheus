@@ -126,6 +126,17 @@ TensorPtr GPT::forward(TensorPtr token_ids) {
         auto pw = pos_emb.weight;
         auto node = make_node(x, {tw, pw});
         node->name = "GPT::forward";
+        autograd::attach_reference(*node, [tok_ids, S, E, xshape = x->shape()](const std::vector<TensorPtr>& in) -> TensorPtr {
+            // tok_emb[id] + pos_emb[position within its sequence]
+            auto ti = make_shared<vector<int64_t>>(tok_ids.size() * (size_t)E);
+            auto pi = make_shared<vector<int64_t>>(tok_ids.size() * (size_t)E);
+            for (size_t r = 0; r < tok_ids.size(); r++)
+                for (int d = 0; d < E; d++) {
+                    (*ti)[r * E + d] = (int64_t)tok_ids[r] * E + d;
+                    (*pi)[r * E + d] = (int64_t)(r % S) * E + d;
+                }
+            return add(gather_flat(in[0], ti, xshape), gather_flat(in[1], pi, xshape));
+        });
         node->backward_fn = [tw, pw, tok_ids, S, E](const TensorPtr& x) {
             for (int r = 0; r < (int)tok_ids.size(); r++) {
                 const int t   = r % S;          // position inside its sequence
@@ -168,6 +179,10 @@ TensorPtr GPT::forward(TensorPtr token_ids) {
     {
         auto node = make_node(logits, {x, tw});
         node->name = "GPT::forward";
+        autograd::attach_reference(*node, [](const std::vector<TensorPtr>& in) -> TensorPtr {
+            // the weight-tied output projection
+            return matmul(in[0], transpose(in[1]));
+        });
         node->backward_fn = [x, tw, rows, E, V](const TensorPtr& logits) {
             const float* gl = logits->grad();
 

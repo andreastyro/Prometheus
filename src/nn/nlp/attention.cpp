@@ -183,6 +183,38 @@ TensorPtr MultiHeadAttention::forward_rows(TensorPtr input, int batch) {
     if (need_grad) {
         auto node = make_node(result, {input, W_q, W_k, W_v, W_o});
         node->name = "MultiHeadAttention::forward_rows";
+        autograd::attach_reference(*node, [B, S, E, H, D, attn_scale, use_rope = rope_, causal = causal_](const std::vector<TensorPtr>& in) -> TensorPtr {
+            const int64_t b = B, s = S, e = E, h = H, d = D;
+            auto x3 = reshape(in[0], {b, s, e});
+            auto heads = [&](const TensorPtr& W) {                  // [B, H, S, D]
+                return permute(reshape(matmul(x3, W), {b, s, h, d}), {0, 2, 1, 3});
+            };
+            auto Q = heads(in[1]), K = heads(in[2]), V = heads(in[3]);
+            if (use_rope) {
+                // RoPE as a constant per-position rotation: v' = v @ R_t
+                vector<float> R((size_t)S * D * D, 0.0f);
+                for (int t = 0; t < S; t++)
+                    for (int i = 0; i < D / 2; i++) {
+                        const float theta = powf(10000.0f, -2.0f * i / D), angle = t * theta;
+                        const float c = cosf(angle), sn = sinf(angle);
+                        float* r = R.data() + (size_t)t * D * D;
+                        r[(2 * i) * D + 2 * i] = c;      r[(2 * i) * D + 2 * i + 1] = sn;
+                        r[(2 * i + 1) * D + 2 * i] = -sn; r[(2 * i + 1) * D + 2 * i + 1] = c;
+                    }
+                auto Rt = make_shared<Tensor>(Shape{s, d, d}, R);
+                Q = reshape(matmul(reshape(Q, {b, h, s, 1, d}), Rt), {b, h, s, d});
+                K = reshape(matmul(reshape(K, {b, h, s, 1, d}), Rt), {b, h, s, d});
+            }
+            auto scores = multiply(attn_scale, matmul(Q, transpose(K)));    // [B, H, S, S]
+            if (causal) {
+                vector<float> m((size_t)S * S, 0.0f);
+                for (int i = 0; i < S; i++) for (int j = i + 1; j < S; j++) m[(size_t)i * S + j] = -1e9f;
+                scores = add(scores, make_shared<Tensor>(Shape{s, s}, m));
+            }
+            auto O = matmul(softmax(scores), V);                            // [B, H, S, D]
+            O = reshape(permute(O, {0, 2, 1, 3}), {b * s, e});
+            return matmul(O, in[4]);
+        });
 
         bool rope = rope_;
 

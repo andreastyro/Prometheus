@@ -43,6 +43,20 @@ TensorPtr AvgPool2D::forward(TensorPtr input){
     if (input->requires_grad()){
         auto node = make_node(output, {input});
         node->name = "AvgPool2D";
+        autograd::attach_reference(*node, [planes, in_hw, out_hw, h_out, w_out, w_in, K, s, oshape = output->shape()](const std::vector<TensorPtr>& in) -> TensorPtr {
+            // every window as a row of K*K, then its mean
+            auto idx = make_shared<vector<int64_t>>((size_t)planes * out_hw * K * K);
+            size_t q = 0;
+            for (int pl = 0; pl < planes; pl++)
+                for (int i = 0; i < h_out; i++)
+                    for (int j = 0; j < w_out; j++)
+                        for (int kh = 0; kh < K; kh++)
+                            for (int kw = 0; kw < K; kw++)
+                                (*idx)[q++] = pl * in_hw + (int64_t)(i * s + kh) * w_in + j * s + kw;
+            Shape wshape = oshape;
+            wshape.push_back((int64_t)K * K);
+            return mean(gather_flat(in[0], idx, wshape), (int)oshape.size(), false);
+        });
         node->backward_fn = [input, planes, in_hw, out_hw, h_out, w_out, w_in, K, s, inv]
                             (const TensorPtr& output) {
             const float* G = output->grad();

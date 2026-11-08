@@ -1,4 +1,5 @@
 #include "ml/nn/batchnorm.hpp"
+#include "ml/ops.hpp"
 #include "ml/tensor.hpp"
 #include <cmath>
 #include <cstdint>
@@ -105,6 +106,25 @@ TensorPtr BatchNorm::forward(TensorPtr input) {
     if (input->requires_grad() || gamma->requires_grad() || beta->requires_grad()) {
         auto node = make_node(output, {input, gamma, beta});
         node->name = "BatchNorm::forward";
+        autograd::attach_reference(*node, [N, C, S, eps = eps, was_training = training, rm = running_mean, rv = running_var](const std::vector<TensorPtr>& in) -> TensorPtr {
+            auto x3 = reshape(in[0], {(int64_t)N, (int64_t)C, (int64_t)S});
+            TensorPtr xh;
+            if (was_training) {
+                auto m   = mean(mean(x3, 2, true), 0, true);
+                auto d   = subtract(x3, m);
+                auto var = mean(mean(multiply(d, d), 2, true), 0, true);
+                xh = divide(d, sqrt_op(add(eps, var)));
+            } else {
+                // the running statistics are constants. They are copied as they stood
+                // at the forward pass; the forward in eval mode does not update them.
+                vector<float> mv(C), iv(C);
+                for (int c = 0; c < C; c++) { mv[c] = rm[c]; iv[c] = 1.0f / std::sqrt(rv[c] + eps); }
+                xh = multiply(subtract(x3, make_shared<Tensor>(Shape{1, C, 1}, mv)),
+                              make_shared<Tensor>(Shape{1, C, 1}, iv));
+            }
+            auto out = add(multiply(xh, reshape(in[1], {1, (int64_t)C, 1})), reshape(in[2], {1, (int64_t)C, 1}));
+            return reshape(out, in[0]->shape());
+        });
 
         auto gamma_ = gamma;
         auto beta_  = beta;

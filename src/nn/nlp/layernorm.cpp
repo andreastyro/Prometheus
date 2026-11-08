@@ -1,4 +1,5 @@
 #include "ml/nn/nlp/layernorm.hpp"
+#include "ml/ops.hpp"
 #include "ml/autograd.hpp"
 #include <cmath>
 #include <utility>
@@ -56,6 +57,15 @@ TensorPtr LayerNorm::forward(TensorPtr input) {
         auto b = beta;
         auto node = make_node(output, {input, g, b});
         node->name = "LayerNorm::forward";
+        autograd::attach_reference(*node, [eps = eps](const std::vector<TensorPtr>& in) -> TensorPtr {
+            auto x = in[0];
+            const int last = x->dim() - 1;
+            auto m   = mean(x, last, true);
+            auto d   = subtract(x, m);
+            auto var = mean(multiply(d, d), last, true);
+            auto xh  = divide(d, sqrt_op(add(eps, var)));
+            return add(multiply(xh, in[1]), in[2]);
+        });
         node->backward_fn = [input, g, b,
                             x_hat_all = std::move(x_hat_all),
                             inv_std_all = std::move(inv_std_all),

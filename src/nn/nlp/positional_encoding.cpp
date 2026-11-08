@@ -1,4 +1,5 @@
 #include "ml/nn/nlp/positional_encoding.hpp"
+#include "ml/ops.hpp"
 #include "ml/tensor.hpp"
 #include <cmath>
 
@@ -32,6 +33,10 @@ TensorPtr PositionalEncoding::forward(TensorPtr input) {
     if (input->requires_grad()) {
         auto node = make_node(output, {input});
         node->name = "PositionalEncoding::forward";
+        autograd::attach_reference(*node, [pe = make_shared<Tensor>(output->shape(), [&]{ auto o = output->to_vector(); auto x = input->to_vector(); for (size_t i = 0; i < o.size(); i++) o[i] -= x[i]; return o; }())](const std::vector<TensorPtr>& in) -> TensorPtr {
+            // the encoding is a constant added to the input
+            return add(in[0], pe);
+        });
 
         node->backward_fn = [input](const TensorPtr& output) {
             for (int i = 0; i < output->num_el(); i++)

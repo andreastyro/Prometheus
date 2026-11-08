@@ -1,4 +1,5 @@
 #include "ml/tensor.hpp"
+#include "ml/ops.hpp"
 #include "ml/optim/grad_scaler.hpp"
 
 using namespace std;
@@ -22,6 +23,9 @@ TensorPtr GradScaler::scale_loss(TensorPtr loss) {
         float s = scale;
         auto node = make_node(out, {loss});
         node->name = "GradScaler::scale_loss";
+        autograd::attach_reference(*node, [s](const std::vector<TensorPtr>& in) -> TensorPtr {
+            return multiply(s, in[0]);
+        });
         node->backward_fn = [loss, s](const TensorPtr& out) {
             for (int i = 0; i < out->num_el(); i++)
                 loss->grad()[i] += out->grad()[i] * s;

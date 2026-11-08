@@ -87,6 +87,29 @@ TensorPtr ConvTranspose2D::forward(TensorPtr input){
     if (input->requires_grad() || weights->requires_grad() || bias->requires_grad()) {
         auto node = make_node(output, {input, weights, bias});
         node->name = "ConvTranspose2D";
+        autograd::attach_reference(*node, [B, Cin, H, W, K, Cout, s, p, Ho, Wo, HW, CKK](const std::vector<TensorPtr>& in) -> TensorPtr {
+            // the output image is what a convolution would read patches from
+            const int CC = Cout, IH = Ho, IW = Wo, OH = H, OW = W;
+            // the patch of every output position, as flat indices into the input;
+            // -1 marks padding, which gathers as 0
+            auto idx = make_shared<vector<int64_t>>((size_t)B * CKK * HW);
+            for (int b = 0; b < B; b++)
+                for (int c = 0; c < CC; c++)
+                    for (int kh = 0; kh < K; kh++)
+                        for (int kw = 0; kw < K; kw++) {
+                            const int64_t row = ((int64_t)b * CKK + (c * K + kh) * K + kw) * HW;
+                            for (int i = 0; i < OH; i++)
+                                for (int j = 0; j < OW; j++) {
+                                    const int y = i * s + kh - p, x = j * s + kw - p;
+                                    (*idx)[row + i * OW + j] = (y < 0 || y >= IH || x < 0 || x >= IW)
+                                        ? -1 : (((int64_t)b * CC + c) * IH + y) * IW + x;
+                                }
+                        }
+            auto col = matmul(transpose(reshape(in[1], {(int64_t)Cin, (int64_t)CKK})),
+                              reshape(in[0], {(int64_t)B, (int64_t)Cin, (int64_t)HW}));      // [B, CKK, HW]
+            auto out = scatter_add_flat(col, idx, {(int64_t)B, (int64_t)Cout, (int64_t)Ho, (int64_t)Wo}); // col2im
+            return add(out, reshape(in[2], {1, (int64_t)Cout, 1, 1}));
+        });
         auto w = weights;
         auto bvec = bias;
         node->backward_fn = [input, w, bvec, B, Cin, H, W, K, s, p, Ho, Wo, Cout, HW, OHW, CKK, in_sz, out_sz]

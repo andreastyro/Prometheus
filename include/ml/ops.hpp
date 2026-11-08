@@ -1,4 +1,6 @@
 #pragma once
+#include <functional>
+#include <memory>
 #include "ml/tensor.hpp"
 
 /// Element-wise addition: a + b
@@ -151,6 +153,36 @@ namespace autograd {
 /// gets zeros. Every op on the path needs a differentiable backward; one
 /// without it raises, naming the op.
 std::vector<TensorPtr> grad(TensorPtr output, std::vector<TensorPtr> inputs,
-                            bool create_graph = false, TensorPtr grad_output = nullptr);
+                            bool create_graph = false, TensorPtr grad_output = nullptr,
+                            bool partial = false);
+
+/// Give a fused kernel's node a differentiable backward by recomputing its
+/// forward from differentiable ops and differentiating that.
+///
+/// The fast kernels -- convolution, the norms, attention, the recurrent
+/// layers -- compute their gradients with raw loops, which cannot be
+/// differentiated again. `ref` rebuilds the same output from node.inputs (in
+/// that order) out of ops that can. Only higher-order gradients use it; a
+/// plain .backward() still runs the fast kernel. `partial` above is what this
+/// relies on: it treats the inputs as leaves, returning the derivative with
+/// respect to each direct input rather than tracing past them.
+void attach_reference(GradNode& node,
+                      std::function<TensorPtr(const std::vector<TensorPtr>&)> ref);
 
 } // namespace autograd
+
+// ── Gather and scatter by flat index ─────────────────────────────────────────
+//
+// out[i] = x.flat[idx[i]] and its adjoint, out.flat[idx[i]] += g[i]. Each is
+// the other's backward, so both are differentiable to any order. An index
+// below zero reads as 0 and scatters nowhere -- the padding of a convolution.
+// They are what pooling windows, embedding lookups, convolution patches,
+// slices and concatenation reduce to in the reference forwards above.
+
+/// out (shape out_shape) gathered from x's elements at idx.
+TensorPtr gather_flat(TensorPtr x, std::shared_ptr<const std::vector<int64_t>> idx,
+                      ShapeArg out_shape);
+
+/// zeros(out_shape) with g's elements added at idx.
+TensorPtr scatter_add_flat(TensorPtr g, std::shared_ptr<const std::vector<int64_t>> idx,
+                           ShapeArg out_shape);

@@ -52,6 +52,14 @@ TensorPtr MaxPool2D::forward(TensorPtr input){
     if (input->requires_grad()){
         auto node = make_node(output, {input});
         node->name = "MaxPool2D";
+        autograd::attach_reference(*node, [mask, planes, in_hw, out_hw, oshape = output->shape()](const std::vector<TensorPtr>& in) -> TensorPtr {
+            // the winner of each window is fixed; picking it is linear in the input
+            auto idx = make_shared<vector<int64_t>>((size_t)planes * out_hw);
+            for (int pl = 0; pl < planes; pl++)
+                for (int64_t k = 0; k < out_hw; k++)
+                    (*idx)[pl * out_hw + k] = pl * in_hw + (*mask)[pl * out_hw + k];
+            return gather_flat(in[0], idx, oshape);
+        });
         node->backward_fn = [input, mask, planes, in_hw, out_hw](const TensorPtr& output) {
             const float* G = output->grad();
             float* GX = input->grad();

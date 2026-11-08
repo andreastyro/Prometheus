@@ -1,4 +1,5 @@
 #include "ml/nn/dropout.hpp"
+#include "ml/ops.hpp"
 #include "ml/tensor.hpp"
 #include <memory>
 #include <vector>
@@ -41,6 +42,9 @@ TensorPtr Dropout::forward(TensorPtr input){
     if (input->requires_grad()) {
         auto node = make_node(result, {input});
         node->name = "Dropout::forward";
+        autograd::attach_reference(*node, [mtensor = make_shared<Tensor>(input->shape(), mask)](const std::vector<TensorPtr>& in) -> TensorPtr {
+            return multiply(in[0], mtensor);
+        });
 
         node->backward_fn = [input, mask, n](const TensorPtr& result) {
             for (int i = 0; i < n; i++)

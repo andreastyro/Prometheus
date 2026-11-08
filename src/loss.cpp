@@ -72,6 +72,20 @@ TensorPtr huber_loss(TensorPtr pred, TensorPtr target, float delta) {
     if (pred->requires_grad()) {
         auto node = make_node(out, {pred});
         node->name = "huber_loss";
+        autograd::attach_reference(*node, [tgt = target, delta](const std::vector<TensorPtr>& in) -> TensorPtr {
+            // quadratic inside |d| <= delta, linear outside; which side each element
+            // is on is fixed at this point
+            auto d = subtract(in[0], tgt);
+            auto inside = make_shared<Tensor>(d->shape());
+            {
+                const float* D = d->data();
+                float* M = inside->data();
+                for (int64_t i = 0; i < d->numel(); i++) M[i] = std::abs(D[i]) <= delta ? 1.0f : 0.0f;
+            }
+            auto quad = multiply(0.5f, multiply(d, d));
+            auto lin  = multiply(delta, subtract(abs_op(d), 0.5f * delta));
+            return mean(add(multiply(quad, inside), multiply(lin, subtract(1.0f, inside))), -1);
+        });
         node->backward_fn = [pred, target, delta, n](const TensorPtr& out) {
             const float g = out->grad()[0] / n;
             for (int i = 0; i < n; i++) {
@@ -132,6 +146,13 @@ TensorPtr contrastive_loss(TensorPtr anchor, TensorPtr positive, TensorPtr negat
     if (anchor->requires_grad() || positive->requires_grad() || negative->requires_grad()) {
         auto node = make_node(out, {anchor, positive, negative});
         node->name = "contrastive_loss";
+        autograd::attach_reference(*node, [margin, active = raw > 0.0f](const std::vector<TensorPtr>& in) -> TensorPtr {
+            // max(0, |a - p|^2 - |a - n|^2 + margin), the hinge's side fixed
+            auto dp = subtract(in[0], in[1]);
+            auto dn = subtract(in[0], in[2]);
+            auto raw_t = add(margin, subtract(sum(multiply(dp, dp), -1), sum(multiply(dn, dn), -1)));
+            return multiply(active ? 1.0f : 0.0f, raw_t);
+        });
         node->backward_fn = [anchor, positive, negative, raw, n](const TensorPtr& out) {
             if (raw <= 0.0f) return;            // hinge inactive, no gradient
             const float g = out->grad()[0];
@@ -164,6 +185,11 @@ TensorPtr l1_regularization(std::vector<TensorPtr> params, float lambda_) {
     if (any_grad) {
         auto node = make_node(out, params);
         node->name = "l1_regularization";
+        autograd::attach_reference(*node, [lambda_](const std::vector<TensorPtr>& in) -> TensorPtr {
+            TensorPtr total;
+            for (auto& t : in) { auto s = sum(abs_op(t), -1); total = total ? add(total, s) : s; }
+            return multiply(lambda_, total);
+        });
         node->backward_fn = [params, lambda_](const TensorPtr& out) {
             const float g = out->grad()[0];
             for (auto& p : params) {
@@ -196,6 +222,11 @@ TensorPtr l2_regularization(std::vector<TensorPtr> params, float lambda_) {
     if (any_grad) {
         auto node = make_node(out, params);
         node->name = "l2_regularization";
+        autograd::attach_reference(*node, [lambda_](const std::vector<TensorPtr>& in) -> TensorPtr {
+            TensorPtr total;
+            for (auto& t : in) { auto s = sum(multiply(t, t), -1); total = total ? add(total, s) : s; }
+            return multiply(lambda_, total);
+        });
         node->backward_fn = [params, lambda_](const TensorPtr& out) {
             const float g = out->grad()[0];
             for (auto& p : params) {
@@ -214,8 +245,12 @@ TensorPtr l2_regularization(std::vector<TensorPtr> params, float lambda_) {
 // Numerically stable: loss = log(Σ exp(logits)) - logits[target]
 //                          = log(Σ exp(logits - max)) + max - logits[target]
 TensorPtr cross_entropy_sparse(TensorPtr logits, int target_idx) {
+    // max_element over ONE buffer: this read begin() and end() from two
+    // separate temporary copies, which is undefined behaviour
+    logits = checked_input("cross_entropy_sparse", logits);
     int n = logits->num_el();
-    float max_v = *std::max_element(logits->to_vector().begin(), logits->to_vector().end());
+    auto vals = logits->values();
+    float max_v = *std::max_element(vals.begin(), vals.end());
 
     float sum_exp = 0.0f;
     for (float v : logits->values())
@@ -229,6 +264,12 @@ TensorPtr cross_entropy_sparse(TensorPtr logits, int target_idx) {
     if (logits->requires_grad()) {
         auto node = make_node(result, {logits});
         node->name = "cross_entropy_sparse";
+        autograd::attach_reference(*node, [target_idx](const std::vector<TensorPtr>& in) -> TensorPtr {
+            // -log softmax(logits)[target]
+            auto flat = reshape(in[0], {in[0]->numel()});
+            auto pick = make_shared<vector<int64_t>>(1, (int64_t)target_idx);
+            return multiply(-1.0f, log_op(gather_flat(softmax(flat), pick, {1})));
+        });
         node->backward_fn = [logits, target_idx, n, max_v, sum_exp](const TensorPtr& result) {
             float scale = result->grad()[0];
             for (int j = 0; j < n; j++) {
