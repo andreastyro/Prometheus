@@ -137,3 +137,20 @@ Shape broadcast_shapes(const Shape& a, const Shape& b);
 /// The integer values of an index tensor -- token ids, class labels -- for
 /// any dtype, exactly. A float holding a non-integer raises.
 std::vector<int64_t> index_values(TensorPtr t, const char* op);
+
+namespace autograd {
+
+/// Gradients of `output` with respect to `inputs`, returned as tensors --
+/// torch.autograd.grad. Unlike output->backward() it leaves every tensor's
+/// grad buffer alone.
+///
+/// With create_graph the returned gradients are themselves in the graph and
+/// can be differentiated again: gradients of gradients, Hessian-vector
+/// products, MAML's meta-gradient. `output` must have one element unless
+/// grad_output gives the weighting. An input the output does not depend on
+/// gets zeros. Every op on the path needs a differentiable backward; one
+/// without it raises, naming the op.
+std::vector<TensorPtr> grad(TensorPtr output, std::vector<TensorPtr> inputs,
+                            bool create_graph = false, TensorPtr grad_output = nullptr);
+
+} // namespace autograd

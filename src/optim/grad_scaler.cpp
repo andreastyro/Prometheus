@@ -21,6 +21,7 @@ TensorPtr GradScaler::scale_loss(TensorPtr loss) {
     if (loss->requires_grad()) {
         float s = scale;
         auto node = make_node(out, {loss});
+        node->name = "GradScaler::scale_loss";
         node->backward_fn = [loss, s](const TensorPtr& out) {
             for (int i = 0; i < out->num_el(); i++)
                 loss->grad()[i] += out->grad()[i] * s;

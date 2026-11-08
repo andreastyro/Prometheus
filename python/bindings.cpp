@@ -191,6 +191,13 @@ PYBIND11_MODULE(prometheus, m) {
     m.def("tanh_op",       &tanh_op);
     m.def("softmax",       &softmax);
     m.def("concat_op",     &concat_op, py::arg("inputs"), py::arg("axis") = 0);
+    m.def("grad", [](TensorPtr output, std::vector<TensorPtr> inputs, bool create_graph,
+                     TensorPtr grad_output) {
+              return autograd::grad(output, inputs, create_graph, grad_output);
+          }, py::arg("output"), py::arg("inputs"), py::arg("create_graph") = false,
+          py::arg("grad_output") = nullptr,
+          "Gradients of output w.r.t. inputs as tensors, like torch.autograd.grad. With "
+          "create_graph=True they can be differentiated again (MAML, Hessian-vector products).");
     m.def("transpose",     &transpose, py::arg("a"), py::arg("dim0") = -2, py::arg("dim1") = -1,
           "Swap two dimensions: an O(1), differentiable view sharing storage.");
     m.def("permute",       &permute, py::arg("a"), py::arg("dims"),

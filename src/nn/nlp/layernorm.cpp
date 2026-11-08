@@ -55,6 +55,7 @@ TensorPtr LayerNorm::forward(TensorPtr input) {
         auto g = gamma;
         auto b = beta;
         auto node = make_node(output, {input, g, b});
+        node->name = "LayerNorm::forward";
         node->backward_fn = [input, g, b,
                             x_hat_all = std::move(x_hat_all),
                             inv_std_all = std::move(inv_std_all),

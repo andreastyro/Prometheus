@@ -125,6 +125,7 @@ TensorPtr GPT::forward(TensorPtr token_ids) {
         auto tw = tok_emb.weight;
         auto pw = pos_emb.weight;
         auto node = make_node(x, {tw, pw});
+        node->name = "GPT::forward";
         node->backward_fn = [tw, pw, tok_ids, S, E](const TensorPtr& x) {
             for (int r = 0; r < (int)tok_ids.size(); r++) {
                 const int t   = r % S;          // position inside its sequence
@@ -166,6 +167,7 @@ TensorPtr GPT::forward(TensorPtr token_ids) {
     // Register backward for the weight-tied projection
     {
         auto node = make_node(logits, {x, tw});
+        node->name = "GPT::forward";
         node->backward_fn = [x, tw, rows, E, V](const TensorPtr& logits) {
             const float* gl = logits->grad();
 

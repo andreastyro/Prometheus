@@ -182,6 +182,7 @@ TensorPtr MultiHeadAttention::forward_rows(TensorPtr input, int batch) {
 
     if (need_grad) {
         auto node = make_node(result, {input, W_q, W_k, W_v, W_o});
+        node->name = "MultiHeadAttention::forward_rows";
 
         bool rope = rope_;
 

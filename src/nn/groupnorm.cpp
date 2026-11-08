@@ -85,6 +85,7 @@ TensorPtr GroupNorm::forward(TensorPtr input) {
 
     if (input->requires_grad() || gamma->requires_grad() || beta->requires_grad()) {
         auto node = make_node(output, {input, gamma, beta});
+        node->name = "GroupNorm::forward";
 
         auto gamma_ = gamma;
         auto beta_  = beta;

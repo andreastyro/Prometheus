@@ -5,6 +5,8 @@
 #include "ml/fastmath.hpp"
 #include "ml/strided.hpp"
 #include <cstring>
+#include <unordered_set>
+#include <unordered_map>
 #include <cmath>
 #include <string>
 
@@ -96,6 +98,9 @@ static void broadcast_walk(const Shape& out, const Shape& sa, const Shape& sb,
     }
 }
 
+// defined with the other higher-order helpers below
+static TensorPtr sum_to(TensorPtr g, const Shape& shape);
+
 enum class BinOp { Add, Sub, Mul, Div };
 
 template <BinOp OP> static inline float bin_fwd(float x, float y) {
@@ -149,6 +154,16 @@ static TensorPtr binary_op(const char* name, TensorPtr a, TensorPtr b) {
 
     if (a->requires_grad() || b->requires_grad()) {
         auto node = make_node(result, {a, b});
+        node->name = name;
+        node->backward_graph = [a, b](const TensorPtr&, const TensorPtr& G) -> std::vector<TensorPtr> {
+            TensorPtr ga, gb;
+            if constexpr (OP == BinOp::Add)      { ga = G; gb = G; }
+            else if constexpr (OP == BinOp::Sub) { ga = G; gb = multiply(-1.0f, G); }
+            else if constexpr (OP == BinOp::Mul) { ga = multiply(G, b); gb = multiply(G, a); }
+            else { ga = divide(G, b); gb = multiply(-1.0f, divide(multiply(G, a), multiply(b, b))); }
+            return { a->requires_grad() ? sum_to(ga, a->shape()) : nullptr,
+                     b->requires_grad() ? sum_to(gb, b->shape()) : nullptr };
+        };
         node->backward_fn = [a, b, same, out_shape](const TensorPtr& result) {
             const float* G  = result->grad();
             const float* A  = a->data();
@@ -204,6 +219,33 @@ vector<int64_t> index_values(TensorPtr t, const char* op) {
     return out;
 }
 
+// ── Higher-order gradients: backward passes written with ops ────────────────
+//
+// Each op that supports it attaches a backward_graph: its gradient formula
+// written with the differentiable ops in this file rather than raw loops. Run
+// with gradients enabled, those ops record a graph of their own, so a
+// gradient can itself be differentiated -- what MAML and Hessian-vector
+// products need. autograd::grad drives them.
+
+// Sum a gradient back down to `shape`, undoing a broadcast: over leading
+// dims the target lacks, and over dims where it had size 1.
+static TensorPtr sum_to(TensorPtr g, const Shape& shape) {
+    if (g->shape() == shape) return g;
+    TensorPtr r = g;
+    const int lead = r->dim() - (int)shape.size();
+    for (int i = 0; i < lead; i++) r = sum(r, 0);
+    for (int i = 0; i < (int)shape.size() && i < r->dim(); i++)
+        if (shape[i] == 1 && r->shape()[i] != 1) r = sum(r, i, true);
+    if (r->shape() != shape) r = reshape(r, shape);
+    return r;
+}
+
+// Broadcast a gradient up to `shape`: the backward of a reduction.
+static TensorPtr expand_to(TensorPtr g, const Shape& shape) {
+    if (g->shape() == shape) return g;
+    return add(Tensor::zeros(shape), g);
+}
+
 
 
 TensorPtr add(TensorPtr a, TensorPtr b) { return binary_op<BinOp::Add>("add", a, b); }
@@ -219,6 +261,8 @@ TensorPtr add(float scalar, TensorPtr a) {
 
     if (a->requires_grad()) {
         auto node = make_node(result, {a});
+        node->name = "add";
+        node->backward_graph = [](const TensorPtr&, const TensorPtr& G) -> std::vector<TensorPtr> { return {G}; };
         node->backward_fn = [a](const TensorPtr& result) {
             const int n_4 = result->num_el();
             #pragma omp parallel for schedule(static) if(n_4 >= 32768)
@@ -243,6 +287,8 @@ TensorPtr multiply(float scalar, TensorPtr a) {
 
     if (a->requires_grad()) {
         auto node = make_node(result, {a});
+        node->name = "multiply";
+        node->backward_graph = [scalar](const TensorPtr&, const TensorPtr& G) -> std::vector<TensorPtr> { return {multiply(scalar, G)}; };
         node->backward_fn = [a, scalar](const TensorPtr& result) {
             const int n_8 = result->num_el();
             #pragma omp parallel for schedule(static) if(n_8 >= 32768)
@@ -290,6 +336,14 @@ TensorPtr matmul(TensorPtr a, TensorPtr b) {
 
         if (a->requires_grad() || b->requires_grad()) {
             auto node = make_node(result, {a, b});
+            node->name = "matmul";
+            node->backward_graph = [a, b, rows, k, n](const TensorPtr&, const TensorPtr& G) -> std::vector<TensorPtr> {
+                TensorPtr ga, gb;
+                if (a->requires_grad()) ga = matmul(G, transpose(b));
+                if (b->requires_grad())
+                    gb = matmul(transpose(reshape(a, {(int64_t)rows, k})), reshape(G, {(int64_t)rows, n}));
+                return {ga, gb};
+            };
             node->backward_fn = [a, b, rows, n, k, b_is_wt](const TensorPtr& result) {
                 const float* g = result->grad();
                 if (a->requires_grad()) {
@@ -331,6 +385,13 @@ TensorPtr matmul(TensorPtr a, TensorPtr b) {
 
     if (a->requires_grad() || b->requires_grad()) {
         auto node = make_node(result, {a, b});
+        node->name = "matmul";
+        node->backward_graph = [a, b](const TensorPtr&, const TensorPtr& G) -> std::vector<TensorPtr> {
+            TensorPtr ga, gb;
+            if (a->requires_grad()) ga = sum_to(matmul(G, transpose(b)), a->shape());
+            if (b->requires_grad()) gb = sum_to(matmul(transpose(a), G), b->shape());
+            return {ga, gb};
+        };
         node->backward_fn = [a, b, ia, ib, nb, m, n, k, sz_a, sz_b, sz_c](const TensorPtr& result) {
             const float* g = result->grad();
             // serial over the batch: a broadcast operand accumulates from
@@ -361,6 +422,16 @@ TensorPtr relu(TensorPtr a) {
 
     if (a->requires_grad()) {
         auto node = make_node(result, {a});
+        node->name = "relu";
+        node->backward_graph = [a](const TensorPtr&, const TensorPtr& G) -> std::vector<TensorPtr> {
+            // the mask is a constant: relu is piecewise linear, so its second
+            // derivative is zero wherever it exists
+            auto mask = make_shared<Tensor>(a->shape());
+            const float* A = a->data();
+            float* M = mask->data();
+            for (int64_t i = 0; i < a->numel(); i++) M[i] = A[i] > 0.0f ? 1.0f : 0.0f;
+            return {multiply(G, mask)};
+        };
         node->backward_fn = [a](const TensorPtr& result) {
             const int n_10 = result->num_el();
             #pragma omp parallel for schedule(static) if(n_10 >= 32768)
@@ -385,6 +456,8 @@ TensorPtr sigmoid(TensorPtr a) {
 
     if (a->requires_grad()){
         auto node = make_node(result, {a});
+        node->name = "sigmoid";
+        node->backward_graph = [](const TensorPtr& out, const TensorPtr& G) -> std::vector<TensorPtr> { return {multiply(G, multiply(out, subtract(1.0f, out)))}; };
 
         node->backward_fn = [a](const TensorPtr& result){
             const int n_12 = result->num_el();
@@ -411,6 +484,8 @@ TensorPtr subtract(float scalar, TensorPtr a) {
 
     if (a->requires_grad()) {
         auto node = make_node(result, {a});
+        node->name = "subtract";
+        node->backward_graph = [](const TensorPtr&, const TensorPtr& G) -> std::vector<TensorPtr> { return {multiply(-1.0f, G)}; };
         node->backward_fn = [a](const TensorPtr& result) {
             const int n_16 = result->num_el();
             #pragma omp parallel for schedule(static) if(n_16 >= 32768)
@@ -433,6 +508,8 @@ TensorPtr subtract(TensorPtr a, float scalar) {
 
     if (a->requires_grad()) {
         auto node = make_node(result, {a});
+        node->name = "subtract";
+        node->backward_graph = [](const TensorPtr&, const TensorPtr& G) -> std::vector<TensorPtr> { return {G}; };
         node->backward_fn = [a](const TensorPtr& result) {
             const int n_18 = result->num_el();
             #pragma omp parallel for schedule(static) if(n_18 >= 32768)
@@ -460,6 +537,8 @@ TensorPtr divide(float scalar, TensorPtr a) {
 
     if (a->requires_grad()) {
         auto node = make_node(result, {a});
+        node->name = "divide";
+        node->backward_graph = [a, scalar](const TensorPtr&, const TensorPtr& G) -> std::vector<TensorPtr> { return {multiply(-scalar, divide(G, multiply(a, a)))}; };
         node->backward_fn = [a, scalar](const TensorPtr& result) {
             const int n_22 = result->num_el();
             #pragma omp parallel for schedule(static) if(n_22 >= 32768)
@@ -484,6 +563,8 @@ TensorPtr divide(TensorPtr a, float scalar) {
 
     if (a->requires_grad()) {
         auto node = make_node(result, {a});
+        node->name = "divide";
+        node->backward_graph = [scalar](const TensorPtr&, const TensorPtr& G) -> std::vector<TensorPtr> { return {multiply(1.0f / scalar, G)}; };
         node->backward_fn = [a, scalar](const TensorPtr& result) {
             const int n_24 = result->num_el();
             #pragma omp parallel for schedule(static) if(n_24 >= 32768)
@@ -507,6 +588,8 @@ TensorPtr tanh_op(TensorPtr a) {
 
     if (a->requires_grad()){
         auto node = make_node(result, {a});
+        node->name = "tanh_op";
+        node->backward_graph = [](const TensorPtr& out, const TensorPtr& G) -> std::vector<TensorPtr> { return {multiply(G, subtract(1.0f, multiply(out, out)))}; };
 
         node->backward_fn = [a](const TensorPtr& result){
             const int n_26 = result->num_el();
@@ -549,6 +632,12 @@ TensorPtr softmax(TensorPtr a) {
 
     if (a->requires_grad()) {
         auto node = make_node(result, {a});
+        node->name = "softmax";
+        node->backward_graph = [](const TensorPtr& out, const TensorPtr& G) -> std::vector<TensorPtr> {
+            // dx = y * (g - sum(g * y)) over the last dim
+            auto s = sum(multiply(G, out), out->dim() - 1, true);
+            return {multiply(out, subtract(G, s))};
+        };
         node->backward_fn = [a, rows, cols](const TensorPtr& result) {
             // dL/dx_j = y_j * (g_j - sum_k g_k y_k), per row
             const float* Y = result->data();
@@ -582,6 +671,8 @@ TensorPtr log_op(TensorPtr a) {
 
     if (a->requires_grad()) {
         auto node = make_node(result, {a});
+        node->name = "log_op";
+        node->backward_graph = [a](const TensorPtr&, const TensorPtr& G) -> std::vector<TensorPtr> { return {divide(G, a)}; };
         node->backward_fn = [a](const TensorPtr& result) {
             const int n_28 = result->num_el();
             #pragma omp parallel for schedule(static) if(n_28 >= 32768)
@@ -605,6 +696,8 @@ TensorPtr exp_op(TensorPtr a) {
 
     if (a->requires_grad()) {
         auto node = make_node(result, {a});
+        node->name = "exp_op";
+        node->backward_graph = [](const TensorPtr& out, const TensorPtr& G) -> std::vector<TensorPtr> { return {multiply(G, out)}; };
         node->backward_fn = [a](const TensorPtr& result) {
             const int n_30 = result->num_el();
             #pragma omp parallel for schedule(static) if(n_30 >= 32768)
@@ -628,6 +721,8 @@ TensorPtr pow_op(TensorPtr a, float p) {
 
     if (a->requires_grad()) {
         auto node = make_node(result, {a});
+        node->name = "pow_op";
+        node->backward_graph = [a, p](const TensorPtr&, const TensorPtr& G) -> std::vector<TensorPtr> { return {multiply(G, multiply(p, pow_op(a, p - 1.0f)))}; };
         node->backward_fn = [a, p](const TensorPtr& result) {
             const int n_32 = result->num_el();
             #pragma omp parallel for schedule(static) if(n_32 >= 32768)
@@ -654,6 +749,8 @@ TensorPtr sqrt_op(TensorPtr a) {
 
     if (a->requires_grad()) {
         auto node = make_node(result, {a});
+        node->name = "sqrt_op";
+        node->backward_graph = [](const TensorPtr& out, const TensorPtr& G) -> std::vector<TensorPtr> { return {divide(G, multiply(2.0f, out))}; };
         node->backward_fn = [a](const TensorPtr& result) {
             const int n_34 = result->num_el();
             #pragma omp parallel for schedule(static) if(n_34 >= 32768)
@@ -677,6 +774,7 @@ TensorPtr abs_op(TensorPtr a) {
 
     if (a->requires_grad()){
         auto node = make_node(result, {a});
+        node->name = "abs_op";
 
         node->backward_fn = [a](const TensorPtr& result){
             const int n_36 = result->num_el();
@@ -711,6 +809,11 @@ static TensorPtr reduce_sum(const char* name, TensorPtr a, int dim, bool keepdim
         result->data()[0] = (float)(mean ? acc / (double)n : acc);
         if (a->requires_grad()) {
             auto node = make_node(result, {a});
+            node->name = name;
+            node->backward_graph = [a, n, mean](const TensorPtr&, const TensorPtr& G) -> std::vector<TensorPtr> {
+                auto g = expand_to(reshape(G, {1}), a->shape());
+                return {mean ? multiply(1.0f / (float)n, g) : g};
+            };
             node->backward_fn = [a, n, mean](const TensorPtr& result) {
                 const float g = result->grad()[0] / (mean ? (float)n : 1.0f);
                 float* GA = a->grad();
@@ -750,6 +853,13 @@ static TensorPtr reduce_sum(const char* name, TensorPtr a, int dim, bool keepdim
 
     if (a->requires_grad()) {
         auto node = make_node(result, {a});
+        node->name = name;
+        node->backward_graph = [a, dim, scale](const TensorPtr&, const TensorPtr& G) -> std::vector<TensorPtr> {
+            Shape kept = a->shape();
+            kept[dim] = 1;
+            auto g = expand_to(reshape(G, kept), a->shape());
+            return {scale != 1.0f ? multiply(scale, g) : g};
+        };
         node->backward_fn = [a, outer, len, inner, scale](const TensorPtr& result) {
             const float* G = result->grad();
             float* GA = a->grad();
@@ -783,6 +893,7 @@ TensorPtr max_op(TensorPtr a) {
 
     if (a->requires_grad()) {
         auto node = make_node(result, {a});
+        node->name = "max_op";
         node->backward_fn = [a, arg](const TensorPtr& result) {
             a->grad()[arg] += result->grad()[0];
         };
@@ -806,6 +917,7 @@ TensorPtr min_op(TensorPtr a) {
 
     if (a->requires_grad()) {
         auto node = make_node(result, {a});
+        node->name = "min_op";
         node->backward_fn = [a, arg](const TensorPtr& result) {
             a->grad()[arg] += result->grad()[0];
         };
@@ -832,6 +944,7 @@ TensorPtr clip(TensorPtr a, float min_val, float max_val) {
 
     if (a->requires_grad()) {
         auto node = make_node(result, {a});
+        node->name = "clip";
         node->backward_fn = [a, min_val, max_val](const TensorPtr& result) {
             const int n_42 = result->num_el();
             #pragma omp parallel for schedule(static) if(n_42 >= 32768)
@@ -889,6 +1002,18 @@ TensorPtr gelu(TensorPtr a) {
 
     if (a->requires_grad()) {
         auto node = make_node(result, {a});
+        node->name = "gelu";
+        node->backward_graph = [a](const TensorPtr&, const TensorPtr& G) -> std::vector<TensorPtr> {
+            // d/dx of 0.5 x (1 + tanh(k (x + c x^3))), built from ops
+            const float k = 0.7978845608f, c = 0.044715f;
+            auto a2    = multiply(a, a);
+            auto t     = tanh_op(multiply(k, add(a, multiply(c, multiply(a2, a)))));
+            auto left  = multiply(0.5f, add(1.0f, t));
+            auto sech2 = subtract(1.0f, multiply(t, t));
+            auto inner = multiply(k, add(1.0f, multiply(3.0f * c, a2)));
+            auto right = multiply(0.5f, multiply(a, multiply(sech2, inner)));
+            return {multiply(G, add(left, right))};
+        };
         node->backward_fn = [a](const TensorPtr& result) {
             constexpr float k = 0.7978845608f;
             int m = a->num_el();
@@ -956,6 +1081,7 @@ TensorPtr concat_op(vector<TensorPtr> inputs, int axis) {
 
     if (any_grad) {
         auto node = make_node(result, inputs);
+        node->name = "concat_op";
         node->backward_fn = [inputs, outer, inner, concat_total, axis](const TensorPtr& result) {
             for (int o = 0; o < outer; o++) {
                 int read = 0;
@@ -993,6 +1119,7 @@ TensorPtr matmul_bt(TensorPtr a, TensorPtr b) {
 
     if (a->requires_grad() || b->requires_grad()) {
         auto node = make_node(result, {a, b});
+        node->name = "matmul_bt";
 
         node->backward_fn = [a, b, m, n, k](const TensorPtr& result) {
             const float* g = result->grad();
@@ -1046,6 +1173,12 @@ TensorPtr permute(TensorPtr a, vector<int> dims) {
 
     if (a->requires_grad()) {
         auto node = make_node(v, {a});
+        node->name = "permute";
+        node->backward_graph = [dims](const TensorPtr&, const TensorPtr& G) -> std::vector<TensorPtr> {
+            vector<int> inv(dims.size());
+            for (size_t i = 0; i < dims.size(); i++) inv[dims[i]] = (int)i;
+            return {permute(G, inv)};
+        };
         node->backward_fn = [a, dims](const TensorPtr& v) {
             // Walking the view in row-major order with these strides lands on
             // each element's row-major position in `a`.
@@ -1101,6 +1234,8 @@ TensorPtr reshape(TensorPtr a, ShapeArg new_shape_arg) {
 
     if (src->requires_grad()) {
         auto node = make_node(v, {src});
+        node->name = "reshape";
+        node->backward_graph = [src](const TensorPtr&, const TensorPtr& G) -> std::vector<TensorPtr> { return {reshape(G, src->shape())}; };
         node->backward_fn = [src](const TensorPtr& v) {
             // element order is unchanged, so the gradient maps one to one
             const int64_t n = src->numel();
@@ -1126,6 +1261,8 @@ TensorPtr contiguous(TensorPtr a) {
 
     if (a->requires_grad()) {
         auto node = make_node(out, {a});
+        node->name = "contiguous";
+        node->backward_graph = [](const TensorPtr&, const TensorPtr& G) -> std::vector<TensorPtr> { return {G}; };
         node->backward_fn = [a](const TensorPtr& out) {
             // both gradients are row-major over the same shape
             const int64_t n = a->numel();
@@ -1184,6 +1321,17 @@ TensorPtr linear_op(TensorPtr x, TensorPtr W, TensorPtr bias, TensorPtr residual
 
     if (need) {
         auto node = make_node(result, inputs);
+        node->name = "linear";
+        node->backward_graph = [x, W, bias, residual, rows, in, out](const TensorPtr&, const TensorPtr& G) -> std::vector<TensorPtr> {
+            std::vector<TensorPtr> g;
+            g.push_back(x->requires_grad() ? matmul(G, transpose(W)) : nullptr);
+            g.push_back(W->requires_grad()
+                ? matmul(transpose(reshape(x, {(int64_t)rows, (int64_t)in})), reshape(G, {(int64_t)rows, (int64_t)out}))
+                : nullptr);
+            if (bias)     g.push_back(bias->requires_grad() ? sum_to(G, bias->shape()) : nullptr);
+            if (residual) g.push_back(residual->requires_grad() ? G : nullptr);
+            return g;
+        };
         node->backward_fn = [x, W, bias, residual, rows, in, out](const TensorPtr& result) {
             const float* g = result->grad();
 
@@ -1213,3 +1361,78 @@ TensorPtr linear_op(TensorPtr x, TensorPtr W, TensorPtr bias, TensorPtr residual
     }
     return result;
 }
+
+// ── autograd::grad ───────────────────────────────────────────────────────────
+
+namespace autograd {
+
+std::vector<TensorPtr> grad(TensorPtr output, std::vector<TensorPtr> inputs,
+                            bool create_graph, TensorPtr grad_output) {
+    if (!output->grad_fn())
+        throw runtime_error("grad(): the output is not part of a graph -- it is a leaf, or was "
+                            "computed with gradients disabled");
+    if (!grad_output) {
+        if (output->numel() != 1)
+            throw runtime_error("grad(): the output has " + to_string(output->numel()) +
+                                " elements; pass grad_output to say how to weight them");
+        grad_output = Tensor::ones(output->shape());
+    }
+
+    // order: every tensor after the tensors it was computed from
+    vector<TensorPtr> order;
+    unordered_set<Tensor*> seen;
+    vector<pair<TensorPtr, bool>> stack{{output, false}};
+    while (!stack.empty()) {
+        auto [t, expanded] = stack.back();
+        stack.pop_back();
+        if (expanded) { order.push_back(t); continue; }
+        if (!t || seen.count(t.get())) continue;
+        seen.insert(t.get());
+        stack.push_back({t, true});
+        if (t->grad_fn())
+            for (auto& in : t->grad_fn()->inputs)
+                if (in && !seen.count(in.get())) stack.push_back({in, false});
+    }
+
+    // Walk backwards accumulating gradients as tensors. With create_graph the
+    // ops that compute them record a graph, so the result can be
+    // differentiated again; without it they are plain values.
+    unordered_map<Tensor*, TensorPtr> g;
+    g[output.get()] = grad_output;
+    const bool previous = grad_enabled();
+    grad_enabled() = create_graph;
+    try {
+        for (auto it = order.rbegin(); it != order.rend(); ++it) {
+            const TensorPtr& t = *it;
+            if (!t->grad_fn()) continue;
+            auto found = g.find(t.get());
+            if (found == g.end()) continue;
+            const auto& node = t->grad_fn();
+            if (!node->backward_graph)
+                throw runtime_error(string("grad(): '") + node->name +
+                                    "' has no differentiable backward yet, so it cannot be on "
+                                    "the path; .backward() still works through it");
+            auto parts = node->backward_graph(t, found->second);
+            for (size_t i = 0; i < node->inputs.size() && i < parts.size(); i++) {
+                const TensorPtr& in = node->inputs[i];
+                if (!parts[i] || !in || !in->requires_grad()) continue;
+                auto& slot = g[in.get()];
+                slot = slot ? add(slot, parts[i]) : parts[i];
+            }
+        }
+    } catch (...) {
+        grad_enabled() = previous;
+        throw;
+    }
+    grad_enabled() = previous;
+
+    // an input the output does not depend on gets zeros
+    vector<TensorPtr> result;
+    for (auto& in : inputs) {
+        auto found = g.find(in.get());
+        result.push_back(found != g.end() ? found->second : Tensor::zeros(in->shape()));
+    }
+    return result;
+}
+
+} // namespace autograd

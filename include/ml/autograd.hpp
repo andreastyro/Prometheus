@@ -34,4 +34,20 @@ struct GradNode {
     /// nothing in the graph points back towards the loss, and the whole graph
     /// goes when the last reference to the output does.
     std::function<void(const TensorPtr& output)> backward_fn;
+
+    /// The op's name, for error messages.
+    const char* name = "op";
+
+    /// The same backward written with differentiable ops: given the output
+    /// and dL/d(output) as tensors, return dL/d(input) for each input, in
+    /// the order of `inputs` (nullptr where an input needs none).
+    ///
+    /// backward_fn writes raw float buffers, which is fast but is a dead end:
+    /// nothing records how those numbers were made, so they cannot be
+    /// differentiated again. This version builds graph like any other op
+    /// when gradients are enabled, which is what autograd::grad with
+    /// create_graph relies on for gradients of gradients. An op without one
+    /// cannot be differentiated through by autograd::grad, which says so.
+    std::function<std::vector<TensorPtr>(const TensorPtr& output,
+                                         const TensorPtr& grad_output)> backward_graph;
 };

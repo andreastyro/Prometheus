@@ -31,6 +31,7 @@ TensorPtr PositionalEncoding::forward(TensorPtr input) {
     // (typically the embedding table) would silently receive no gradient.
     if (input->requires_grad()) {
         auto node = make_node(output, {input});
+        node->name = "PositionalEncoding::forward";
 
         node->backward_fn = [input](const TensorPtr& output) {
             for (int i = 0; i < output->num_el(); i++)

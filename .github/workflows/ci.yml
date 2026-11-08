@@ -90,6 +90,11 @@ jobs:
 
       # Every name the README shows a reader must exist in the module. A
       # commit that renames or removes an op fails here until the docs say so.
+      # Gradients of gradients, checked against finite differences, and the
+      # MAML meta-gradient against finite differences of the meta-loss.
+      - name: Higher-order gradients
+        run: python tests/test_higher_order.py
+
       - name: README matches the API
         run: python tests/check_readme_api.py
 
