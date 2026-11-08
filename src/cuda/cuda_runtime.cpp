@@ -94,7 +94,19 @@ struct State {
 State                         g;
 mutex                         g_mu;
 vector<string>                g_dirs;
-unordered_map<string, CUfunction> g_kernels;
+// keyed by the name and source pointers: both are string literals or static
+// strings, so the pair identifies the kernel without hashing its text
+struct KernelKey {
+    const char* name;
+    const char* source;
+    bool operator==(const KernelKey& o) const { return name == o.name && source == o.source; }
+};
+struct KernelKeyHash {
+    size_t operator()(const KernelKey& k) const {
+        return std::hash<const void*>()(k.name) * 31u ^ std::hash<const void*>()(k.source);
+    }
+};
+unordered_map<KernelKey, CUfunction, KernelKeyHash> g_kernels;
 mutex                         g_kernel_mu;
 map<size_t, vector<CUdeviceptr>> g_pool;   // idle blocks by size
 size_t                        g_pool_bytes = 0;
@@ -283,7 +295,7 @@ CUfunction compile(const Kernel& k) {
 
 CUfunction function(const Kernel& k) {
     bind_context();
-    const string key = string(k.name) + '\x1f' + to_string((uintptr_t)k.source);
+    const KernelKey key{k.name, k.source};
     {
         lock_guard<mutex> lock(g_kernel_mu);
         auto it = g_kernels.find(key);

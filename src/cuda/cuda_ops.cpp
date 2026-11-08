@@ -227,6 +227,21 @@ extern "C" __global__ void r_dim(const float* a, float* y, long long outer, long
     for (long long k = 0; k < len; k++) acc += p[k * inner];
     y[i] = acc * scale;
 }
+// The same when there are few outputs and a long dimension -- the bias
+// gradient sums 1024 rows into 256 columns, which one thread per column ran on
+// 256 threads. Here each thread sums a chunk of `ch` and adds it atomically,
+// so there are outer * inner * chunks threads; y must start at zero.
+extern "C" __global__ void r_dim_chunk(const float* a, float* y, long long outer, long long len, long long inner,
+                                      float scale, long long ch) {
+    const long long outs = outer * inner, chunks = (len + ch - 1) / ch;
+    long long i = gid(); if (i >= outs * chunks) return;
+    const long long c = i / outs, oi = i % outs, o = oi / inner, j = oi % inner;
+    const long long k0 = c * ch, k1 = min(len, k0 + ch);
+    const float* p = a + o * len * inner + j;
+    float acc = 0.0f;
+    for (long long k = k0; k < k1; k++) acc += p[k * inner];
+    atomicAdd(&y[oi], acc * scale);
+}
 // one partial sum per block, tree-reduced in shared memory
 extern "C" __global__ void r_partial(const float* a, float* part, long long n) {
     __shared__ float s[256];
@@ -293,6 +308,9 @@ void attach(const TensorPtr& out, vector<TensorPtr> inputs, const char* name,
 } // namespace
 
 namespace cuda_ops {
+
+TensorPtr softmax_backward(const TensorPtr& y, const TensorPtr& G);
+TensorPtr cross_entropy_backward(const TensorPtr& x, const TensorPtr& targets, const TensorPtr& G);
 
 // An operand on the GPU: a CPU scalar (0-d or one element, as scalar_tensor
 // and wrapped Python numbers make) is moved over; a full CPU tensor is an error.
@@ -451,6 +469,12 @@ TensorPtr reduce(const char* name, const TensorPtr& a0, int dim, bool keepdim, b
         long long o1 = 1;
         void* a2[] = {&pp, &py, &one, &nb, &o1, &s};
         cuda::launch(K("r_dim", REDUCE_SRC()), 1, a2);
+    } else if (outer * inner < 16384 && len >= 64) {
+        cuda::memset_zero(py, (size_t)out->numel() * sizeof(float));
+        long long o = outer, l = len, in = inner, ch = 32;
+        float s = scale;
+        void* args[] = {&pa, &py, &o, &l, &in, &s, &ch};
+        cuda::launch(K("r_dim_chunk", REDUCE_SRC()), outer * inner * ((len + ch - 1) / ch), args);
     } else {
         long long o = outer, l = len, in = inner;
         float s = scale;
@@ -483,6 +507,7 @@ TensorPtr softmax(const TensorPtr& a0) {
     void* args[] = {&pa, &py, &cols};
     if (rows) cuda::launch(K("r_softmax", REDUCE_SRC()), (unsigned)rows, 1, 1, 256, 1, 1, 0, args);
     attach(out, {a}, "softmax", [](const TensorPtr& out, const TensorPtr& G) -> vector<TensorPtr> {
+        if (!grad_enabled()) return {softmax_backward(out, G)};
         auto s = sum(multiply(G, out), out->dim() - 1, true);
         return {multiply(out, subtract(G, s))};
     });
@@ -732,6 +757,78 @@ TensorPtr concat(const vector<TensorPtr>& inputs0, int axis) {
     return out;
 }
 
+// ── fused softmax and cross-entropy backward (see BACKWARD_SRC below) ────────
+
+static const string& SOFTMAX_BACK_SRC() {
+    static const string s = src(R"(
+// dx = y * (g - sum(g * y)) over each row; one block per row
+extern "C" __global__ void b_softmax(const float* y, const float* g, float* dx, long long cols) {
+    __shared__ float s[256];
+    const float* yr = y + (long long)blockIdx.x * cols;
+    const float* gr = g + (long long)blockIdx.x * cols;
+    float* dr = dx + (long long)blockIdx.x * cols;
+    float t = 0.0f;
+    for (long long j = threadIdx.x; j < cols; j += blockDim.x) t += gr[j] * yr[j];
+    s[threadIdx.x] = t;
+    __syncthreads();
+    for (int w = blockDim.x / 2; w > 0; w >>= 1) { if (threadIdx.x < w) s[threadIdx.x] += s[threadIdx.x + w]; __syncthreads(); }
+    const float dot = s[0];
+    for (long long j = threadIdx.x; j < cols; j += blockDim.x) dr[j] = yr[j] * (gr[j] - dot);
+}
+// cross-entropy: dx = (softmax(x) - onehot(target)) * G / rows; one block per row
+extern "C" __global__ void b_cross_entropy(const float* x, const long long* target, const float* G, float* dx,
+                                           long long cols, long long rows) {
+    __shared__ float s[256];
+    const float* xr = x + (long long)blockIdx.x * cols;
+    float* dr = dx + (long long)blockIdx.x * cols;
+    float m = -3.402823466e38f;
+    for (long long j = threadIdx.x; j < cols; j += blockDim.x) m = fmaxf(m, xr[j]);
+    s[threadIdx.x] = m;
+    __syncthreads();
+    for (int w = blockDim.x / 2; w > 0; w >>= 1) { if (threadIdx.x < w) s[threadIdx.x] = fmaxf(s[threadIdx.x], s[threadIdx.x + w]); __syncthreads(); }
+    m = s[0];
+    __syncthreads();
+    float t = 0.0f;
+    for (long long j = threadIdx.x; j < cols; j += blockDim.x) t += expf(xr[j] - m);
+    s[threadIdx.x] = t;
+    __syncthreads();
+    for (int w = blockDim.x / 2; w > 0; w >>= 1) { if (threadIdx.x < w) s[threadIdx.x] += s[threadIdx.x + w]; __syncthreads(); }
+    const float inv = 1.0f / s[0], scale = G[0] / (float)rows;
+    const long long tg = target[blockIdx.x];
+    for (long long j = threadIdx.x; j < cols; j += blockDim.x)
+        dr[j] = (expf(xr[j] - m) * inv - (j == tg ? 1.0f : 0.0f)) * scale;
+}
+)");
+    return s;
+}
+
+TensorPtr softmax_backward(const TensorPtr& y0, const TensorPtr& G0) {
+    auto y = contiguous_on_device(y0), G = contiguous_on_device(f32(G0, "softmax"));
+    long long cols = y->shape().back();
+    const long long rows = cols ? y->numel() / cols : 0;
+    auto dx = empty_cuda(y->shape());
+    const void* py = base(y);
+    const void* pg = base(G);
+    void* pd = dx->storage()->data();
+    void* args[] = {&py, &pg, &pd, &cols};
+    if (rows) cuda::launch(K("b_softmax", SOFTMAX_BACK_SRC()), (unsigned)rows, 1, 1, 256, 1, 1, 0, args);
+    return dx;
+}
+
+TensorPtr cross_entropy_backward(const TensorPtr& x, const TensorPtr& targets, const TensorPtr& G0) {
+    auto G = contiguous_on_device(f32(G0, "cross_entropy"));
+    long long cols = x->shape().back();
+    long long rows = cols ? x->numel() / cols : 0;
+    auto dx = empty_cuda(x->shape());
+    const void* px = base(x);
+    const void* pt = targets->storage()->data();
+    const void* pg = base(G);
+    void* pd = dx->storage()->data();
+    void* args[] = {&px, &pt, &pg, &pd, &cols, &rows};
+    if (rows) cuda::launch(K("b_cross_entropy", SOFTMAX_BACK_SRC()), (unsigned)rows, 1, 1, 256, 1, 1, 0, args);
+    return dx;
+}
+
 // ── cross-entropy over rows of logits ────────────────────────────────────────
 
 static const string& LOSS_SRC() {
@@ -793,7 +890,8 @@ TensorPtr cross_entropy(const TensorPtr& logits0, const vector<int>& targets) {
     }
     // d/dx = (softmax(x) - onehot(target)) / rows, written with ops so the
     // gradient is itself differentiable
-    attach(out, {x}, "cross_entropy", [x, pick, rows](const TensorPtr&, const TensorPtr& G) -> vector<TensorPtr> {
+    attach(out, {x}, "cross_entropy", [x, pick, rows, td](const TensorPtr&, const TensorPtr& G) -> vector<TensorPtr> {
+        if (!grad_enabled()) return {cross_entropy_backward(x, td, G)};
         auto ones = make_shared<Tensor>(Shape{rows}, F32, Device::CUDA);
         fill(ones->storage()->data(), rows, 1.0f);
         auto onehot = scatter_add_flat(ones, pick, x->shape());
@@ -890,8 +988,18 @@ TensorPtr matmul(const TensorPtr& a0, const TensorPtr& b0) {
         }
     }
     attach(out, {a, b}, "matmul", [a, b](const TensorPtr&, const TensorPtr& G) -> vector<TensorPtr> {
-        return {a->requires_grad() ? sum_to(::matmul(G, transpose(b)), a->shape()) : nullptr,
-                b->requires_grad() ? sum_to(::matmul(transpose(a), G), b->shape()) : nullptr};
+        TensorPtr gb;
+        if (b->requires_grad()) {
+            if (b->dim() == 2 && a->dim() > 2) {
+                // a weight: every row of a contributes, so it is one product
+                // over all of them -- not one per batch entry summed after
+                const int64_t kk = a->size(-1), rows = a->numel() / kk;
+                gb = ::matmul(transpose(reshape(a, {rows, kk})), reshape(G, {rows, G->size(-1)}));
+            } else {
+                gb = sum_to(::matmul(transpose(a), G), b->shape());
+            }
+        }
+        return {a->requires_grad() ? sum_to(::matmul(G, transpose(b)), a->shape()) : nullptr, gb};
     });
     return half_out ? cast_op(out, d) : out;
 }
@@ -1121,18 +1229,21 @@ extern "C" __global__ void b_layernorm_rows(const float* x, const float* g, cons
     }
     if (threadIdx.x == 0) { mean_out[blockIdx.x] = mean; inv_out[blockIdx.x] = inv; }
 }
-// gamma / beta gradients: one thread per column, summing over the rows
+// gamma / beta gradients: a thread per (chunk of 32 rows, column), added
+// atomically -- one thread per column left most of the GPU idle
 extern "C" __global__ void b_layernorm_cols(const float* x, const float* dy, const float* mean, const float* inv,
                                             float* dg, float* db, long long rows, long long cols) {
-    long long j = gid(); if (j >= cols) return;
+    const long long chunks = (rows + 31) / 32;
+    long long i = gid(); if (i >= cols * chunks) return;
+    const long long j = i % cols, r0 = (i / cols) * 32, r1 = min(rows, r0 + 32);
     float ag = 0.0f, ab = 0.0f;
-    for (long long r = 0; r < rows; r++) {
+    for (long long r = r0; r < r1; r++) {
         const float d = dy[r * cols + j];
         ag += d * (x[r * cols + j] - mean[r]) * inv[r];
         ab += d;
     }
-    dg[j] = ag;
-    db[j] = ab;
+    atomicAdd(&dg[j], ag);
+    atomicAdd(&db[j], ab);
 }
 // GELU (tanh form): dx = dy * d/dx [0.5 x (1 + tanh(k (x + c x^3)))]
 extern "C" __global__ void b_gelu(const float* x, const float* dy, float* dx, long long n) {
@@ -1159,7 +1270,8 @@ vector<TensorPtr> layernorm_backward(const TensorPtr& x0, const TensorPtr& g0, c
     auto G = contiguous_on_device(f32(G0, "LayerNorm"));
     long long cols = x->shape().back();
     long long rows = cols ? x->numel() / cols : 0;
-    auto dx = empty_cuda(x->shape()), dg = empty_cuda({cols}), db = empty_cuda({cols});
+    auto dx = empty_cuda(x->shape());
+    auto dg = make_shared<Tensor>(Shape{cols}, F32, Device::CUDA), db = make_shared<Tensor>(Shape{cols}, F32, Device::CUDA);
     auto mean = empty_cuda({max(rows, 1LL)}), inv = empty_cuda({max(rows, 1LL)});
     const void* px = base(x);
     const void* pg = base(g);
@@ -1172,7 +1284,7 @@ vector<TensorPtr> layernorm_backward(const TensorPtr& x0, const TensorPtr& g0, c
     void* a1[] = {&px, &pg, &pd, &pdx, &pm, &pi, &cols, &eps};
     if (rows) cuda::launch(K("b_layernorm_rows", BACKWARD_SRC()), (unsigned)rows, 1, 1, 256, 1, 1, 0, a1);
     void* a2[] = {&px, &pd, &pm, &pi, &pdg, &pdb, &rows, &cols};
-    cuda::launch(K("b_layernorm_cols", BACKWARD_SRC()), cols, a2);
+    cuda::launch(K("b_layernorm_cols", BACKWARD_SRC()), cols * ((rows + 31) / 32), a2);
     return {dx, dg, db};
 }
 

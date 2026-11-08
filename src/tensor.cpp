@@ -12,6 +12,9 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
+#include <chrono>
+#include <map>
+#include <cstdlib>
 #include <new>
 #include <unordered_map>
 #include <mutex>
@@ -730,9 +733,27 @@ void Tensor::backward() {
     // float64 ops have no such kernel: those run their backward_graph -- the
     // same formula written with ops, which compute in float64 -- with
     // recording off, and add the result into each input's buffer.
+    // PROMETHEUS_PROFILE_BACKWARD=1: time each node (waiting for the GPU after
+    // each) and print the totals by op, slowest first
+    static const bool profile = std::getenv("PROMETHEUS_PROFILE_BACKWARD") != nullptr;
+    std::map<std::string, std::pair<double, int>> prof;
+    auto now = [] { return std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count(); };
     for (TensorPtr& t : order) {
         const auto& node = t->grad_fn();
         if (!node) continue;
+        const double t0 = profile ? now() : 0.0;
+        struct Timer {
+            bool on; double t0; const char* name; const TensorPtr& t;
+            std::map<std::string, std::pair<double, int>>& out; double (*clock)();
+            ~Timer() {
+                if (!on) return;
+                if (t->device() == Device::CUDA) cuda::synchronize();
+                auto& e = out[name];
+                e.first += clock() - t0;
+                e.second++;
+            }
+        } timer{profile, t0, node->name, t, prof, +now};
         // float64 and GPU tensors keep their gradients outside the float32
         // host buffers the raw kernels write
         auto special = [](const TensorPtr& x) {
@@ -755,6 +776,15 @@ void Tensor::backward() {
             const TensorPtr& in = node->inputs[i];
             if (parts[i] && in && in->requires_grad()) in->accumulate_grad(parts[i]);
         }
+    }
+    if (profile) {
+        std::vector<std::pair<double, std::string>> rows;
+        double total = 0.0;
+        for (auto& [name, e] : prof) { rows.push_back({e.first, name}); total += e.first; }
+        std::sort(rows.rbegin(), rows.rend());
+        std::printf("backward: %.2f ms over %zu op kinds\n", total, rows.size());
+        for (auto& [ms, name] : rows)
+            std::printf("  %-32s %8.2f ms  %5d calls\n", name.c_str(), ms, prof[name].second);
     }
 }
 
