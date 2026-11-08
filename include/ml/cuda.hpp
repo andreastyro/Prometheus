@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include "ml/tensor.hpp"
 
 /// The GPU, loaded at runtime.
 ///
@@ -23,6 +24,11 @@ bool available();
 std::string status();
 
 std::string device_name();
+/// Tensor cores (compute 7.0+): fp16 matmuls run on them.
+bool has_tensor_cores();
+/// bfloat16 matmuls in hardware (compute 8.0+). Older GPUs compute bf16
+/// matmuls in float32 and round, which is correct but no faster.
+bool has_bf16();
 /// Compute capability as major*10 + minor (52 for a GTX 970).
 int compute_capability();
 std::size_t total_memory();
@@ -81,5 +87,13 @@ void sgemm_batched(bool trans_a, bool trans_b, int m, int n, int k, float alpha,
                    const float* a, int lda, long long stride_a,
                    const float* b, int ldb, long long stride_b, float beta,
                    float* c, int ldc, long long stride_c, int batch);
+
+/// The same with float16 / bfloat16 inputs (both of `dtype`) and a float32
+/// result, accumulated in float32 -- on tensor cores where the GPU has them.
+/// bfloat16 needs has_bf16(). `batch` products as sgemm_batched.
+void gemm_half(bool trans_a, bool trans_b, int m, int n, int k, DType dtype,
+               const void* a, int lda, long long stride_a,
+               const void* b, int ldb, long long stride_b,
+               float* c, int ldc, long long stride_c, int batch);
 
 } // namespace cuda

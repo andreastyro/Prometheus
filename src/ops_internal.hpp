@@ -132,4 +132,6 @@ void adam_step(float* w, const float* g, float* m, float* v, int64_t n, float lr
 void rmsprop_step(float* w, const float* g, float* v, int64_t n, float lr, float b, float eps);
 double sum_squares(const float* a, int64_t n);
 void scale_inplace(float* a, int64_t n, float c);
+/// g /= scale in place, zeroing non-finite entries; false if there were any
+bool unscale_inplace(float* g, int64_t n, float inv);
 }

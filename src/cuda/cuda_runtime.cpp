@@ -424,6 +424,10 @@ struct Cublas {
     int (*sgemm_batched)(cublasHandle_t, int, int, int, int, int, const float*, const float*, int,
                          long long, const float*, int, long long, const float*, float*, int,
                          long long, int);
+    // cublasGemmStridedBatchedEx: typed operands, a compute type and an algorithm
+    int (*gemm_ex)(cublasHandle_t, int, int, int, int, int, const void*, const void*, int, int,
+                   long long, const void*, int, int, long long, const void*, void*, int, int,
+                   long long, int, int, int);
 };
 Cublas         g_blas{};
 cublasHandle_t g_handle = nullptr;
@@ -442,7 +446,8 @@ void init_blas_locked() {
 #endif
     if (!lib) { g_blas_why = "cuBLAS not found; pip install nvidia-cublas-cu12"; return; }
     if (!bind(lib, g_blas.create, "cublasCreate_v2") || !bind(lib, g_blas.sgemm, "cublasSgemm_v2") ||
-        !bind(lib, g_blas.sgemm_batched, "cublasSgemmStridedBatched")) {
+        !bind(lib, g_blas.sgemm_batched, "cublasSgemmStridedBatched") ||
+        !bind(lib, g_blas.gemm_ex, "cublasGemmStridedBatchedEx")) {
         g_blas_why = "cuBLAS is missing an entry point";
         return;
     }
@@ -497,6 +502,23 @@ void sgemm_batched(bool ta, bool tb, int m, int n, int k, float alpha, const flo
     auto h = blas_handle();
     check_blas(g_blas.sgemm_batched(h, tb ? 1 : 0, ta ? 1 : 0, n, m, k, &alpha, b, ldb, sb, a, lda, sa,
                                     &beta, c, ldc, sc, batch), "sgemm (batched)");
+}
+
+bool has_tensor_cores() { return available() && state().cc >= 70; }
+bool has_bf16()         { return available() && state().cc >= 80; }
+
+void gemm_half(bool ta, bool tb, int m, int n, int k, DType dtype, const void* a, int lda, long long sa,
+               const void* b, int ldb, long long sb, float* c, int ldc, long long sc, int batch) {
+    if (m == 0 || n == 0 || batch == 0) return;
+    // cudaDataType: CUDA_R_32F 0, CUDA_R_16F 2, CUDA_R_16BF 14; CUBLAS_COMPUTE_32F 68
+    const int type = dtype == DType::Float16 ? 2 : dtype == DType::BFloat16 ? 14 : -1;
+    if (type < 0) throw runtime_error("gemm_half: inputs must be float16 or bfloat16");
+    if (type == 14 && !has_bf16())
+        throw runtime_error("gemm_half: bfloat16 matmuls need compute 8.0 or newer");
+    auto h = blas_handle();
+    const float alpha = 1.0f, beta = 0.0f;
+    check_blas(g_blas.gemm_ex(h, tb ? 1 : 0, ta ? 1 : 0, n, m, k, &alpha, b, type, ldb, sb, a, type, lda, sa,
+                              &beta, c, 0, ldc, sc, batch, 68, -1), "GemmEx");
 }
 
 void launch(const Kernel& k, int64_t n, void** args, unsigned block) {

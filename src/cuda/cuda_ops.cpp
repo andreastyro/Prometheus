@@ -318,13 +318,11 @@ TensorPtr cast(const TensorPtr& a, DType d) {
 TensorPtr copy(const TensorPtr& a) { return cast(a, a->dtype()); }
 
 // operands for a float32 kernel: on the device, as float32
+// through cast_op, so a half-precision input's gradient flows back through
+// the conversion
 static TensorPtr f32(const TensorPtr& t, const char* op) {
     auto d = on_device(t, op);
-    if (d->dtype() == F32) return d;
-    if (d->dtype() == DType::Float64 || d->dtype() == DType::Float16 || d->dtype() == DType::BFloat16 ||
-        d->dtype() == DType::Int64 || d->dtype() == DType::Int32 || d->dtype() == DType::Bool)
-        return cast(d, F32);
-    return d;
+    return d->dtype() == F32 ? d : cast_op(d, F32);
 }
 
 TensorPtr unary(const char* kernel, const char* name, const TensorPtr& a0, float p0, float p1,
@@ -806,8 +804,30 @@ TensorPtr cross_entropy(const TensorPtr& logits0, const vector<int>& targets) {
 // ── matmul on cuBLAS ─────────────────────────────────────────────────────────
 
 TensorPtr matmul(const TensorPtr& a0, const TensorPtr& b0) {
-    auto a = contiguous_on_device(f32(a0, "matmul"));
-    auto b = contiguous_on_device(f32(b0, "matmul"));
+    // Two float16 (or, on compute 8.0+, bfloat16) operands multiply as they
+    // are, through GemmEx: float32 accumulation, tensor cores where present.
+    // Anything else multiplies in float32; a half result is rounded back.
+    const DType d = result_type(a0, b0);
+    const bool half_out = d == DType::Float16 || d == DType::BFloat16;
+    const bool half_in = half_out && a0->dtype() == d && b0->dtype() == d &&
+                         (d == DType::Float16 || cuda::has_bf16());
+    auto a = contiguous_on_device(half_in ? on_device(a0, "matmul") : f32(a0, "matmul"));
+    auto b = contiguous_on_device(half_in ? on_device(b0, "matmul") : f32(b0, "matmul"));
+    const size_t es = dtype_size(a->dtype());
+    auto gemm = [&](int m_, int n_, int k_, const void* pa, long long sa, const void* pb, long long sb,
+                    float* pc, long long sc, int batch) {
+        if (half_in)
+            cuda::gemm_half(false, false, m_, n_, k_, d, pa, k_, sa, pb, n_, sb, pc, n_, sc, batch);
+        else if (batch == 1)
+            cuda::sgemm(false, false, m_, n_, k_, 1.0f, static_cast<const float*>(pa), k_,
+                        static_cast<const float*>(pb), n_, 0.0f, pc, n_);
+        else
+            cuda::sgemm_batched(false, false, m_, n_, k_, 1.0f, static_cast<const float*>(pa), k_, sa,
+                                static_cast<const float*>(pb), n_, sb, 0.0f, pc, n_, sc, batch);
+    };
+    auto at = [&](const TensorPtr& t, int64_t elems) {
+        return static_cast<const void*>(static_cast<const unsigned char*>(base(t)) + elems * es);
+    };
     const int64_t m = a->size(-2), k = a->size(-1), n = b->size(-1);
     TensorPtr out;
     if (b->dim() == 2) {
@@ -816,9 +836,8 @@ TensorPtr matmul(const TensorPtr& a0, const TensorPtr& b0) {
         out_shape.back() = n;
         out = make_shared<Tensor>(out_shape, F32, Device::CUDA);
         if (k > 0)
-            cuda::sgemm(false, false, (int)(a->numel() / k), (int)n, (int)k, 1.0f,
-                        static_cast<const float*>(base(a)), (int)k, static_cast<const float*>(base(b)), (int)n,
-                        0.0f, static_cast<float*>(out->storage()->data()), (int)n);
+            gemm((int)(a->numel() / k), (int)n, (int)k, base(a), 0, base(b), 0,
+                 static_cast<float*>(out->storage()->data()), 0, 1);
     } else {
         const Shape batch_a(a->shape().begin(), a->shape().end() - 2);
         const Shape batch_b(b->shape().begin(), b->shape().end() - 2);
@@ -829,27 +848,23 @@ TensorPtr matmul(const TensorPtr& a0, const TensorPtr& b0) {
         out = make_shared<Tensor>(out_shape, F32, Device::CUDA);
         int64_t nb = 1;
         for (int64_t v : batch) nb *= v;
-        const float* pa = static_cast<const float*>(base(a));
-        const float* pb = static_cast<const float*>(base(b));
         float* pc = static_cast<float*>(out->storage()->data());
         if (k > 0 && batch_a == batch && batch_b == batch) {
-            cuda::sgemm_batched(false, false, (int)m, (int)n, (int)k, 1.0f, pa, (int)k, m * k, pb, (int)n, k * n,
-                                0.0f, pc, (int)n, m * n, (int)nb);
+            gemm((int)m, (int)n, (int)k, base(a), m * k, base(b), k * n, pc, m * n, (int)nb);
         } else if (k > 0) {
             // broadcast batch dims: one product per output matrix
             vector<int64_t> ia((size_t)nb, 0), ib((size_t)nb, 0);
             broadcast_walk(batch, broadcast_strides(batch_a, batch), broadcast_strides(batch_b, batch), false,
                            [&](int64_t i, int64_t x, int64_t y) { ia[i] = x; ib[i] = y; });
             for (int64_t q = 0; q < nb; q++)
-                cuda::sgemm(false, false, (int)m, (int)n, (int)k, 1.0f, pa + ia[q] * m * k, (int)k,
-                            pb + ib[q] * k * n, (int)n, 0.0f, pc + q * m * n, (int)n);
+                gemm((int)m, (int)n, (int)k, at(a, ia[q] * m * k), 0, at(b, ib[q] * k * n), 0, pc + q * m * n, 0, 1);
         }
     }
     attach(out, {a, b}, "matmul", [a, b](const TensorPtr&, const TensorPtr& G) -> vector<TensorPtr> {
         return {a->requires_grad() ? sum_to(::matmul(G, transpose(b)), a->shape()) : nullptr,
                 b->requires_grad() ? sum_to(::matmul(transpose(a), G), b->shape()) : nullptr};
     });
-    return out;
+    return half_out ? cast_op(out, d) : out;
 }
 
 // ── fused LayerNorm forward, dropout masks, optimizer updates ─────────────────
@@ -929,6 +944,12 @@ extern "C" __global__ void o_sumsq(const float* a, float* part, long long n) {
     for (int w = blockDim.x / 2; w > 0; w >>= 1) { if (threadIdx.x < w) s[threadIdx.x] += s[threadIdx.x + w]; __syncthreads(); }
     if (threadIdx.x == 0) part[blockIdx.x] = s[0];
 }
+// g *= inv, or 0 and a flag where g is not finite (the GradScaler's unscale)
+extern "C" __global__ void o_unscale(float* g, long long n, float inv, int* bad) {
+    long long i = gid(); if (i >= n) return;
+    float v = g[i];
+    if (isinf(v) || isnan(v)) { *bad = 1; g[i] = 0.0f; } else g[i] = v * inv;
+}
 extern "C" __global__ void o_scale(float* a, long long n, float c) {
     long long i = gid(); if (i >= n) return;
     a[i] *= c;
@@ -997,6 +1018,18 @@ double sum_squares(const float* a, int64_t n) {
     double total = 0.0;
     for (float v : h) total += v;
     return total;
+}
+
+bool unscale_inplace(float* g, int64_t n, float inv) {
+    if (n <= 0) return true;
+    auto flag = make_shared<Tensor>(Shape{1}, DType::Int32, Device::CUDA);      // zeroed
+    void* pf = flag->storage()->data();
+    long long nn = n;
+    void* args[] = {&g, &nn, &inv, &pf};
+    cuda::launch(K("o_unscale", FUSED_SRC()), nn, args);
+    int bad = 0;
+    cuda::copy_to_host(&bad, pf, sizeof bad);
+    return bad == 0;
 }
 
 void scale_inplace(float* a, int64_t n, float c) {

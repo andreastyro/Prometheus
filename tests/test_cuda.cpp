@@ -7,6 +7,7 @@
 #include "ml/tensor.hpp"
 #include "ml/utils/testing.hpp"
 #include "ml/loss.hpp"
+#include "ml/optim/grad_scaler.hpp"
 #include "ml/optim/adam.hpp"
 #include "ml/optim/adamw.hpp"
 #include "ml/optim/rmsprop.hpp"
@@ -492,6 +493,75 @@ int main() {
         std::remove("_test_cuda_adamw.bin");
         CHECK_TRUE("AdamW state saved from the GPU reloads", og2.t == og.t && og2.m.size() == og.m.size() &&
                    og2.m[0] == og.m[0] && og2.v[3] == og.v[3]);
+    }
+
+    // ── phase 3: half precision, GemmEx, autocast, GradScaler ──
+    {
+        std::printf("  tensor cores: %s, bf16 in hardware: %s\n", cuda::has_tensor_cores() ? "yes" : "no",
+                    cuda::has_bf16() ? "yes" : "no");
+        auto h = cast_op(G(x), DType::Float16), hc = cast_op(x, DType::Float16);
+        CHECK_TRUE("float16 stays float16 through add, exp, sum, softmax",
+                   add(h, h)->dtype() == DType::Float16 && exp_op(h)->dtype() == DType::Float16 &&
+                   sum(h, -1)->dtype() == DType::Float16 && softmax(h)->dtype() == DType::Float16);
+        CHECK_TRUE("float16 ops match the CPU's float16 ops",
+                   max_diff(add(h, exp_op(h)), add(hc, exp_op(hc))) <= 1e-2f);
+        for (DType d : {DType::Float16, DType::BFloat16}) {
+            auto a = random_tensor({48, 64}, 81), b = random_tensor({64, 40}, 82);
+            auto ac = cast_op(a, d), bc = cast_op(b, d);
+            auto r = matmul(cast_op(G(a), d), cast_op(G(b), d));
+            CHECK_TRUE((std::string(dtype_name(d)) + " matmul returns " + dtype_name(d)).c_str(), r->dtype() == d);
+            // both round a float32-accumulated product of the same rounded inputs
+            CHECK_NEAR((std::string(dtype_name(d)) + " matmul matches the CPU").c_str(),
+                       rel(r, matmul(ac, bc)), 0.0f, d == DType::Float16 ? 2e-3f : 1e-2f);
+            auto a3 = cast_op(G(random_tensor({3, 8, 16}, 83)), d), b3 = cast_op(G(random_tensor({3, 16, 5}, 84)), d);
+            CHECK_TRUE((std::string(dtype_name(d)) + " batched matmul").c_str(),
+                       rel(matmul(a3, b3), matmul(a3->to(Device::CPU), b3->to(Device::CPU))) < 1e-2f);
+        }
+        // gradients through a float16 matmul land in the leaf's float32 buffer
+        auto w0 = random_tensor({16, 8}, 85), x0 = random_tensor({4, 16}, 86);
+        auto wl = cast_op(w0, DType::Float16)->to(Device::CUDA), wc = cast_op(w0, DType::Float16);
+        wl->set_requires_grad(true);
+        wc->set_requires_grad(true);
+        sum(matmul(cast_op(G(x0), DType::Float16), wl), -1)->backward();
+        sum(matmul(cast_op(x0, DType::Float16), wc), -1)->backward();
+        double m = 0;
+        const auto g1 = wl->grad_doubles(), g2 = wc->grad_doubles();
+        for (size_t j = 0; j < g2.size(); j++) m = std::max(m, std::fabs(g1[j] - g2[j]) / std::max(1.0, std::fabs(g2[j])));
+        CHECK_NEAR("gradient through a float16 matmul", (float)m, 0.0f, 1e-2f);
+
+        // autocast on the GPU: the same rules as the CPU
+        Linear lin(16, 8);
+        lin.to(Device::CUDA);
+        TensorPtr hl, sm;
+        {
+            Autocast ac(DType::BFloat16);
+            hl = lin.forward(G(x0));
+            sm = softmax(hl);
+        }
+        CHECK_TRUE("autocast: Linear on the GPU returns bfloat16", hl->dtype() == DType::BFloat16);
+        CHECK_TRUE("autocast: softmax returns float32", sm->dtype() == DType::Float32);
+        sum(sm, -1)->backward();
+        const auto lg = lin.weights->grad_doubles();
+        bool finite = !lg.empty();
+        for (double v : lg) finite = finite && std::isfinite(v);
+        CHECK_TRUE("autocast: float32 weights on the GPU get finite gradients", finite);
+
+        // GradScaler with GPU parameters
+        auto p1 = G(random_tensor({100}, 87));
+        p1->set_requires_grad(true);
+        GradScaler scaler(1024.0f);
+        scaler.scale_loss(sum(multiply(p1, p1), -1))->backward();
+        const bool clean = scaler.unscale({p1});
+        const auto gp = p1->grad_doubles();
+        const auto pv = p1->to(Device::CPU)->to_vector();
+        double err = 0;
+        for (size_t j = 0; j < gp.size(); j++) err = std::max(err, std::fabs(gp[j] - 2.0 * pv[j]));
+        CHECK_TRUE("GradScaler: unscaled GPU gradients are the true ones", clean && err < 1e-4);
+        std::vector<float> bad(100, 1.0f);
+        bad[7] = INFINITY;
+        p1->set_grad(bad);
+        CHECK_TRUE("GradScaler: an inf on the GPU is caught", !scaler.unscale({p1}));
+        CHECK_TRUE("GradScaler: and zeroed", p1->grad_doubles()[7] == 0.0);
     }
 
     // a CPU leaf that goes to the GPU and back gets its gradient on the CPU

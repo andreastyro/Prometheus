@@ -219,7 +219,9 @@ TensorPtr unary(const char* name, const TensorPtr& a, function<double(double)> f
                 const Self1& self, bool keeps_int, bool range_op, const char* cuda_kernel, float p0, float p1) {
     if (a->device() == Device::CUDA) {
         if (!cuda_kernel) throw runtime_error(string(name) + ": not available on the GPU yet");
-        return cuda_ops::unary(cuda_kernel, name, a, p0, p1, graph);
+        auto r = cuda_ops::unary(cuda_kernel, name, a, p0, p1, graph);
+        const bool half = a->dtype() == F16 || a->dtype() == BF16;
+        return (half && !(range_op && g_autocast != F32)) ? cast_op(r, a->dtype()) : r;
     }
     const DType d = a->dtype();
     if (d == F32) return nullptr;
@@ -659,8 +661,11 @@ TensorPtr isinf_op(TensorPtr a)    { return map_values(a, BOOL, [](double x) -> 
 TensorPtr isfinite_op(TensorPtr a) { return map_values(a, BOOL, [](double x) -> double { return std::isfinite(x); }); }
 
 TensorPtr where(TensorPtr cond, TensorPtr a, TensorPtr b) {
-    if (cond->device() == Device::CUDA || a->device() == Device::CUDA || b->device() == Device::CUDA)
-        return cuda_ops::where(cond, a, b);
+    if (cond->device() == Device::CUDA || a->device() == Device::CUDA || b->device() == Device::CUDA) {
+        const DType d = result_type(a, b);
+        auto r = cuda_ops::where(cond, a, b);
+        return (d == F16 || d == BF16) ? cast_op(r, d) : r;
+    }
     const DType d = result_type(a, b);
     auto A = cast_op(a, d), B = cast_op(b, d);
     const auto C = plain(cond), Ap = plain(A), Bp = plain(B);

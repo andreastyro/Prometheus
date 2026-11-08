@@ -1,6 +1,8 @@
 #include "ml/tensor.hpp"
 #include "ml/ops.hpp"
 #include "ml/optim/grad_scaler.hpp"
+#include "ml/optim/optimizer.hpp"
+#include "../ops_internal.hpp"
 
 using namespace std;
 
@@ -15,6 +17,7 @@ GradScaler::GradScaler(float init_scale, float growth_factor,
 // silently disables training for anyone using the mixed-precision path.
 TensorPtr GradScaler::scale_loss(TensorPtr loss) {
     if (!enabled) return loss;
+    if (loss->device() == Device::CUDA) return multiply(scale, loss);
     auto out = make_shared<Tensor>(loss->shape());
     for (int i = 0; i < (int)loss->numel(); i++)
         out->data()[i] = loss->data()[i] * scale;
@@ -39,6 +42,12 @@ bool GradScaler::unscale(vector<TensorPtr> params) {
     if (!enabled) return true;
     bool clean = true;
     for (auto& p : params) {
+        if (p->device() == Device::CUDA) {
+            if (p->has_grad() &&
+                !cuda_ops::unscale_inplace(const_cast<float*>(device_grad(p)), p->numel(), 1.0f / scale))
+                clean = false;
+            continue;
+        }
         for (float& g : p->grad_values()) {
             if (std::isinf(g) || std::isnan(g)) {
                 clean = false;

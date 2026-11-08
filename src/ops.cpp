@@ -627,7 +627,11 @@ TensorPtr tanh_op(TensorPtr a) {
 // or below zero. Without it a logit of 90 already overflows to inf and the
 // result is NaN, which attention scores and an untrained output layer reach.
 TensorPtr softmax(TensorPtr a) {
-    if (a->device() == Device::CUDA) return cuda_ops::softmax(a);
+    if (a->device() == Device::CUDA) {
+        auto r = cuda_ops::softmax(a);
+        const bool half = a->dtype() == DType::Float16 || a->dtype() == DType::BFloat16;
+        return (half && autocast_dtype() == DType::Float32) ? cast_op(r, a->dtype()) : r;
+    }
     if (auto r = dispatch::softmax(a, [](TensorPtr x) { return softmax(x); })) return r;
     a = checked_input("softmax", a);
     if (a->dim() < 1) throw runtime_error("softmax: needs at least one dimension");
@@ -843,7 +847,11 @@ TensorPtr abs_op(TensorPtr a) {
 // relies on -1 meaning "all", and quietly changing it would change numbers
 // without raising. Any other negative dim is refused rather than guessed at.
 static TensorPtr reduce_sum(const char* name, TensorPtr a, int dim, bool keepdim, bool mean) {
-    if (a->device() == Device::CUDA) return cuda_ops::reduce(name, a, dim, keepdim, mean);
+    if (a->device() == Device::CUDA) {
+        auto r = cuda_ops::reduce(name, a, dim, keepdim, mean);
+        const bool half = a->dtype() == DType::Float16 || a->dtype() == DType::BFloat16;
+        return (half && autocast_dtype() == DType::Float32) ? cast_op(r, a->dtype()) : r;
+    }
     if (auto r = dispatch::reduce(name, a, dim, keepdim, mean,
                                   [=](TensorPtr x) { return reduce_sum(name, x, dim, keepdim, mean); }))
         return r;

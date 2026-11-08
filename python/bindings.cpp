@@ -355,6 +355,10 @@ PYBIND11_MODULE(_C, m) {
           "True when an NVIDIA GPU and its driver are present. Never raises.");
     m.def("cuda_status", &cuda::status,
           "The GPU in use, or why there is none.");
+    m.def("cuda_has_tensor_cores", &cuda::has_tensor_cores,
+          "Tensor cores (compute 7.0+): float16 matmuls run on them.");
+    m.def("cuda_has_bf16", &cuda::has_bf16,
+          "bfloat16 matmuls in hardware (compute 8.0+); older GPUs compute them in float32.");
     m.def("cuda_synchronize", &cuda::synchronize,
           "Wait for queued GPU work; for timing.");
 
