@@ -186,3 +186,98 @@ TensorPtr gather_flat(TensorPtr x, std::shared_ptr<const std::vector<int64_t>> i
 /// zeros(out_shape) with g's elements added at idx.
 TensorPtr scatter_add_flat(TensorPtr g, std::shared_ptr<const std::vector<int64_t>> idx,
                            ShapeArg out_shape);
+
+// ── Dtypes: promotion, casting, comparisons, masks ───────────────────────────
+//
+// Every op takes every dtype. float32 runs the fast kernels; float64 computes
+// in double with double gradients; float16 and bfloat16 are stored narrow and
+// computed with float32 arithmetic, the result rounded back; int and bool go
+// through exact integer arithmetic where the result stays integral (add,
+// subtract, multiply, sums) and are promoted to float32 where it cannot (true
+// division, exp, ...). The layers (conv, norms, recurrent, attention) take
+// float32, float16 and bfloat16, computing in float32; float64 is for the
+// tensor ops above, which is what float64 gradient checks use.
+
+/// The dtype a binary op on a and b produces -- PyTorch's rule. Categories
+/// rank bool < integer < floating, the higher category wins, and within one
+/// the wider type: int32+int64 -> int64, float16+bfloat16 -> float32. A 0-d
+/// tensor (a wrapped scalar) only promotes across categories: an int32
+/// tensor plus a 0-d int64 stays int32.
+DType result_type(const TensorPtr& a, const TensorPtr& b);
+/// The promotion of two dtypes, both treated as full tensors.
+DType promote_types(DType a, DType b);
+
+/// `a` in `dtype`, the tensor itself if it already is. Differentiable between
+/// floating dtypes (the gradient is cast back); out of the graph otherwise.
+TensorPtr cast_op(TensorPtr a, DType dtype);
+
+/// Element-wise comparisons, broadcasting, returning bool.
+TensorPtr eq(TensorPtr a, TensorPtr b);
+TensorPtr ne(TensorPtr a, TensorPtr b);
+TensorPtr lt(TensorPtr a, TensorPtr b);
+TensorPtr le(TensorPtr a, TensorPtr b);
+TensorPtr gt(TensorPtr a, TensorPtr b);
+TensorPtr ge(TensorPtr a, TensorPtr b);
+/// The same against a scalar.
+TensorPtr eq(TensorPtr a, double s);
+TensorPtr ne(TensorPtr a, double s);
+TensorPtr lt(TensorPtr a, double s);
+TensorPtr le(TensorPtr a, double s);
+TensorPtr gt(TensorPtr a, double s);
+TensorPtr ge(TensorPtr a, double s);
+
+/// Element-wise logic on the truth of each value (non-zero is true), bool out.
+TensorPtr logical_and(TensorPtr a, TensorPtr b);
+TensorPtr logical_or(TensorPtr a, TensorPtr b);
+TensorPtr logical_xor(TensorPtr a, TensorPtr b);
+TensorPtr logical_not(TensorPtr a);
+/// True when any / every element is non-zero; a 1-element bool tensor.
+TensorPtr any(TensorPtr a);
+TensorPtr all(TensorPtr a);
+/// isnan / isinf / isfinite, element-wise, bool out.
+TensorPtr isnan_op(TensorPtr a);
+TensorPtr isinf_op(TensorPtr a);
+TensorPtr isfinite_op(TensorPtr a);
+
+/// cond ? a : b element-wise, all three broadcasting. Differentiable in a and
+/// b: each gets the gradient where it was chosen.
+TensorPtr where(TensorPtr cond, TensorPtr a, TensorPtr b);
+/// a with `value` wherever mask is true. Differentiable in a (zero gradient
+/// at the filled positions). The mask broadcasts to a.
+TensorPtr masked_fill(TensorPtr a, TensorPtr mask, double value);
+
+/// Python's // and %: floor division, and the remainder taking the divisor's
+/// sign. Exact on integers (dividing by zero raises); floor of the true
+/// quotient on floats. Not differentiable.
+TensorPtr floor_divide(TensorPtr a, TensorPtr b);
+TensorPtr remainder(TensorPtr a, TensorPtr b);
+
+/// A 0-d tensor holding one value, for the scalar side of a mixed op.
+TensorPtr scalar_tensor(double value, DType dtype);
+
+// ── Mixed precision ──────────────────────────────────────────────────────────
+//
+// torch.autocast: inside the scope matmul, matmul_bt and linear_op (so
+// Linear) compute in the scope's dtype (float16 or bfloat16) -- inputs
+// rounded to it, products accumulated in float32, the result returned in it
+// -- while the ops that need range (softmax, log, exp, the reductions, the
+// norms, the losses) return float32. Gradients flow back through the casts in
+// float32. Pair float16 with GradScaler (ml/optim/grad_scaler.hpp), whose loss
+// scaling keeps small gradients from flushing to zero.
+
+/// The active autocast dtype, or Float32 when autocast is off.
+DType autocast_dtype();
+/// Set it (Float32 turns autocast off) and return the previous one. The
+/// Autocast scope below is the usual way.
+DType set_autocast_dtype(DType dtype);
+
+struct Autocast {
+    DType previous;
+    explicit Autocast(DType dtype = DType::BFloat16);
+    ~Autocast();
+    Autocast(const Autocast&) = delete;
+    Autocast& operator=(const Autocast&) = delete;
+};
+
+/// Inside autocast, `t` (if floating) cast to the autocast dtype; otherwise t.
+TensorPtr autocast_input(TensorPtr t);

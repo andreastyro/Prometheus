@@ -1,3 +1,4 @@
+#include "ml/strided.hpp"
 #include "ml/utils/gradcheck.hpp"
 #include "ml/ops.hpp"
 
@@ -48,7 +49,7 @@ GradCheckResult gradcheck(const function<TensorPtr()>& forward,
         }
 
         loss->backward();
-        vector<float> analytic = p->grad_vector();
+        vector<double> analytic = p->grad_doubles();
 
         const int n    = p->num_el();
         int step = 1;
@@ -56,19 +57,25 @@ GradCheckResult gradcheck(const function<TensorPtr()>& forward,
             step = (n + opts.max_points - 1) / opts.max_points;
 
         for (int i = 0; i < n; i += step) {
-            const float orig = p->data()[i];
+            // read and written through the dtype, so a float64 input is
+            // perturbed and measured in double
+            void* base = p->storage()->data();
+            const DType dt = p->dtype();
+            const int64_t at = p->offset() + i;
+            const double orig = strided::load(base, dt, at);
 
             // A central difference over the step actually taken: orig + h is
-            // rounded to float32, so dividing by 2h was itself an error of up
-            // to an ulp of orig over h.
-            auto central = [&](float h) -> double {
-                const float up = orig + h, dn = orig - h;
-                p->data()[i] = up;
-                const double lp = scalarise(forward())->data()[0];
-                p->data()[i] = dn;
-                const double lm = scalarise(forward())->data()[0];
-                p->data()[i] = orig;
-                return (lp - lm) / ((double)up - (double)dn);
+            // rounded to the tensor's dtype, so dividing by 2h was itself an
+            // error of up to an ulp of orig over h.
+            auto central = [&](double h) -> double {
+                strided::store(base, dt, at, orig + h);
+                const double up = strided::load(base, dt, at);
+                const double lp = scalarise(forward())->item_double();
+                strided::store(base, dt, at, orig - h);
+                const double dn = strided::load(base, dt, at);
+                const double lm = scalarise(forward())->item_double();
+                strided::store(base, dt, at, orig);
+                return (lp - lm) / (up - dn);
             };
 
             // Richardson extrapolation. A central difference is off by

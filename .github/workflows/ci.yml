@@ -105,6 +105,10 @@ jobs:
       - name: Model files (safetensors)
         run: bash .github/annotate.sh python tests/test_safetensors.py
 
+      # Promotion, integer/bool ops, float64 gradients, half precision, autocast.
+      - name: Dtypes
+        run: bash .github/annotate.sh python tests/test_dtypes.py
+
       - name: README matches the API
         run: bash .github/annotate.sh python tests/check_readme_api.py
 

@@ -364,6 +364,12 @@ float Tensor::item() const {
     return (float)strided::load(storage_->data(), dtype(), offset_);
 }
 
+double Tensor::item_double() const {
+    if (numel_ != 1)
+        throw runtime_error("item(): tensor has " + to_string(numel_) + " elements, not 1");
+    return strided::load(storage_->data(), dtype(), offset_);
+}
+
 float Tensor::get(int64_t row, int64_t col) const {
     if (dim() != 2) throw runtime_error("get: needs a 2-D tensor");
     return (float)strided::load(storage_->data(), dtype(),
@@ -417,17 +423,58 @@ void Tensor::set_grad(const vector<float>& g) {
     if ((int64_t)g.size() != numel_)
         throw runtime_error("set_grad: " + to_string(g.size()) + " values for " +
                             to_string(numel_) + " elements");
+    if (dtype() == DType::Float64) { grad64_.assign(g.begin(), g.end()); return; }
     grad_.assign(g.size(), 0.0f);
     if (!g.empty()) std::memcpy(grad_.data(), g.data(), g.size() * sizeof(float));
 }
 
 void Tensor::ensure_grad() {
+    if (dtype() == DType::Float64) {
+        if ((int64_t)grad64_.size() != numel_) grad64_.assign((size_t)numel_, 0.0);
+        return;
+    }
     if ((int64_t)grad_.size() != numel_)
         grad_.assign((size_t)numel_, 0.0f);
 }
 
 void Tensor::zero_grad() {
+    if (dtype() == DType::Float64) { grad64_.assign((size_t)numel_, 0.0); return; }
     grad_.assign((size_t)numel_, 0.0f);
+}
+
+vector<double> Tensor::grad_doubles() const {
+    if (dtype() == DType::Float64) return grad64_;
+    return vector<double>(grad_.data(), grad_.data() + grad_.size());
+}
+
+TensorPtr Tensor::grad_tensor() const {
+    if (!has_grad()) return nullptr;
+    if (dtype() == DType::Float64) {
+        auto t = make_shared<Tensor>(shape_, DType::Float64);
+        if (numel_) memcpy(t->storage()->data(), grad64_.data(), (size_t)numel_ * sizeof(double));
+        return t;
+    }
+    auto t = make_shared<Tensor>(shape_, DType::Float32);
+    if (numel_) memcpy(t->data(), grad_.data(), (size_t)numel_ * sizeof(float));
+    return t;
+}
+
+void Tensor::accumulate_grad(const TensorPtr& g) {
+    if (g->numel() != numel_)
+        throw runtime_error("accumulate_grad: " + to_string(g->numel()) + " values for " +
+                            to_string(numel_) + " elements");
+    ensure_grad();
+    const void* src = g->storage()->data();
+    const DType gd = g->dtype();
+    if (dtype() == DType::Float64) {
+        double* dst = grad64_.data();
+        strided::for_each(g->shape(), g->strides(), g->offset(),
+                          [&](int64_t i, int64_t off) { dst[i] += strided::load(src, gd, off); });
+    } else {
+        float* dst = grad_.data();
+        strided::for_each(g->shape(), g->strides(), g->offset(),
+                          [&](int64_t i, int64_t off) { dst[i] += (float)strided::load(src, gd, off); });
+    }
 }
 
 // ── factories ────────────────────────────────────────────────────────────────
@@ -477,6 +524,8 @@ TensorPtr Tensor::randn(ShapeArg shape) {
 TensorPtr Tensor::to(DType target) {
     if (target == dtype())
         return shared_from_this();
+    if (is_floating(target) && is_floating(dtype()) && requires_grad_)
+        return cast_op(shared_from_this(), target);     // differentiable
     auto out = make_shared<Tensor>(shape_, target);
     const void* src = storage_->data();
     void* dst = out->storage()->data();
@@ -523,16 +572,40 @@ void Tensor::backward() {
             "either a leaf, or it was produced while gradients were disabled "
             "(NoGrad / no_grad()).");
 
-    grad_.assign((size_t)numel_, 1.0f);
+    if (dtype() == DType::Float64) grad64_.assign((size_t)numel_, 1.0);
+    else                           grad_.assign((size_t)numel_, 1.0f);
 
     vector<TensorPtr> order;
     unordered_set<TensorPtr> visited;
     dfs(shared_from_this(), order, visited);
     reverse(order.begin(), order.end());
 
-    for (TensorPtr& t : order)
-        if (t->grad_fn())
-            t->grad_fn()->backward_fn(t);
+    // A node whose output or any input is float64 keeps its gradients in
+    // double, which the raw float backward_fn kernels cannot write, and the
+    // float64 ops have no such kernel: those run their backward_graph -- the
+    // same formula written with ops, which compute in float64 -- with
+    // recording off, and add the result into each input's buffer.
+    for (TensorPtr& t : order) {
+        const auto& node = t->grad_fn();
+        if (!node) continue;
+        bool wide = t->dtype() == DType::Float64;
+        for (auto& in : node->inputs) wide = wide || (in && in->dtype() == DType::Float64);
+        if (node->backward_fn && !wide) { node->backward_fn(t); continue; }
+        if (!node->backward_graph)
+            throw runtime_error(string("backward(): '") + node->name +
+                                "' has no float64 backward; compute it in float32");
+        if (!t->has_grad()) continue;
+        TensorPtr parts_g = t->grad_tensor();
+        vector<TensorPtr> parts;
+        {
+            NoGrad off;
+            parts = node->backward_graph(t, parts_g);
+        }
+        for (size_t i = 0; i < node->inputs.size() && i < parts.size(); i++) {
+            const TensorPtr& in = node->inputs[i];
+            if (parts[i] && in && in->requires_grad()) in->accumulate_grad(parts[i]);
+        }
+    }
 }
 
 TensorPtr Tensor::detach() const {

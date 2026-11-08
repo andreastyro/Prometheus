@@ -62,6 +62,19 @@ struct PySequential {
     std::vector<TensorPtr> parameters() { return impl->parameters(); }
 };
 
+// A Python operand as a tensor: tensors as they are, bool / int / float as 0-d
+// tensors. A float meeting a floating tensor is held as float64 so its value
+// reaches a float64 tensor exactly; against an integer tensor it is float32,
+// the default dtype, as PyTorch promotes int + 1.5.
+static TensorPtr as_operand(const py::object& o, const TensorPtr& like) {
+    if (py::isinstance<Tensor>(o)) return o.cast<TensorPtr>();
+    if (py::isinstance<py::bool_>(o)) return scalar_tensor(o.cast<bool>() ? 1.0 : 0.0, DType::Bool);
+    if (py::isinstance<py::int_>(o))  return scalar_tensor((double)o.cast<int64_t>(), DType::Int64);
+    if (py::isinstance<py::float_>(o))
+        return scalar_tensor(o.cast<double>(), is_floating(like->dtype()) ? DType::Float64 : DType::Float32);
+    throw py::type_error("unsupported operand: " + std::string(py::str(o.get_type())));
+}
+
 PYBIND11_MODULE(_C, m) {
     m.doc() = "Prometheus ML library";
 
@@ -102,7 +115,14 @@ PYBIND11_MODULE(_C, m) {
              }), py::arg("shape"), py::arg("values"), py::arg("dtype") = DType::Float32)
 
         .def_property("data",
-                      [](const Tensor& t) { return t.to_vector(); },
+                      [](const Tensor& t) {
+                          // doubles, so float64 and int64 values come through exactly
+                          std::vector<double> v((size_t)t.numel());
+                          const void* base = t.storage()->data();
+                          strided::for_each(t.shape(), t.strides(), t.offset(),
+                              [&](int64_t i, int64_t off) { v[(size_t)i] = strided::load(base, t.dtype(), off); });
+                          return v;
+                      },
                       [](Tensor& t, const std::vector<float>& v) { t.set_data(v); },
                       "Every element in row-major order, as a list (a copy).")
         .def_property_readonly("shape",   [](const Tensor& t) { return t.shape(); })
@@ -110,7 +130,7 @@ PYBIND11_MODULE(_C, m) {
         .def_property_readonly("dtype",   &Tensor::dtype)
         .def_property_readonly("device",  &Tensor::device)
         .def_property("grad",
-                      [](const Tensor& t) { return t.grad_vector(); },
+                      [](const Tensor& t) { return t.grad_doubles(); },
                       [](Tensor& t, const std::vector<float>& g) { t.set_grad(g); })
         .def_property("requires_grad",
                       [](const Tensor& t) { return t.requires_grad(); },
@@ -124,7 +144,7 @@ PYBIND11_MODULE(_C, m) {
         .def("numel",         &Tensor::numel)
         .def("num_el",        &Tensor::num_el)
         .def("size",          &Tensor::size, py::arg("dim"))
-        .def("item",          &Tensor::item)
+        .def("item",          &Tensor::item_double)
         .def("get",           &Tensor::get)
         .def("set",           &Tensor::set)
         .def("fill",          &Tensor::fill)
@@ -170,6 +190,43 @@ PYBIND11_MODULE(_C, m) {
             auto buf = arr.request();
             const float* ptr = static_cast<const float*>(buf.ptr);
             return std::make_shared<Tensor>(shape, std::vector<float>(ptr, ptr + buf.size));
+        })
+        // Python operators. A Python int is an int64 scalar, a float a float
+        // scalar, a bool a bool: each a 0-d tensor, which promotes only across
+        // categories -- an int32 tensor + 1 stays int32, + 1.5 is float32.
+        .def("__add__",      [](TensorPtr a, py::object b) { return add(a, as_operand(b, a)); })
+        .def("__radd__",     [](TensorPtr a, py::object b) { return add(as_operand(b, a), a); })
+        .def("__sub__",      [](TensorPtr a, py::object b) { return subtract(a, as_operand(b, a)); })
+        .def("__rsub__",     [](TensorPtr a, py::object b) { return subtract(as_operand(b, a), a); })
+        .def("__mul__",      [](TensorPtr a, py::object b) { return multiply(a, as_operand(b, a)); })
+        .def("__rmul__",     [](TensorPtr a, py::object b) { return multiply(as_operand(b, a), a); })
+        .def("__truediv__",  [](TensorPtr a, py::object b) { return divide(a, as_operand(b, a)); })
+        .def("__rtruediv__", [](TensorPtr a, py::object b) { return divide(as_operand(b, a), a); })
+        .def("__floordiv__", [](TensorPtr a, py::object b) { return floor_divide(a, as_operand(b, a)); })
+        .def("__mod__",      [](TensorPtr a, py::object b) { return remainder(a, as_operand(b, a)); })
+        .def("__pow__",      [](TensorPtr a, float e) { return pow_op(a, e); })
+        .def("__neg__",      [](TensorPtr a) { return multiply(a, scalar_tensor(-1.0, DType::Int64)); })
+        .def("__matmul__",   [](TensorPtr a, TensorPtr b) { return matmul(a, b); })
+        .def("__lt__",       [](TensorPtr a, py::object b) { return lt(a, as_operand(b, a)); })
+        .def("__le__",       [](TensorPtr a, py::object b) { return le(a, as_operand(b, a)); })
+        .def("__gt__",       [](TensorPtr a, py::object b) { return gt(a, as_operand(b, a)); })
+        .def("__ge__",       [](TensorPtr a, py::object b) { return ge(a, as_operand(b, a)); })
+        .def("__eq__",       [](TensorPtr a, py::object b) { return eq(a, as_operand(b, a)); })
+        .def("__ne__",       [](TensorPtr a, py::object b) { return ne(a, as_operand(b, a)); })
+        .def("__and__",      [](TensorPtr a, py::object b) { return logical_and(a, as_operand(b, a)); })
+        .def("__or__",       [](TensorPtr a, py::object b) { return logical_or(a, as_operand(b, a)); })
+        .def("__xor__",      [](TensorPtr a, py::object b) { return logical_xor(a, as_operand(b, a)); })
+        .def("__invert__",   [](TensorPtr a) { return logical_not(a); })
+        .def("__hash__",     [](const Tensor& t) { return (py::ssize_t)(uintptr_t)&t; })
+        .def("__bool__",     [](const Tensor& t) {
+            if (t.numel() != 1)
+                throw std::runtime_error("the truth value of a tensor with " + std::to_string(t.numel()) +
+                                         " elements is ambiguous; use any() or all()");
+            return t.item_double() != 0.0;
+        })
+        .def("__len__",      [](const Tensor& t) {
+            if (t.dim() == 0) throw std::runtime_error("len() of a 0-d tensor");
+            return t.shape()[0];
         });
 
     // -------------------------------------------------------------------------
@@ -212,6 +269,38 @@ PYBIND11_MODULE(_C, m) {
           "Same elements, new shape (one dim may be -1). A view when the input is contiguous.");
     m.def("contiguous",    &contiguous, py::arg("a"),
           "The tensor in contiguous storage; the input itself if it already is.");
+
+    // dtypes: promotion, casts, comparisons, masks
+    m.def("result_type",   &result_type, py::arg("a"), py::arg("b"),
+          "The dtype a binary op on a and b produces (PyTorch's promotion rule).");
+    m.def("promote_types", &promote_types, py::arg("a"), py::arg("b"));
+    m.def("cast",          &cast_op, py::arg("a"), py::arg("dtype"),
+          "a in dtype; differentiable between floating dtypes.");
+    m.def("scalar_tensor", &scalar_tensor, py::arg("value"), py::arg("dtype") = DType::Float32,
+          "A 0-d tensor holding one value.");
+    auto cmp = [&m](const char* name, TensorPtr (*tt)(TensorPtr, TensorPtr), TensorPtr (*ts)(TensorPtr, double)) {
+        m.def(name, tt, py::arg("a"), py::arg("b"));
+        m.def(name, ts, py::arg("a"), py::arg("b"));
+    };
+    cmp("eq", &eq, &eq); cmp("ne", &ne, &ne); cmp("lt", &lt, &lt);
+    cmp("le", &le, &le); cmp("gt", &gt, &gt); cmp("ge", &ge, &ge);
+    m.def("logical_and",  &logical_and);
+    m.def("logical_or",   &logical_or);
+    m.def("logical_xor",  &logical_xor);
+    m.def("logical_not",  &logical_not);
+    m.def("any",          &any);
+    m.def("all",          &all);
+    m.def("isnan",        &isnan_op);
+    m.def("isinf",        &isinf_op);
+    m.def("isfinite",     &isfinite_op);
+    m.def("where",        &where, py::arg("cond"), py::arg("a"), py::arg("b"),
+          "cond ? a : b element-wise, broadcasting; differentiable in a and b.");
+    m.def("masked_fill",  &masked_fill, py::arg("a"), py::arg("mask"), py::arg("value"),
+          "a with value wherever mask is true; differentiable in a.");
+    m.def("floor_divide", &floor_divide);
+    m.def("remainder",    &remainder);
+    m.def("autocast_dtype",     &autocast_dtype);
+    m.def("_set_autocast_dtype", &set_autocast_dtype);
     // Where pip and conda put shared libraries, so `pip install mkl` is found
     // with no configuration: <prefix>/Library/bin on Windows, <prefix>/lib
     // elsewhere, for both the interpreter's prefix and the user base.

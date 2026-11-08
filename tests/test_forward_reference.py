@@ -969,8 +969,10 @@ def test_dtypes():
     h = tensor([2], [1.0, 3.14159265]).to(p.float16).to(p.float32)
     check("float16 keeps ~3-4 significant digits", arr(h), np.array([1.0, 3.140625]), atol=0)
 
-    for name, fn in (("an op on int64 raises", lambda: p.relu(ids)),
-                     ("int64 cannot require grad", lambda: setattr(ids, "requires_grad", True)),
+    r = p.relu(ids)
+    check("relu on int64 stays int64 and exact", np.array(r.numpy(), dtype=np.float64),
+          np.maximum(np.array(ids.numpy(), dtype=np.float64), 0), atol=0)
+    for name, fn in (("int64 cannot require grad", lambda: setattr(ids, "requires_grad", True)),
                      ("cuda is refused, not faked", lambda: f.to(p.device.cuda))):
         threw = False
         try:

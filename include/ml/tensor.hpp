@@ -193,6 +193,7 @@ public:
     void set_data(const std::vector<float>& v);
 
     float item() const;                         ///< the single element of a 1-element tensor
+    double item_double() const;                 ///< the same, exact for float64 and int64
     float get(std::int64_t row, std::int64_t col) const;   ///< 2-D element, honours strides
     void  set(std::int64_t row, std::int64_t col, float value);
     void  fill(float value);
@@ -203,14 +204,27 @@ public:
     /// Only floating-point tensors can require a gradient.
     void set_requires_grad(bool r);
 
+    /// The gradient buffer, row-major over this tensor's shape. float32 for
+    /// every floating dtype but float64, whose gradient is kept in double --
+    /// grad() is null for it; use grad64().
     float*       grad()       { return grad_.empty() ? nullptr : grad_.data(); }
     const float* grad() const { return grad_.empty() ? nullptr : grad_.data(); }
+    double*       grad64()       { return grad64_.empty() ? nullptr : grad64_.data(); }
+    const double* grad64() const { return grad64_.empty() ? nullptr : grad64_.data(); }
+    /// The gradient as doubles, whatever buffer holds it.
+    std::vector<double> grad_doubles() const;
+    /// The gradient as a tensor: float64 for a float64 tensor, else float32.
+    TensorPtr grad_tensor() const;
+    /// Add `g` (same number of elements, any float dtype) into the gradient.
+    void accumulate_grad(const TensorPtr& g);
     FloatSpan    grad_values();
     std::vector<float> grad_vector() const {
         return std::vector<float>(grad_.data(), grad_.data() + grad_.size());
     }
     void set_grad(const std::vector<float>& g);
-    bool has_grad() const { return (std::int64_t)grad_.size() == numel_; }
+    bool has_grad() const {
+        return (std::int64_t)(dtype() == DType::Float64 ? grad64_.size() : grad_.size()) == numel_;
+    }
     /// Allocate a zeroed gradient buffer if there is not one already.
     void ensure_grad();
     /// Allocate if needed and zero.
@@ -233,8 +247,10 @@ public:
     static void manual_seed(unsigned int seed);
 
     // ── conversion and the graph ─────────────────────────────────────────
-    /// A copy in another dtype. Casting leaves the graph, except a float32
-    /// tensor asked for float32, which is returned as is.
+    /// A copy in another dtype; the tensor itself when it already is one.
+    /// Between floating dtypes the cast is differentiable, as in PyTorch: the
+    /// gradient is cast back. To or from an integer or bool dtype it leaves
+    /// the graph.
     TensorPtr to(DType dtype);
     /// Only Device::CPU is available in this build; asking for CUDA raises.
     TensorPtr to(Device device);
@@ -265,6 +281,7 @@ private:
     bool         is_view_       = false;
     bool         requires_grad_ = false;
     FloatBuffer               grad_;
+    std::vector<double>       grad64_;     // float64 tensors only
     std::shared_ptr<GradNode> grad_fn_;
 };
 

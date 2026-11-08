@@ -13,6 +13,7 @@ option(USE_OPENMP   "Parallelise across CPU cores"      OFF)
 set(SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tensor.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/ops.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/dtype_ops.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/loss.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/matmul_backend.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/blas_loader.cpp
