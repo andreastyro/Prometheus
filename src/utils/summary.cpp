@@ -23,8 +23,8 @@ void model_summary(vector<Module*> layers){
 
         if (auto l = dynamic_cast<Linear*>(layers[i])){
             name = "Linear";
-            int in_feat = l->parameters()[0]->shape[0];
-            int out_feat = l->parameters()[0]->shape[1];
+            int in_feat = l->parameters()[0]->shape()[0];
+            int out_feat = l->parameters()[0]->shape()[1];
             shape_str = "[" + to_string(in_feat) + " -> " + to_string(out_feat) + "]";
         } else if (dynamic_cast<ReLU*>(layers[i]))
             name = "ReLU";

@@ -9,15 +9,15 @@ Linear::Linear(int in_features, int out_features, string init) {
 
     if (init == "xavier"){
         float std = sqrt(2.0f / (in_features + out_features));
-        for (auto& v : weights->data) v *= std;
+        for (auto& v : weights->values()) v *= std;
     } else if (init == "kaiming"){
         float std = sqrt(2.0f / in_features);
-        for (auto& v : weights->data) v *= std;
+        for (auto& v : weights->values()) v *= std;
     }
 
     bias = Tensor::zeros({out_features});
-    weights->requires_grad = true;
-    bias->requires_grad = true;
+    weights->set_requires_grad(true);
+    bias->set_requires_grad(true);
 }
 
 TensorPtr Linear::forward(TensorPtr input){

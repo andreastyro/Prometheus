@@ -30,7 +30,7 @@ TensorPtr load_image(const string& path, bool normalize){
                 float val = img[source];
 
                 if (normalize) val /= 255.0f;
-                tensor->data[destination] = val;
+                tensor->data()[destination] = val;
 
             }
         }

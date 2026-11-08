@@ -10,15 +10,15 @@ int main() {
     // input: [batch=2, channels=4, spatial=3]
     // 2 groups of 2 channels each
     printf("=== GroupNorm shape test ===\n");
-    auto x = make_shared<Tensor>(vector<int>{2, 4, 3});
-    for (int i = 0; i < x->num_el(); i++) x->data[i] = (float)(i + 1);
+    auto x = make_shared<Tensor>(Shape{2, 4, 3});
+    for (int i = 0; i < x->num_el(); i++) x->data()[i] = (float)(i + 1);
 
     GroupNorm gn(2, 4);
     auto out = gn.forward(x);
     printf("input:  [2, 4, 3]\n");
-    CHECK_NEAR("output dim 0", (double)(out->shape[0]), 2, 0.0);
-CHECK_NEAR("output dim 1", (double)(out->shape[1]), 4, 0.0);
-CHECK_NEAR("output dim 2", (double)(out->shape[2]), 3, 0.0);
+    CHECK_NEAR("output dim 0", (double)(out->shape()[0]), 2, 0.0);
+CHECK_NEAR("output dim 1", (double)(out->shape()[1]), 4, 0.0);
+CHECK_NEAR("output dim 2", (double)(out->shape()[2]), 3, 0.0);
 
     // === Each group in each batch should have mean~0 ===
     // group 0 of batch 0: channels 0-1, 3 spatial = 6 values
@@ -26,7 +26,7 @@ CHECK_NEAR("output dim 2", (double)(out->shape[2]), 3, 0.0);
     float mean = 0.0f;
     for (int c = 0; c < 2; c++)
         for (int s = 0; s < 3; s++)
-            mean += out->data[(0 * 4 + c) * 3 + s];
+            mean += out->data()[(0 * 4 + c) * 3 + s];
     mean /= 6;
     printf("mean: %.4f\n", mean);
 
@@ -43,7 +43,7 @@ CHECK_NEAR("output dim 2", (double)(out->shape[2]), 3, 0.0);
     printf("\n=== Parameters ===\n");
     auto params = gn.parameters();
     printf("param count: %zu (expected 2)\n", params.size());
-    CHECK_NEAR("gamma shape dim 0", (double)(params[0]->shape[0]), 4, 0.0);
+    CHECK_NEAR("gamma shape dim 0", (double)(params[0]->shape()[0]), 4, 0.0);
 
     return test_report();
 }

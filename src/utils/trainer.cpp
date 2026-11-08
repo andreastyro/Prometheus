@@ -28,7 +28,7 @@ TrainHistory train(
             loss->backward();
             optimizer.step();
 
-            epoch_loss += loss->data[0];
+            epoch_loss += loss->data()[0];
             epoch_acc += accuracy(pred, y);
         }
 

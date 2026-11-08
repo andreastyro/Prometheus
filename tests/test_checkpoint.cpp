@@ -7,9 +7,9 @@
 
 int main() {
     // Create two parameters with known values
-    auto p1 = std::make_shared<Tensor>(std::vector<int>{2, 3},
+    auto p1 = std::make_shared<Tensor>(Shape{2, 3},
                                        std::vector<float>{1,2,3,4,5,6});
-    auto p2 = std::make_shared<Tensor>(std::vector<int>{1, 3},
+    auto p2 = std::make_shared<Tensor>(Shape{1, 3},
                                        std::vector<float>{7,8,9});
     std::vector<TensorPtr> params = {p1, p2};
 
@@ -26,15 +26,15 @@ int main() {
     assert(std::fabs(ckpt.loss - 0.123f) < 1e-5f && "loss must survive round-trip");
     assert(loaded.size() == 2  && "must restore both parameters");
     std::vector<int> expected_shape = {2, 3};
-    assert(loaded[0]->shape == expected_shape);
-    assert(std::fabs(loaded[0]->data[5] - 6.0f) < 1e-5f && "data must survive round-trip");
-    assert(std::fabs(loaded[1]->data[2] - 9.0f) < 1e-5f);
+    assert(loaded[0]->shape() == expected_shape);
+    assert(std::fabs(loaded[0]->data()[5] - 6.0f) < 1e-5f && "data must survive round-trip");
+    assert(std::fabs(loaded[1]->data()[2] - 9.0f) < 1e-5f);
 
     // Adam save/load state round-trip
-    auto pa = std::make_shared<Tensor>(std::vector<int>{1, 2},
+    auto pa = std::make_shared<Tensor>(Shape{1, 2},
                                        std::vector<float>{1.0f, 2.0f});
-    pa->requires_grad = true;
-    pa->grad = {0.1f, 0.2f};
+    pa->set_requires_grad(true);
+    pa->set_grad({0.1f, 0.2f});
 
     Adam opt({pa}, 0.01f);
     opt.step();

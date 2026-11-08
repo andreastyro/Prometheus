@@ -6,32 +6,32 @@
 
 int main() {
     // Single parameter, gradient = 1.0, weight = 0.5
-    auto p = std::make_shared<Tensor>(std::vector<int>{1, 1}, std::vector<float>{0.5f});
-    p->requires_grad = true;
-    p->grad = {1.0f};
+    auto p = std::make_shared<Tensor>(Shape{1, 1}, std::vector<float>{0.5f});
+    p->set_requires_grad(true);
+    p->set_grad({1.0f});
 
     float lr = 0.1f, wd = 0.01f;
     AdamW opt({p}, lr, 0.9f, 0.999f, 1e-8f, wd);
 
-    float w_before = p->data[0];
+    float w_before = p->data()[0];
     opt.step();
 
     // Weight must decrease (gradient pushes it down, weight decay also shrinks it)
-    assert(p->data[0] < w_before && "AdamW should decrease weight when gradient > 0");
+    assert(p->data()[0] < w_before && "AdamW should decrease weight when gradient > 0");
 
     // Weight decay test: zero gradient → only decay term acts
-    p->data[0] = 1.0f;
-    p->grad = {0.0f};
+    p->data()[0] = 1.0f;
+    p->set_grad({0.0f});
     // Rebuild fresh optimizer so t starts at 0 again
     AdamW opt2({p}, lr, 0.9f, 0.999f, 1e-8f, wd);
-    float w2 = p->data[0];
+    float w2 = p->data()[0];
     opt2.step();
     // With zero gradient and weight_decay > 0, weight should shrink toward 0
-    assert(p->data[0] < w2 && "weight decay alone should shrink weight");
+    assert(p->data()[0] < w2 && "weight decay alone should shrink weight");
 
     // Round-trip save/load state
     AdamW saver({p}, lr, 0.9f, 0.999f, 1e-8f, wd);
-    p->grad = {0.5f};
+    p->set_grad({0.5f});
     saver.step();
     saver.save_state("_test_adamw_state.bin");
 

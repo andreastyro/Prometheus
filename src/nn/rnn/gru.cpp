@@ -7,23 +7,23 @@ using namespace std;
 GRU::GRU(int input_size, int hidden_size)
     : input_size(input_size), hidden_size(hidden_size) {
 
-    W_xr = Tensor::randn({input_size, hidden_size}); W_xr->requires_grad = true;
-    W_xz = Tensor::randn({input_size, hidden_size}); W_xz->requires_grad = true;
-    W_xn = Tensor::randn({input_size, hidden_size}); W_xn->requires_grad = true;
+    W_xr = Tensor::randn({input_size, hidden_size}); W_xr->set_requires_grad(true);
+    W_xz = Tensor::randn({input_size, hidden_size}); W_xz->set_requires_grad(true);
+    W_xn = Tensor::randn({input_size, hidden_size}); W_xn->set_requires_grad(true);
 
-    W_hr = Tensor::randn({hidden_size, hidden_size}); W_hr->requires_grad = true;
-    W_hz = Tensor::randn({hidden_size, hidden_size}); W_hz->requires_grad = true;
-    W_hn = Tensor::randn({hidden_size, hidden_size}); W_hn->requires_grad = true;
+    W_hr = Tensor::randn({hidden_size, hidden_size}); W_hr->set_requires_grad(true);
+    W_hz = Tensor::randn({hidden_size, hidden_size}); W_hz->set_requires_grad(true);
+    W_hn = Tensor::randn({hidden_size, hidden_size}); W_hn->set_requires_grad(true);
 
-    b_r = Tensor::zeros({hidden_size}); b_r->requires_grad = true;
-    b_z = Tensor::zeros({hidden_size}); b_z->requires_grad = true;
-    b_n = Tensor::zeros({hidden_size}); b_n->requires_grad = true;
+    b_r = Tensor::zeros({hidden_size}); b_r->set_requires_grad(true);
+    b_z = Tensor::zeros({hidden_size}); b_z->set_requires_grad(true);
+    b_n = Tensor::zeros({hidden_size}); b_n->set_requires_grad(true);
 }
 
 pair<TensorPtr, TensorPtr> GRU::forward(TensorPtr input, TensorPtr h0) {
-    int seq_len  = input->shape[0];
-    int batch    = input->shape[1];
-    int input_sz = input->shape[2];
+    int seq_len  = input->shape()[0];
+    int batch    = input->shape()[1];
+    int input_sz = input->shape()[2];
 
     TensorPtr h = h0 ? h0 : Tensor::zeros({batch, hidden_size});
 

@@ -85,14 +85,7 @@ TensorPtr argmax(TensorPtr a);
 /// The activation used inside GPT-2/3/4 feedforward blocks.
 TensorPtr gelu(TensorPtr a);
 
-/// Gradient-tracking reshape. Returns a new tensor with the given shape
-/// but the same element count; gradients flow back through the reshape.
-TensorPtr reshape_op(TensorPtr a, std::vector<int> new_shape);
 
-/// Gradient-tracking 2D transpose. Returns a new [cols, rows] tensor.
-/// Tensor::transpose() is the non-differentiable equivalent: it detaches,
-/// so it cannot be used inside a forward pass you intend to backprop through.
-TensorPtr transpose_op(TensorPtr a);
 
 /// Concatenate tensors along `axis`. All inputs must agree on every dimension
 /// except that one. Gradient-tracking: the backward splits the output gradient
@@ -119,17 +112,24 @@ TensorPtr matmul_bt(TensorPtr a, TensorPtr b);
 TensorPtr linear_op(TensorPtr x, TensorPtr W, TensorPtr bias = nullptr,
                     TensorPtr residual = nullptr);
 
-/// O(1) transpose: a 2-D view with the strides swapped, sharing storage.
-/// Nothing is copied. The result is non-contiguous, so pass it through
-/// contiguous() before an op that reads `data` directly. To apply a weight
-/// transposed, prefer matmul_bt, which needs neither.
-TensorPtr transpose_view(TensorPtr a);
+// ── Views and input checking ─────────────────────────────────────────────────
 
-/// O(1) reshape: a view with the same element order and a new shape. A
-/// reshape of contiguous storage stays contiguous.
-TensorPtr reshape_view(TensorPtr a, std::vector<int> new_shape);
+/// Swap two dimensions. An O(1) view sharing storage, differentiable. The
+/// default swaps the last two, which for a matrix is the usual transpose.
+TensorPtr transpose(TensorPtr a, int dim0 = -2, int dim1 = -1);
 
-/// Materialise a view into owned, contiguous storage. Returns the input
-/// unchanged when it already owns its data, so calling it is free in the
-/// common case.
+/// Reorder all dimensions: result dim i is input dim dims[i]. A view.
+TensorPtr permute(TensorPtr a, std::vector<int> dims);
+
+/// Same elements, new shape; one dimension may be -1 and is inferred. A view
+/// when the input is contiguous, otherwise a contiguous copy then a view.
+TensorPtr reshape(TensorPtr a, ShapeArg shape);
+
+/// The same tensor in contiguous storage: the input itself when it already
+/// is, otherwise a copy that stays in the graph.
 TensorPtr contiguous(TensorPtr a);
+
+/// What every op does to its inputs before reading them through data():
+/// materialise a non-contiguous view, and raise for a dtype or device the
+/// kernels cannot read. Exposed for kernels outside ops.cpp.
+TensorPtr checked_input(const char* op, TensorPtr t);

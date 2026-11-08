@@ -112,17 +112,17 @@ def test_ops():
     m_np = spread(8).reshape(4, 2)
     check("matmul", arr(p.matmul(a, tensor([4, 2], m_np))), a_np @ m_np)
 
-    check("transpose_op", arr(p.transpose_op(a)), a_np.T)
+    check("transpose", arr(p.contiguous(p.transpose(a))), a_np.T)
 
     # a @ b^T computed with the transpose as a flag rather than a copy, which
     # is what nn.Linear does in PyTorch. Must agree with both numpy and the
     # explicit-transpose route.
     bt = spread(8).reshape(2, 4)
     check("matmul_bt", arr(p.matmul_bt(a, tensor([2, 4], bt))), a_np @ bt.T)
-    check("matmul_bt == matmul(a, transpose_op(b))",
+    check("matmul_bt == matmul(a, transpose(b))",
           arr(p.matmul_bt(a, tensor([2, 4], bt))),
-          arr(p.matmul(a, p.transpose_op(tensor([2, 4], bt)))))
-    check("reshape_op",   arr(p.reshape_op(a, [4, 3])), a_np.reshape(4, 3))
+          arr(p.matmul(a, p.transpose(tensor([2, 4], bt)))))
+    check("reshape",      arr(p.reshape(a, [4, 3])), a_np.reshape(4, 3))
 
     check("max_op", arr(p.max_op(a)), np.array([a_np.max()]))
     check("min_op", arr(p.min_op(a)), np.array([a_np.min()]))
@@ -728,61 +728,100 @@ def test_batching():
           np.array([1.0]), atol=0)
 
 
+def flag(b):
+    return np.array([1.0 if b else 0.0])
+
+
 def test_views():
     print("\n=== strided views ===\n")
     A = spread(12).reshape(3, 4)
     a = tensor([3, 4], A)
 
-    v = p.transpose_view(a)
-    check("transpose_view shape", np.array(v.shape), np.array([4, 3]), atol=0)
-    check("transpose_view is a view",
-          np.array([1.0 if v.is_view() else 0.0]), np.array([1.0]), atol=0)
-    check("and is non-contiguous",
-          np.array([0.0 if v.is_contiguous() else 1.0]), np.array([1.0]), atol=0)
+    v = p.transpose(a)
+    check("transpose shape", np.array(v.shape), np.array([4, 3]), atol=0)
+    check("transpose is a view", flag(v.is_view()), flag(True), atol=0)
+    check("and is non-contiguous", flag(not v.is_contiguous()), flag(True), atol=0)
+    check("strides are swapped, not copied", np.array(v.strides), np.array([1, 4]), atol=0)
     check("materialises to numpy .T", arr(p.contiguous(v)), A.T)
+    check("transposing twice is the identity", arr(p.transpose(p.transpose(a))), A)
 
-    r = p.reshape_view(a, [4, 3])
-    check("reshape_view stays contiguous",
-          np.array([1.0 if r.is_contiguous() else 0.0]), np.array([1.0]), atol=0)
-    check("reshape_view materialises correctly", arr(p.contiguous(r)), A.reshape(4, 3))
+    r = p.reshape(a, [4, 3])
+    check("reshape of contiguous stays contiguous", flag(r.is_contiguous()), flag(True), atol=0)
+    check("reshape matches numpy", arr(r), A.reshape(4, 3))
+    check("reshape infers -1", np.array(p.reshape(a, [2, -1]).shape), np.array([2, 6]), atol=0)
+    check("reshape of a transposed view matches numpy",
+          arr(p.reshape(p.transpose(a), [12])), A.T.reshape(12))
 
-    # transposing twice must return the original
-    check("transpose_view twice is the identity",
-          arr(p.contiguous(p.transpose_view(p.transpose_view(a)))), A)
+    check("contiguous() returns the same tensor when already contiguous",
+          flag(p.contiguous(a) is a), flag(True), atol=0)
 
-    # contiguous() on an owned tensor must not copy
-    check("contiguous() is a no-op on owned storage",
-          np.array([0.0 if p.contiguous(a).is_view() else 1.0]),
-          np.array([1.0]), atol=0)
+    # a view shares storage: writing through it changes the source
+    s_ = tensor([3, 4], A)
+    p.transpose(s_).set(0, 1, 99.0)
+    check("writes through a view reach the source", np.array([s_.get(1, 0)]),
+          np.array([99.0]), atol=0)
 
-    # The gradient convention: a view's grad is row-major over the view's own
-    # shape, not indexed through the strides. Getting this wrong was a real
-    # defect -- one backward wrote in storage order while another read
-    # row-major, which disagreed silently wherever it did not crash. The test
-    # is that the view route gives exactly what the copying route gives.
-    x = tensor([3, 4], spread(12))
+    # n-d: permute agrees with numpy.transpose
+    B = spread(24).reshape(2, 3, 4)
+    b = tensor([2, 3, 4], B)
+    check("permute (1, 2, 0) matches numpy", arr(p.contiguous(p.permute(b, [1, 2, 0]))),
+          np.transpose(B, (1, 2, 0)))
+    check("transpose of dims 0 and 2 matches numpy", arr(p.contiguous(p.transpose(b, 0, 2))),
+          np.swapaxes(B, 0, 2))
+
+    # ops accept views directly: they materialise what they need
+    check("ops take a non-contiguous view", arr(p.relu(p.transpose(a))), np.maximum(A.T, 0))
+
+    # Gradients through a view, against the analytic answer: for
+    # L = mean(w * x.T), dL/dx = w.T / n. The weights differ per position, so a
+    # backward that mapped positions wrongly could not pass.
+    W = spread(12).reshape(4, 3) + 2.0
+    x = tensor([3, 4], A)
     x.requires_grad = True
     x.reset_grad()
-    y = p.contiguous(p.transpose_view(x))
-    p.mean(p.multiply(y, y), -1).backward()
-    via_view = list(x.grad)
+    p.mean(p.multiply(p.transpose(x), tensor([4, 3], W)), -1).backward()
+    check("gradient through transpose == w.T / n",
+          np.array(x.grad).reshape(3, 4), W.T / 12, atol=1e-6)
 
     x.reset_grad()
-    z = p.transpose_op(x)
-    p.mean(p.multiply(z, z), -1).backward()
-    via_copy = list(x.grad)
+    p.mean(p.multiply(p.permute(p.reshape(x, [3, 2, 2]), [2, 0, 1]),
+                      tensor([2, 3, 2], W.reshape(2, 3, 2))), -1).backward()
+    expect = np.transpose(W.reshape(2, 3, 2), (1, 2, 0)).reshape(3, 4) / 12
+    check("gradient through reshape + permute == analytic",
+          np.array(x.grad).reshape(3, 4), expect, atol=1e-6)
 
-    check("view gradients equal transpose_op gradients",
-          np.array(via_view), np.array(via_copy), atol=1e-6)
 
-    # a non-contiguous view cannot be reshaped without materialising first
-    threw = False
-    try:
-        p.reshape_view(p.transpose_view(a), [12])
-    except Exception:
-        threw = True
-    check("reshaping a non-contiguous view raises",
-          np.array([1.0 if threw else 0.0]), np.array([1.0]), atol=0)
+def test_dtypes():
+    print("\n=== dtypes ===\n")
+    big = 2 ** 24 + 1                     # first integer float32 cannot hold
+    ids = p.Tensor([1], [big], p.int64)
+    check("int64 holds 2^24 + 1 exactly", np.array(ids.numpy(), dtype=np.float64),
+          np.array([big], dtype=np.float64), atol=0)
+    check("float32 cannot (which is why ids need int64)",
+          np.array(p.Tensor([1], [big]).data, dtype=np.float64),
+          np.array([big - 1], dtype=np.float64), atol=0)
+    check("dtype is reported", flag(ids.dtype == p.int64), flag(True), atol=0)
+
+    f = tensor([4], [1.5, -2.25, 3.0, 1e-3])
+    check("float32 -> float64 -> float32 is exact", arr(f.to(p.float64).to(p.float32)),
+          np.array([1.5, -2.25, 3.0, 1e-3]))
+    check("float32 -> int64 truncates like a cast", np.array(f.to(p.int64).numpy(), dtype=np.float64),
+          np.array([1, -2, 3, 0], dtype=np.float64), atol=0)
+    bf = tensor([3], [1.0, 3.14159265, 1000.123]).to(p.bfloat16).to(p.float32)
+    check("bfloat16 keeps ~3 significant digits", arr(bf),
+          np.array([1.0, 3.140625, 1000.0]), atol=0)
+    h = tensor([2], [1.0, 3.14159265]).to(p.float16).to(p.float32)
+    check("float16 keeps ~3-4 significant digits", arr(h), np.array([1.0, 3.140625]), atol=0)
+
+    for name, fn in (("an op on int64 raises", lambda: p.relu(ids)),
+                     ("int64 cannot require grad", lambda: setattr(ids, "requires_grad", True)),
+                     ("cuda is refused, not faked", lambda: f.to(p.device.cuda))):
+        threw = False
+        try:
+            fn()
+        except Exception:
+            threw = True
+        check(name, flag(threw), flag(True), atol=0)
 
 
 def main():
@@ -799,6 +838,7 @@ def main():
     test_attention()
     test_batching()
     test_views()
+    test_dtypes()
     test_optimizers()
     test_rmsprop_and_clip()
     test_metrics()

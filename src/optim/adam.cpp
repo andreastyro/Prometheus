@@ -39,13 +39,13 @@ void Adam::step(){
         // them shared state the moment this is threaded.
         #pragma omp parallel for schedule(static) if(n >= 32768)
         for (int j = 0; j < n; j++){
-            m[i][j] = beta1 * m[i][j] + (1 - beta1) * p->grad[j];
-            v[i][j] = beta2 * v[i][j] + (1 - beta2) * (p->grad[j] * p->grad[j]);
+            m[i][j] = beta1 * m[i][j] + (1 - beta1) * p->grad()[j];
+            v[i][j] = beta2 * v[i][j] + (1 - beta2) * (p->grad()[j] * p->grad()[j]);
 
             const float m_hat = m[i][j] / bc1;
             const float v_hat = v[i][j] / bc2;
 
-            p->data[j] -= lr * m_hat / (sqrt(v_hat) + eps);
+            p->data()[j] -= lr * m_hat / (sqrt(v_hat) + eps);
         }
     }
 }

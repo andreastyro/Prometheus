@@ -13,7 +13,7 @@ static bool all_finite(const vector<float>& v) {
 }
 
 static bool has_nonzero_grad(TensorPtr t) {
-    for (float g : t->grad) if (g != 0.0f) return true;
+    for (float g : t->grad_values()) if (g != 0.0f) return true;
     return false;
 }
 
@@ -23,20 +23,20 @@ int main() {
 
     printf("=== GPT forward shape ===\n");
     GPT gpt(VOCAB, MAXLEN, EMBED, HEADS, LAYERS);
-    auto token_ids = make_shared<Tensor>(vector<int>{4}, vector<float>{1.f, 3.f, 5.f, 2.f});
+    auto token_ids = make_shared<Tensor>(Shape{4}, vector<float>{1.f, 3.f, 5.f, 2.f});
     auto logits = gpt.forward(token_ids);
-    printf("logits shape: [%d, %d] (expected [4, %d])\n", logits->shape[0], logits->shape[1], VOCAB);
-    printf("logits finite: %s (expected true)\n", all_finite(logits->data) ? "true" : "false");
+    printf("logits shape: [%d, %d] (expected [4, %d])\n", logits->shape()[0], logits->shape()[1], VOCAB);
+    printf("logits finite: %s (expected true)\n", all_finite(logits->to_vector()) ? "true" : "false");
 
     printf("\n=== cross_entropy_sparse_seq ===\n");
     vector<int> targets = {3, 5, 2, 1};
     auto loss = cross_entropy_sparse_seq(logits, targets);
-    printf("loss shape: [%d] (expected [1])\n", loss->shape[0]);
-    printf("loss value: %.4f (expected positive)\n", loss->data[0]);
-    printf("loss finite: %s (expected true)\n", all_finite(loss->data) ? "true" : "false");
+    printf("loss shape: [%d] (expected [1])\n", loss->shape()[0]);
+    printf("loss value: %.4f (expected positive)\n", loss->data()[0]);
+    printf("loss finite: %s (expected true)\n", all_finite(loss->to_vector()) ? "true" : "false");
 
     printf("\n=== Backward — gradient flow ===\n");
-    for (float& g : loss->grad) g = 1.0f;
+    for (float& g : loss->grad_values()) g = 1.0f;
     loss->backward();
 
     auto params_unused = gpt.parameters(); (void)params_unused;
@@ -70,7 +70,7 @@ int main() {
 
     printf("\n=== Invalid sequence length throws ===\n");
     try {
-        auto too_long = make_shared<Tensor>(vector<int>{100}, vector<float>(100, 0.0f));
+        auto too_long = make_shared<Tensor>(Shape{100}, vector<float>(100, 0.0f));
         gpt.forward(too_long);
         printf("no exception (unexpected)\n");
     } catch (const exception& e) {
@@ -90,8 +90,8 @@ int main() {
         int S = (int)ids.size();
         int V = g.vocab_size_;
 
-        auto seq = make_shared<Tensor>(vector<int>{S});
-        for (int i = 0; i < S; i++) seq->data[i] = (float)ids[i];
+        auto seq = make_shared<Tensor>(Shape{S});
+        for (int i = 0; i < S; i++) seq->data()[i] = (float)ids[i];
         auto full = g.forward(seq);              // [S, V]
 
         auto cache = g.make_kv_cache();
@@ -100,7 +100,7 @@ int main() {
 
         float maxdiff = 0.0f;
         for (int v = 0; v < V; v++)
-            maxdiff = std::max(maxdiff, std::fabs(full->data[(S - 1) * V + v] - step->data[v]));
+            maxdiff = std::max(maxdiff, std::fabs(full->data()[(S - 1) * V + v] - step->data()[v]));
 
         CHECK_NEAR("forward vs forward_cached (last position)", maxdiff, 0.0f, 1e-3f);
     }

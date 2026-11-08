@@ -27,11 +27,11 @@ void SGD::step(){
         for(int j = 0; j < p->num_el(); j++){
 
             if (momentum == 0.0f){
-                p->data[j] -= lr * p->grad[j];
+                p->data()[j] -= lr * p->grad()[j];
                 
             } else {
-                velocity[i][j] = momentum * velocity[i][j] + p->grad[j];
-                p->data[j] -= lr * velocity[i][j];
+                velocity[i][j] = momentum * velocity[i][j] + p->grad()[j];
+                p->data()[j] -= lr * velocity[i][j];
             }
 
         }

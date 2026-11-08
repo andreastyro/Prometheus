@@ -9,8 +9,8 @@ LayerNorm::LayerNorm(int normalized_shape, float eps)
     : normalized_shape(normalized_shape), eps(eps) {
     gamma = Tensor::ones({normalized_shape});
     beta  = Tensor::zeros({normalized_shape});
-    gamma->requires_grad = true;
-    beta->requires_grad  = true;
+    gamma->set_requires_grad(true);
+    beta->set_requires_grad(true);
 }
 
 // LayerNorm backward (each row is independent):
@@ -21,7 +21,7 @@ LayerNorm::LayerNorm(int normalized_shape, float eps)
 TensorPtr LayerNorm::forward(TensorPtr input) {
     int N       = normalized_shape;
     int num_rows = input->num_el() / N;
-    auto output  = make_shared<Tensor>(input->shape);
+    auto output  = make_shared<Tensor>(input->shape());
 
     // x_hat and inv_std saved per-row for the backward
     vector<float> x_hat_all(input->num_el());
@@ -32,12 +32,12 @@ TensorPtr LayerNorm::forward(TensorPtr input) {
         int off = r * N;
 
         float mean_v = 0.0f;
-        for (int i = 0; i < N; i++) mean_v += input->data[off + i];
+        for (int i = 0; i < N; i++) mean_v += input->data()[off + i];
         mean_v /= N;
 
         float var = 0.0f;
         for (int i = 0; i < N; i++) {
-            float d = input->data[off + i] - mean_v;
+            float d = input->data()[off + i] - mean_v;
             var += d * d;
         }
         var /= N;
@@ -46,12 +46,12 @@ TensorPtr LayerNorm::forward(TensorPtr input) {
         inv_std_all[r] = is;
 
         for (int i = 0; i < N; i++) {
-            x_hat_all[off + i] = (input->data[off + i] - mean_v) * is;
-            output->data[off + i] = gamma->data[i] * x_hat_all[off + i] + beta->data[i];
+            x_hat_all[off + i] = (input->data()[off + i] - mean_v) * is;
+            output->data()[off + i] = gamma->data()[i] * x_hat_all[off + i] + beta->data()[i];
         }
     }
 
-    if (input->requires_grad || gamma->requires_grad || beta->requires_grad) {
+    if (input->requires_grad() || gamma->requires_grad() || beta->requires_grad()) {
         auto g = gamma;
         auto b = beta;
         auto node = make_node(output, {input, g, b});
@@ -67,15 +67,15 @@ TensorPtr LayerNorm::forward(TensorPtr input) {
                 // g[i] = gamma[i] * output.grad[r, i]  (grad w.r.t. x_hat)
                 float sum_g = 0.0f, sum_g_xhat = 0.0f;
                 for (int i = 0; i < N; i++) {
-                    float gi = g->data[i] * output->grad[off + i];
+                    float gi = g->data()[i] * output->grad()[off + i];
                     sum_g      += gi;
                     sum_g_xhat += gi * x_hat_all[off + i];
                 }
 
-                if (input->requires_grad) {
+                if (input->requires_grad()) {
                     for (int i = 0; i < N; i++) {
-                        float gi = g->data[i] * output->grad[off + i];
-                        input->grad[off + i] += (is / N) * (N * gi - sum_g - x_hat_all[off + i] * sum_g_xhat);
+                        float gi = g->data()[i] * output->grad()[off + i];
+                        input->grad()[off + i] += (is / N) * (N * gi - sum_g - x_hat_all[off + i] * sum_g_xhat);
                     }
                 }
             }
@@ -83,17 +83,17 @@ TensorPtr LayerNorm::forward(TensorPtr input) {
             // gamma and beta accumulate over every row, so the row loop
             // cannot be split. Walking the feature index on the outside gives
             // each thread its own output slot and one pass over the gradient.
-            if (g->requires_grad || b->requires_grad) {
+            if (g->requires_grad() || b->requires_grad()) {
                 #pragma omp parallel for schedule(static) if(N >= 256)
                 for (int i = 0; i < N; i++) {
                     float gg = 0.0f, bg = 0.0f;
                     for (int r = 0; r < num_rows; r++) {
-                        float go = output->grad[r * N + i];
+                        float go = output->grad()[r * N + i];
                         gg += go * x_hat_all[r * N + i];
                         bg += go;
                     }
-                    if (g->requires_grad) g->grad[i] += gg;
-                    if (b->requires_grad) b->grad[i] += bg;
+                    if (g->requires_grad()) g->grad()[i] += gg;
+                    if (b->requires_grad()) b->grad()[i] += bg;
                 }
             }
         };

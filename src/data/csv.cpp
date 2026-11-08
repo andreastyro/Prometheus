@@ -36,8 +36,8 @@ pair<TensorPtr, TensorPtr> read_csv(const string& path, int y_col, bool header){
 
     if (y_col == -1) y_col = n_cols - 1;
 
-    auto x = make_shared<Tensor>(vector<int>{n_rows, n_cols-1});
-    auto y = make_shared<Tensor>(vector<int>{n_rows, 1});
+    auto x = make_shared<Tensor>(Shape{n_rows, n_cols-1});
+    auto y = make_shared<Tensor>(Shape{n_rows, 1});
 
     for (int i = 0; i < n_rows; i++){
 
@@ -46,9 +46,9 @@ pair<TensorPtr, TensorPtr> read_csv(const string& path, int y_col, bool header){
         for (int j = 0; j < n_cols; j++){
 
             if (j == y_col){
-                y->data[i] = rows[i][j]; 
+                y->data()[i] = rows[i][j]; 
             } else {
-                x->data[i * (n_cols - 1) + x_col] = rows[i][j];
+                x->data()[i * (n_cols - 1) + x_col] = rows[i][j];
                 x_col++;
             }
 

@@ -81,12 +81,12 @@ class GPT(Model):
         out = []
 
         ids = p.Tensor([1, S], [float(t) for t in token_ids])
-        x = p.reshape_op(self.tok_emb.forward(ids), [S, E])
+        x = p.reshape(self.tok_emb.forward(ids), [S, E])
         out.append(("tok_emb", x))
 
         if not self.rope:
             pos = p.Tensor([1, S], [float(i) for i in range(S)])
-            x = p.add(x, p.reshape_op(self.pos_emb.forward(pos), [S, E]))
+            x = p.add(x, p.reshape(self.pos_emb.forward(pos), [S, E]))
             out.append(("pos_emb", x))
 
         for i, blk in enumerate(self.blocks):
@@ -115,15 +115,15 @@ class GPT(Model):
                 raise ValueError("token id {} out of range".format(t))
 
         # Embedding expects [batch, seq] and returns [batch, seq, embed];
-        # reshape_op drops the batch axis while keeping the gradient path.
-        # reshape_view would be free, but a view carries no data of its own
+        # reshape drops the batch axis while keeping the gradient path.
+        # reshape would be free, but a view carries no data of its own
         # and the blocks below read data directly, so it cannot go here yet.
         ids = p.Tensor([1, S], [float(t) for t in token_ids])
-        x = p.reshape_op(self.tok_emb.forward(ids), [S, E])
+        x = p.reshape(self.tok_emb.forward(ids), [S, E])
 
         if not self.rope:
             pos = p.Tensor([1, S], [float(i) for i in range(S)])
-            x = p.add(x, p.reshape_op(self.pos_emb.forward(pos), [S, E]))
+            x = p.add(x, p.reshape(self.pos_emb.forward(pos), [S, E]))
 
         for blk in self.blocks:
             x = blk.forward(x)

@@ -4,6 +4,7 @@
 #include <pybind11/numpy.h>
 
 #include "ml/tensor.hpp"
+#include "ml/strided.hpp"
 #include "ml/ops.hpp"
 #include "ml/matmul_backend.hpp"
 #include "ml/blas.hpp"
@@ -66,48 +67,108 @@ PYBIND11_MODULE(prometheus, m) {
     // -------------------------------------------------------------------------
     // Tensor
     // -------------------------------------------------------------------------
+    py::enum_<DType>(m, "dtype")
+        .value("float32",  DType::Float32)
+        .value("float64",  DType::Float64)
+        .value("float16",  DType::Float16)
+        .value("bfloat16", DType::BFloat16)
+        .value("int64",    DType::Int64)
+        .value("int32",    DType::Int32)
+        .value("bool",     DType::Bool);
+    // the PyTorch spelling: prometheus.float32, prometheus.int64, ...
+    for (const char* n : {"float32", "float64", "float16", "bfloat16", "int64", "int32", "bool"})
+        m.attr(n) = m.attr("dtype").attr(n);
+
+    py::enum_<Device>(m, "device")
+        .value("cpu",  Device::CPU)
+        .value("cuda", Device::CUDA);
+    m.attr("cpu") = m.attr("device").attr("cpu");
+
     py::class_<Tensor, std::shared_ptr<Tensor>>(m, "Tensor")
-        .def(py::init<std::vector<int>>())
-        .def(py::init<std::vector<int>, std::vector<float>>())
-        .def_readwrite("data",          &Tensor::data)
-        .def_readwrite("shape",         &Tensor::shape)
-        .def_readwrite("grad",          &Tensor::grad)
+        .def(py::init([](std::vector<int64_t> shape, DType dtype) {
+                 return std::make_shared<Tensor>(shape, dtype);
+             }), py::arg("shape"), py::arg("dtype") = DType::Float32)
+        // values arrive as doubles so that int64 ids are exact past 2^24
+        .def(py::init([](std::vector<int64_t> shape, std::vector<double> values, DType dtype) {
+                 auto t = std::make_shared<Tensor>(shape, dtype);
+                 if ((int64_t)values.size() != t->numel())
+                     throw std::runtime_error("Tensor: " + std::to_string(values.size()) +
+                                              " values for a shape of " +
+                                              std::to_string(t->numel()) + " elements");
+                 for (int64_t i = 0; i < t->numel(); i++)
+                     strided::store(t->storage()->data(), dtype, i, values[i]);
+                 return t;
+             }), py::arg("shape"), py::arg("values"), py::arg("dtype") = DType::Float32)
+
+        .def_property("data",
+                      [](const Tensor& t) { return t.to_vector(); },
+                      [](Tensor& t, const std::vector<float>& v) { t.set_data(v); },
+                      "Every element in row-major order, as a list (a copy).")
+        .def_property_readonly("shape",   [](const Tensor& t) { return t.shape(); })
+        .def_property_readonly("strides", [](const Tensor& t) { return t.strides(); })
+        .def_property_readonly("dtype",   &Tensor::dtype)
+        .def_property_readonly("device",  &Tensor::device)
+        .def_property("grad",
+                      [](const Tensor& t) { return t.grad_vector(); },
+                      [](Tensor& t, const std::vector<float>& g) { t.set_grad(g); })
         .def_property("requires_grad",
-                      [](Tensor &t) { return t.requires_grad; },
-                      [](Tensor &t, bool v) {
-                          t.requires_grad = v;
+                      [](const Tensor& t) { return t.requires_grad(); },
+                      [](Tensor& t, bool v) {
+                          t.set_requires_grad(v);
                           // the buffer is allocated lazily, so a tensor the
                           // user marks by hand needs one before any op writes
                           if (v) t.ensure_grad();
                       })
-        .def("get",       &Tensor::get)
-        .def("set",       &Tensor::set)
-        .def("fill",      &Tensor::fill)
-        .def("print",     &Tensor::print)
-        .def("num_el",    &Tensor::num_el)
-        .def("is_view",        &Tensor::is_view)
-        .def("is_contiguous",  &Tensor::is_contiguous)
-        .def("transpose", &Tensor::transpose)
-        .def("reshape",   &Tensor::reshape)
-        .def("backward",  &Tensor::backward)
-        .def("reset_grad",&Tensor::reset_grad)
-        .def("detach",    &Tensor::detach)
-        .def("half",      &Tensor::half)
-        .def("to_float",  &Tensor::to_float)
-        .def_static("zeros", &Tensor::zeros)
-        .def_static("ones",  &Tensor::ones)
-        .def_static("randn", &Tensor::randn)
+        .def("dim",           &Tensor::dim)
+        .def("numel",         &Tensor::numel)
+        .def("num_el",        &Tensor::num_el)
+        .def("size",          &Tensor::size, py::arg("dim"))
+        .def("item",          &Tensor::item)
+        .def("get",           &Tensor::get)
+        .def("set",           &Tensor::set)
+        .def("fill",          &Tensor::fill)
+        .def("print",         &Tensor::print)
+        .def("is_view",       &Tensor::is_view)
+        .def("is_contiguous", &Tensor::is_contiguous)
+        .def("transpose",     &Tensor::transpose, py::arg("dim0") = -2, py::arg("dim1") = -1)
+        .def("reshape",       [](Tensor& t, std::vector<int64_t> shape) { return t.reshape(shape); })
+        .def("contiguous",    &Tensor::contiguous)
+        .def("to",            py::overload_cast<DType>(&Tensor::to))
+        .def("to",            py::overload_cast<Device>(&Tensor::to))
+        .def("backward",      &Tensor::backward)
+        .def("reset_grad",    &Tensor::reset_grad)
+        .def("zero_grad",     &Tensor::zero_grad)
+        .def("detach",        &Tensor::detach)
+        .def("half",          &Tensor::half)
+        .def("to_float",      &Tensor::to_float)
+        .def_static("zeros", [](std::vector<int64_t> s, DType d) { return Tensor::zeros(s, d); },
+                    py::arg("shape"), py::arg("dtype") = DType::Float32)
+        .def_static("ones",  [](std::vector<int64_t> s, DType d) { return Tensor::ones(s, d); },
+                    py::arg("shape"), py::arg("dtype") = DType::Float32)
+        .def_static("full",  [](std::vector<int64_t> s, float v, DType d) { return Tensor::full(s, v, d); },
+                    py::arg("shape"), py::arg("value"), py::arg("dtype") = DType::Float32)
+        .def_static("randn", [](std::vector<int64_t> s) { return Tensor::randn(s); }, py::arg("shape"))
         .def_static("manual_seed", &Tensor::manual_seed, py::arg("seed"))
-        // numpy interop
-        .def("numpy", [](TensorPtr t) {
-            std::vector<py::ssize_t> shape(t->shape.begin(), t->shape.end());
-            return py::array_t<float>(shape, t->data.data());
+        // numpy interop: a copy, in the matching numpy dtype
+        .def("numpy", [](TensorPtr t) -> py::object {
+            std::vector<py::ssize_t> shape(t->shape().begin(), t->shape().end());
+            auto c = t->detach();                       // contiguous copy
+            switch (c->dtype()) {
+                case DType::Float64: return py::array_t<double>(shape, c->data_ptr<double>());
+                case DType::Int64:   return py::array_t<int64_t>(shape, c->data_ptr<int64_t>());
+                case DType::Int32:   return py::array_t<int32_t>(shape, c->data_ptr<int32_t>());
+                case DType::Bool:    return py::array_t<bool>(shape, c->data_ptr<bool>());
+                default: {
+                    auto v = c->to_vector();            // float16/bfloat16 widen to float32
+                    return py::array_t<float>(shape, v.data());
+                }
+            }
         })
-        .def_static("from_numpy", [](py::array_t<float> arr, std::vector<int> shape) {
+        .def_static("from_numpy", [](py::array_t<float, py::array::c_style | py::array::forcecast> arr,
+                                     std::vector<int64_t> shape) {
             auto buf = arr.request();
-            float* ptr = static_cast<float*>(buf.ptr);
-            std::vector<float> data(ptr, ptr + buf.size);
-            return std::make_shared<Tensor>(shape, data);
+            const float* ptr = static_cast<const float*>(buf.ptr);
+            return std::make_shared<Tensor>(shape, std::vector<float>(ptr, ptr + buf.size));
         });
 
     // -------------------------------------------------------------------------
@@ -129,16 +190,16 @@ PYBIND11_MODULE(prometheus, m) {
     m.def("sigmoid",       &sigmoid);
     m.def("tanh_op",       &tanh_op);
     m.def("softmax",       &softmax);
-    m.def("reshape_op",    &reshape_op, py::arg("a"), py::arg("new_shape"));
-    m.def("transpose_op",  &transpose_op, py::arg("a"));
     m.def("concat_op",     &concat_op, py::arg("inputs"), py::arg("axis") = 0);
-    m.def("transpose_view", &transpose_view, py::arg("a"),
-          "O(1) transpose sharing storage. Non-contiguous; use contiguous() "
-          "for ops that read data directly.");
-    m.def("reshape_view",   &reshape_view, py::arg("a"), py::arg("new_shape"),
-          "O(1) reshape sharing storage.");
-    m.def("contiguous",     &contiguous, py::arg("a"),
-          "Materialise a view; returns the input unchanged if it owns its data.");
+    m.def("transpose",     &transpose, py::arg("a"), py::arg("dim0") = -2, py::arg("dim1") = -1,
+          "Swap two dimensions: an O(1), differentiable view sharing storage.");
+    m.def("permute",       &permute, py::arg("a"), py::arg("dims"),
+          "Reorder all dimensions: an O(1), differentiable view.");
+    m.def("reshape",       [](TensorPtr a, std::vector<int64_t> shape) { return reshape(a, shape); },
+          py::arg("a"), py::arg("shape"),
+          "Same elements, new shape (one dim may be -1). A view when the input is contiguous.");
+    m.def("contiguous",    &contiguous, py::arg("a"),
+          "The tensor in contiguous storage; the input itself if it already is.");
     // Where pip and conda put shared libraries, so `pip install mkl` is found
     // with no configuration: <prefix>/Library/bin on Windows, <prefix>/lib
     // elsewhere, for both the interpreter's prefix and the user base.

@@ -83,8 +83,8 @@ GPT::GPT(int vocab_size, int max_seq_len, int embed_dim,
     // initialisation the residual stream variance stays ≈1.
     float residual_scale = 1.0f / sqrtf(2.0f * (float)num_layers);
     for (auto& blk : blocks) {
-        for (float& v : blk.attn.W_o->data) v *= residual_scale;
-        for (float& v : blk.ff2.weights->data) v *= residual_scale;
+        for (float& v : blk.attn.W_o->values()) v *= residual_scale;
+        for (float& v : blk.ff2.weights->values()) v *= residual_scale;
     }
 }
 
@@ -111,17 +111,17 @@ TensorPtr GPT::forward(TensorPtr token_ids, int batch) {
     // Out[b, t, d] = tok_emb.weight[tok_id, d] + pos_emb.weight[t, d]
     // Position restarts at every sequence, so pos_emb is indexed by t, not by
     // the folded row.
-    auto x = make_shared<Tensor>(vector<int>{B * S, E});
+    auto x = make_shared<Tensor>(Shape{B * S, E});
     vector<int> tok_ids(B * S);
     for (int r = 0; r < B * S; r++) {
         const int t = r % S;
-        tok_ids[r] = (int)token_ids->data[r];
+        tok_ids[r] = (int)token_ids->data()[r];
         int tid    = tok_ids[r];
         if (tid < 0 || tid >= V)
             throw runtime_error("GPT: token id " + to_string(tid) + " out of range");
         for (int d = 0; d < E; d++)
-            x->data[r*E + d] = tok_emb.weight->data[tid*E + d]
-                              + pos_emb.weight->data[t  *E + d];
+            x->data()[r*E + d] = tok_emb.weight->data()[tid*E + d]
+                              + pos_emb.weight->data()[t  *E + d];
     }
 
     {
@@ -133,9 +133,9 @@ TensorPtr GPT::forward(TensorPtr token_ids, int batch) {
                 const int t   = r % S;          // position inside its sequence
                 const int tid = tok_ids[r];
                 for (int d = 0; d < E; d++) {
-                    float g = x->grad[r*E + d];
-                    tw->grad[tid*E + d] += g;
-                    pw->grad[t  *E + d] += g;   // accumulates across the batch
+                    float g = x->grad()[r*E + d];
+                    tw->grad()[tid*E + d] += g;
+                    pw->grad()[t  *E + d] += g;   // accumulates across the batch
                 }
             }
         };
@@ -153,7 +153,7 @@ TensorPtr GPT::forward(TensorPtr token_ids, int batch) {
     //              = x @ tok_emb.weight^T,   tok_emb.weight [V, E]
     // Implemented as: logits = x @ W_T  where W_T = tok_emb.weight^T [E, V]
     const int rows = B * S;
-    auto logits = make_shared<Tensor>(vector<int>{rows, V});
+    auto logits = make_shared<Tensor>(Shape{rows, V});
 
     auto tw = tok_emb.weight;
 
@@ -162,23 +162,23 @@ TensorPtr GPT::forward(TensorPtr token_ids, int batch) {
     // 24.6 MB of copying on a 16000x384 table, measured at 29.5 ms, with a
     // second transpose of the same size in the backward. Neither is needed:
     // the gemm reads the weight transposed while striding over its own memory.
-    matmul_forward_bt(rows, V, E, x->data.data(), tw->data.data(),
-                      logits->data.data());
+    matmul_forward_bt(rows, V, E, x->data(), tw->data(),
+                      logits->data());
 
     // Register backward for the weight-tied projection
     {
         auto node = make_node(logits, {x, tw});
         node->backward_fn = [x, tw, logits, rows, E, V]() {
-            const float* gl = logits->grad.data();
+            const float* gl = logits->grad();
 
             // logits = x @ W^T  =>  grad_x += grad_logits @ W
-            if (x->requires_grad)
-                matmul_accumulate(rows, E, V, gl, tw->data.data(), x->grad.data());
+            if (x->requires_grad())
+                matmul_accumulate(rows, E, V, gl, tw->data(), x->grad());
 
             // and grad_W += grad_logits^T @ x, straight into tw->grad with no
             // intermediate transpose
-            if (tw->requires_grad)
-                matmul_backward_b(rows, V, E, x->data.data(), gl, tw->grad.data());
+            if (tw->requires_grad())
+                matmul_backward_b(rows, V, E, x->data(), gl, tw->grad());
         };
     }
 
@@ -224,11 +224,11 @@ TensorPtr GPT::forward_cached(int token_id, KVCache& cache) {
 
     // ── Embedding ─────────────────────────────────────────────────────────────
     vector<float> x(E);
-    const float* tw = tok_emb.weight->data.data();
+    const float* tw = tok_emb.weight->data();
     for (int d = 0; d < E; d++) x[d] = tw[token_id * E + d];
 
     if (!rope_) {
-        const float* pw = pos_emb.weight->data.data();
+        const float* pw = pos_emb.weight->data();
         for (int d = 0; d < E; d++) x[d] += pw[pos * E + d];
     }
 
@@ -240,14 +240,14 @@ TensorPtr GPT::forward_cached(int token_id, KVCache& cache) {
         auto& Kcache = cache.K[l];
         auto& Vcache = cache.V[l];
 
-        const float* Wq = blk.attn.W_q->data.data();
-        const float* Wk = blk.attn.W_k->data.data();
-        const float* Wv = blk.attn.W_v->data.data();
-        const float* Wo = blk.attn.W_o->data.data();
+        const float* Wq = blk.attn.W_q->data();
+        const float* Wk = blk.attn.W_k->data();
+        const float* Wv = blk.attn.W_v->data();
+        const float* Wo = blk.attn.W_o->data();
 
         // Pre-norm 1
         ln_arr(x.data(), x_norm.data(),
-               blk.norm1.gamma->data.data(), blk.norm1.beta->data.data(),
+               blk.norm1.gamma->data(), blk.norm1.beta->data(),
                E, blk.norm1.eps);
 
         // Q, K, V projections for this single token  (W is [E, E] = [in, out])
@@ -302,33 +302,33 @@ TensorPtr GPT::forward_cached(int token_id, KVCache& cache) {
 
         // Pre-norm 2
         ln_arr(x.data(), x_norm.data(),
-               blk.norm2.gamma->data.data(), blk.norm2.beta->data.data(),
+               blk.norm2.gamma->data(), blk.norm2.beta->data(),
                E, blk.norm2.eps);
 
         // FFN: ff1 [E → ff_dim], gelu, ff2 [ff_dim → E], residual
-        int ff_dim = blk.ff1.weights->shape[1]; // ff1.weights is [E, ff_dim]
+        int ff_dim = blk.ff1.weights->shape()[1]; // ff1.weights is [E, ff_dim]
         vector<float> ff1_out(ff_dim), ff1_act(ff_dim), ff2_out(E);
 
         linear_arr(x_norm.data(), ff1_out.data(),
-                   blk.ff1.weights->data.data(), blk.ff1.bias->data.data(), E, ff_dim);
+                   blk.ff1.weights->data(), blk.ff1.bias->data(), E, ff_dim);
         gelu_arr(ff1_out.data(), ff1_act.data(), ff_dim);
         linear_arr(ff1_act.data(), ff2_out.data(),
-                   blk.ff2.weights->data.data(), blk.ff2.bias->data.data(), ff_dim, E);
+                   blk.ff2.weights->data(), blk.ff2.bias->data(), ff_dim, E);
 
         for (int d = 0; d < E; d++) x[d] += ff2_out[d];
     }
 
     // ── Final LayerNorm ───────────────────────────────────────────────────────
     ln_arr(x.data(), x.data(),
-           ln_f.gamma->data.data(), ln_f.beta->data.data(), E, ln_f.eps);
+           ln_f.gamma->data(), ln_f.beta->data(), E, ln_f.eps);
 
     // ── Weight-tied output projection: logits[v] = Σ_d x[d] * tok_emb.weight[v, d] ─
-    auto logits = make_shared<Tensor>(vector<int>{V_sz});
-    const float* tw2 = tok_emb.weight->data.data();
+    auto logits = make_shared<Tensor>(Shape{V_sz});
+    const float* tw2 = tok_emb.weight->data();
     for (int v = 0; v < V_sz; v++) {
         float dot = 0.0f;
         for (int d = 0; d < E; d++) dot += x[d] * tw2[v*E + d];
-        logits->data[v] = dot;
+        logits->data()[v] = dot;
     }
 
     cache.past_len++;

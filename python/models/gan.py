@@ -68,7 +68,7 @@ class Generator(Model):
         out.append(("project", x))
         x = p.relu(x)
         batch = z.shape[0]
-        x = p.reshape_op(x, [batch, self.proj_channels,
+        x = p.reshape(x, [batch, self.proj_channels,
                              self.start_size, self.start_size])
         out.append(("reshape", x))
         for i, (up, norm, relu) in enumerate(self.ups):
@@ -82,7 +82,7 @@ class Generator(Model):
         x = self.project.forward(z)
         x = p.relu(x)
         batch = z.shape[0]
-        x = p.reshape_op(x, [batch, self.proj_channels,
+        x = p.reshape(x, [batch, self.proj_channels,
                              self.start_size, self.start_size])
         for up, norm, relu in self.ups:
             x = relu.forward(norm.forward(up.forward(x)))

@@ -17,22 +17,18 @@ int main(){
     Tensor::manual_seed(11);
 
     // 10 train samples
-    auto x_train = make_shared<Tensor>(
-        vector<int>{10, 2},
+    auto x_train = make_shared<Tensor>(Shape{10, 2},
         vector<float>{1,2, 3,4, 5,6, 7,8, 9,10, 2,1, 4,3, 6,5, 8,7, 10,9}
     );
-    auto y_train = make_shared<Tensor>(
-        vector<int>{10, 1},
+    auto y_train = make_shared<Tensor>(Shape{10, 1},
         vector<float>{0,1,0,1,0,1,0,1,0,1}
     );
 
     // 4 val samples
-    auto x_val = make_shared<Tensor>(
-        vector<int>{4, 2},
+    auto x_val = make_shared<Tensor>(Shape{4, 2},
         vector<float>{1,3, 2,4, 5,7, 6,8}
     );
-    auto y_val = make_shared<Tensor>(
-        vector<int>{4, 1},
+    auto y_val = make_shared<Tensor>(Shape{4, 1},
         vector<float>{0,1,0,1}
     );
 
@@ -73,12 +69,12 @@ int main(){
         auto val_pred = model.forward(vx);
         auto val_loss = bce_loss(val_pred, vy);
 
-        printf("Epoch %d | Val Loss: %.4f\n", epoch + 1, val_loss->data[0]);
+        printf("Epoch %d | Val Loss: %.4f\n", epoch + 1, val_loss->data()[0]);
 
         epochs_run = epoch + 1;
-        last_val   = val_loss->data[0];
+        last_val   = val_loss->data()[0];
 
-        if (es.step(val_loss->data[0])){
+        if (es.step(val_loss->data()[0])){
             printf("Early stopping triggered at epoch %d\n", epoch + 1);
             stopped = true;
             break;

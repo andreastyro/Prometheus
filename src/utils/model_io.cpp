@@ -15,14 +15,14 @@ void save(const string& path, vector<TensorPtr> params){
     file.write((char*)&num_params, sizeof(int));
 
     for (auto& p : params){
-        int ndims = p->shape.size();
+        int ndims = p->shape().size();
         file.write((char*)&ndims, sizeof(int));
 
-        for (int dim : p->shape)
+        for (int dim : p->shape())
             file.write((char*)&dim, sizeof(int));
 
         int n = p->num_el();
-        file.write((char*)p->data.data(), n * sizeof(float));
+        file.write((char*)p->data(), n * sizeof(float));
     }
 }
 
@@ -48,7 +48,7 @@ vector<TensorPtr> load(const string& path){
             file.read((char*)&shape[d], sizeof(int));
 
         auto tensor = make_shared<Tensor>(shape);
-        file.read((char*)tensor->data.data(), tensor->num_el() * sizeof(float));
+        file.read((char*)tensor->data(), tensor->num_el() * sizeof(float));
 
         params.push_back(tensor);
     }
@@ -75,12 +75,12 @@ void save_checkpoint(const string& path, const vector<TensorPtr>& params,
     file.write(reinterpret_cast<const char*>(&num_params), sizeof(int));
 
     for (auto& p : params) {
-        int ndims = (int)p->shape.size();
+        int ndims = (int)p->shape().size();
         file.write(reinterpret_cast<const char*>(&ndims), sizeof(int));
-        for (int dim : p->shape)
+        for (int dim : p->shape())
             file.write(reinterpret_cast<const char*>(&dim), sizeof(int));
         int n = p->num_el();
-        file.write(reinterpret_cast<const char*>(p->data.data()), n * sizeof(float));
+        file.write(reinterpret_cast<const char*>(p->data()), n * sizeof(float));
     }
 }
 
@@ -111,7 +111,7 @@ Checkpoint load_checkpoint(const string& path, vector<TensorPtr>& params) {
         for (int d = 0; d < ndims; d++)
             file.read(reinterpret_cast<char*>(&shape[d]), sizeof(int));
         auto tensor = make_shared<Tensor>(shape);
-        file.read(reinterpret_cast<char*>(tensor->data.data()), tensor->num_el() * sizeof(float));
+        file.read(reinterpret_cast<char*>(tensor->data()), tensor->num_el() * sizeof(float));
         params[i] = tensor;
     }
 

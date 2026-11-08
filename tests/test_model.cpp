@@ -21,15 +21,13 @@ int main() {
     });
 
     // --- Dummy input: 3 samples, 2 features each ---
-    auto input = make_shared<Tensor>(
-        vector<int>{3, 2},
+    auto input = make_shared<Tensor>(Shape{3, 2},
         vector<float>{1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f}
     );
-    input->requires_grad = false;
+    input->set_requires_grad(false);
 
     // --- Target values ---
-    auto target = make_shared<Tensor>(
-        vector<int>{3, 1},
+    auto target = make_shared<Tensor>(Shape{3, 1},
         vector<float>{1.0f, 0.0f, 1.0f}
     );
 
@@ -48,9 +46,9 @@ int main() {
         loss->backward();
         optimizer.step();
 
-        if (step == 0) first_loss = loss->data[0];
-        last_loss = loss->data[0];
-        printf("Step %d | Loss: %.4f\n", step + 1, loss->data[0]);
+        if (step == 0) first_loss = loss->data()[0];
+        last_loss = loss->data()[0];
+        printf("Step %d | Loss: %.4f\n", step + 1, loss->data()[0]);
     }
 
     CHECK_TRUE("Sequential: loss finite", std::isfinite(last_loss));
@@ -84,7 +82,7 @@ int main() {
         optimizer2.step();
 
         if ((step + 1) % 20 == 0)
-            printf("Step %d | Loss: %.4f\n", step + 1, loss->data[0]);
+            printf("Step %d | Loss: %.4f\n", step + 1, loss->data()[0]);
     }
 
     printf("\nFinal predictions (manual):\n");
@@ -92,9 +90,9 @@ int main() {
     out->print();
 
     bool finite = true;
-    for (float v : out->data) if (!std::isfinite(v)) finite = false;
+    for (float v : out->values()) if (!std::isfinite(v)) finite = false;
     CHECK_TRUE("manual model: predictions finite", finite);
-    CHECK_NEAR("manual model: output rows", out->shape[0], input->shape[0], 0.0);
+    CHECK_NEAR("manual model: output rows", out->shape()[0], input->shape()[0], 0.0);
 
     return test_report();
 }

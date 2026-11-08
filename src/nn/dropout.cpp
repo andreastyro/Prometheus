@@ -27,7 +27,7 @@ TensorPtr Dropout::forward(TensorPtr input){
     const float scale = 1.0f / (1.0f - rate);
     const int   n     = input->num_el();
 
-    auto result = make_shared<Tensor>(input->shape);
+    auto result = make_shared<Tensor>(input->shape());
 
     // mask[i] is the factor actually applied, so the backward pass can reuse it
     vector<float> mask(n);
@@ -35,15 +35,15 @@ TensorPtr Dropout::forward(TensorPtr input){
     for (int i = 0; i < n; i++) {
         const bool drop = dist(prometheus_rng()) < rate;
         mask[i] = drop ? 0.0f : scale;
-        result->data[i] = input->data[i] * mask[i];
+        result->data()[i] = input->data()[i] * mask[i];
     }
 
-    if (input->requires_grad) {
+    if (input->requires_grad()) {
         auto node = make_node(result, {input});
 
         node->backward_fn = [input, result, mask, n]() {
             for (int i = 0; i < n; i++)
-                input->grad[i] += result->grad[i] * mask[i];
+                input->grad()[i] += result->grad()[i] * mask[i];
         };
     }
 

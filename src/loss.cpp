@@ -61,24 +61,24 @@ TensorPtr huber_loss(TensorPtr pred, TensorPtr target, float delta) {
     auto out = Tensor::zeros({1});
     float total = 0.0f;
     for (int i = 0; i < n; i++) {
-        float diff = std::abs(pred->data[i] - target->data[i]);
+        float diff = std::abs(pred->data()[i] - target->data()[i]);
         if (diff <= delta)
             total += 0.5f * diff * diff;
         else
             total += delta * (diff - 0.5f * delta);
     }
-    out->data[0] = total / n;
+    out->data()[0] = total / n;
 
-    if (pred->requires_grad) {
+    if (pred->requires_grad()) {
         auto node = make_node(out, {pred});
         node->backward_fn = [pred, target, out, delta, n]() {
-            const float g = out->grad[0] / n;
+            const float g = out->grad()[0] / n;
             for (int i = 0; i < n; i++) {
-                const float r = pred->data[i] - target->data[i];
+                const float r = pred->data()[i] - target->data()[i];
                 if (std::abs(r) <= delta)
-                    pred->grad[i] += g * r;
+                    pred->grad()[i] += g * r;
                 else
-                    pred->grad[i] += g * delta * ((r > 0.0f) ? 1.0f : -1.0f);
+                    pred->grad()[i] += g * delta * ((r > 0.0f) ? 1.0f : -1.0f);
             }
         };
     }
@@ -119,26 +119,26 @@ TensorPtr contrastive_loss(TensorPtr anchor, TensorPtr positive, TensorPtr negat
     int n = anchor->num_el();
     float d_pos = 0.0f, d_neg = 0.0f;
     for (int i = 0; i < n; i++) {
-        float dp = anchor->data[i] - positive->data[i];
-        float dn = anchor->data[i] - negative->data[i];
+        float dp = anchor->data()[i] - positive->data()[i];
+        float dn = anchor->data()[i] - negative->data()[i];
         d_pos += dp * dp;
         d_neg += dn * dn;
     }
     auto out = Tensor::zeros({1});
     const float raw = d_pos - d_neg + margin;
-    out->data[0] = std::max(0.0f, raw);
+    out->data()[0] = std::max(0.0f, raw);
 
-    if (anchor->requires_grad || positive->requires_grad || negative->requires_grad) {
+    if (anchor->requires_grad() || positive->requires_grad() || negative->requires_grad()) {
         auto node = make_node(out, {anchor, positive, negative});
         node->backward_fn = [anchor, positive, negative, out, raw, n]() {
             if (raw <= 0.0f) return;            // hinge inactive, no gradient
-            const float g = out->grad[0];
+            const float g = out->grad()[0];
             for (int i = 0; i < n; i++) {
-                const float dp = anchor->data[i] - positive->data[i];
-                const float dn = anchor->data[i] - negative->data[i];
-                if (anchor->requires_grad)   anchor->grad[i]   += g * 2.0f * (dp - dn);
-                if (positive->requires_grad) positive->grad[i] -= g * 2.0f * dp;
-                if (negative->requires_grad) negative->grad[i] += g * 2.0f * dn;
+                const float dp = anchor->data()[i] - positive->data()[i];
+                const float dn = anchor->data()[i] - negative->data()[i];
+                if (anchor->requires_grad())   anchor->grad()[i]   += g * 2.0f * (dp - dn);
+                if (positive->requires_grad()) positive->grad()[i] -= g * 2.0f * dp;
+                if (negative->requires_grad()) negative->grad()[i] += g * 2.0f * dn;
             }
         };
     }
@@ -152,24 +152,24 @@ TensorPtr l1_regularization(std::vector<TensorPtr> params, float lambda_) {
     auto out = Tensor::zeros({1});
     float total = 0.0f;
     for (auto& p : params)
-        for (float v : p->data)
+        for (float v : p->values())
             total += std::abs(v);
-    out->data[0] = lambda_ * total;
+    out->data()[0] = lambda_ * total;
 
     bool any_grad = false;
-    for (auto& p : params) if (p->requires_grad) any_grad = true;
+    for (auto& p : params) if (p->requires_grad()) any_grad = true;
 
     if (any_grad) {
         auto node = make_node(out, params);
         node->backward_fn = [params, out, lambda_]() {
-            const float g = out->grad[0];
+            const float g = out->grad()[0];
             for (auto& p : params) {
-                if (!p->requires_grad) continue;
+                if (!p->requires_grad()) continue;
                 const int n_1 = p->num_el();
                 for (int i = 0; i < n_1; i++) {
-                    const float v = p->data[i];
+                    const float v = p->data()[i];
                     const float sign = (v > 0.0f) ? 1.0f : ((v < 0.0f) ? -1.0f : 0.0f);
-                    p->grad[i] += g * lambda_ * sign;
+                    p->grad()[i] += g * lambda_ * sign;
                 }
             }
         };
@@ -183,22 +183,22 @@ TensorPtr l2_regularization(std::vector<TensorPtr> params, float lambda_) {
     auto out = Tensor::zeros({1});
     float total = 0.0f;
     for (auto& p : params)
-        for (float v : p->data)
+        for (float v : p->values())
             total += v * v;
-    out->data[0] = lambda_ * total;
+    out->data()[0] = lambda_ * total;
 
     bool any_grad = false;
-    for (auto& p : params) if (p->requires_grad) any_grad = true;
+    for (auto& p : params) if (p->requires_grad()) any_grad = true;
 
     if (any_grad) {
         auto node = make_node(out, params);
         node->backward_fn = [params, out, lambda_]() {
-            const float g = out->grad[0];
+            const float g = out->grad()[0];
             for (auto& p : params) {
-                if (!p->requires_grad) continue;
+                if (!p->requires_grad()) continue;
                 const int n_2 = p->num_el();
                 for (int i = 0; i < n_2; i++)
-                    p->grad[i] += g * 2.0f * lambda_ * p->data[i];
+                    p->grad()[i] += g * 2.0f * lambda_ * p->data()[i];
             }
         };
     }
@@ -211,24 +211,24 @@ TensorPtr l2_regularization(std::vector<TensorPtr> params, float lambda_) {
 //                          = log(Σ exp(logits - max)) + max - logits[target]
 TensorPtr cross_entropy_sparse(TensorPtr logits, int target_idx) {
     int n = logits->num_el();
-    float max_v = *std::max_element(logits->data.begin(), logits->data.end());
+    float max_v = *std::max_element(logits->to_vector().begin(), logits->to_vector().end());
 
     float sum_exp = 0.0f;
-    for (float v : logits->data)
+    for (float v : logits->values())
         sum_exp += std::expf(v - max_v);
 
-    float loss_val = std::logf(sum_exp) + max_v - logits->data[target_idx];
+    float loss_val = std::logf(sum_exp) + max_v - logits->data()[target_idx];
 
-    auto result = make_shared<Tensor>(std::vector<int>{1});
-    result->data[0] = loss_val;
+    auto result = make_shared<Tensor>(Shape{1});
+    result->data()[0] = loss_val;
 
-    if (logits->requires_grad) {
+    if (logits->requires_grad()) {
         auto node = make_node(result, {logits});
         node->backward_fn = [logits, result, target_idx, n, max_v, sum_exp]() {
-            float scale = result->grad[0];
+            float scale = result->grad()[0];
             for (int j = 0; j < n; j++) {
-                float p = std::expf(logits->data[j] - max_v) / sum_exp;
-                logits->grad[j] += scale * (p - (j == target_idx ? 1.0f : 0.0f));
+                float p = std::expf(logits->data()[j] - max_v) / sum_exp;
+                logits->grad()[j] += scale * (p - (j == target_idx ? 1.0f : 0.0f));
             }
         };
     }
@@ -240,8 +240,8 @@ TensorPtr cross_entropy_sparse(TensorPtr logits, int target_idx) {
 // logits: [seq_len, vocab_size],  targets: seq_len ints.
 // Returns mean loss (scalar) with proper backward to all logit positions.
 TensorPtr cross_entropy_sparse_seq(TensorPtr logits, const std::vector<int>& targets) {
-    int seq_len  = logits->shape[0];
-    int vocab    = logits->shape[1];
+    int seq_len  = logits->shape()[0];
+    int vocab    = logits->shape()[1];
 
     // Forward: accumulate loss per position
     // 1024 positions x 16000 vocab is 16M exps per step, and this ran them
@@ -254,7 +254,7 @@ TensorPtr cross_entropy_sparse_seq(TensorPtr logits, const std::vector<int>& tar
         std::vector<float> e(vocab);
         #pragma omp for schedule(static)
         for (int t = 0; t < seq_len; t++) {
-            const float* row = logits->data.data() + (size_t)t * vocab;
+            const float* row = logits->data() + (size_t)t * vocab;
             float mx = row[0];
             for (int v = 1; v < vocab; v++)
                 mx = std::max(mx, row[v]);
@@ -270,19 +270,19 @@ TensorPtr cross_entropy_sparse_seq(TensorPtr logits, const std::vector<int>& tar
 
     float total = 0.0f;
     for (int t = 0; t < seq_len; t++)
-        total += std::logf(sum_exp[t]) + max_v[t] - logits->data[t * vocab + targets[t]];
+        total += std::logf(sum_exp[t]) + max_v[t] - logits->data()[t * vocab + targets[t]];
 
-    auto result = make_shared<Tensor>(std::vector<int>{1});
-    result->data[0] = total / (float)seq_len;
+    auto result = make_shared<Tensor>(Shape{1});
+    result->data()[0] = total / (float)seq_len;
 
-    if (logits->requires_grad) {
+    if (logits->requires_grad()) {
         auto node = make_node(result, {logits});
         node->backward_fn = [logits, result, targets, seq_len, vocab, max_v, sum_exp]() {
-            const float scale = result->grad[0] / (float)seq_len;
+            const float scale = result->grad()[0] / (float)seq_len;
             #pragma omp parallel for schedule(static) if(seq_len >= 16)
             for (int t = 0; t < seq_len; t++) {
-                const float* row = logits->data.data() + (size_t)t * vocab;
-                float* g = logits->grad.data() + (size_t)t * vocab;
+                const float* row = logits->data() + (size_t)t * vocab;
+                float* g = logits->grad() + (size_t)t * vocab;
                 const float mx = max_v[t];
                 const float k  = scale / sum_exp[t];
                 // the target's -1 is applied once after the loop, so the loop

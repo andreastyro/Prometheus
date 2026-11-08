@@ -11,15 +11,15 @@ RNN::RNN(int input_size, int hidden_size)
     W_h  = Tensor::randn({hidden_size, hidden_size});
     bias = Tensor::zeros({hidden_size});
 
-    W_x->requires_grad  = true;
-    W_h->requires_grad  = true;
-    bias->requires_grad = true;
+    W_x->set_requires_grad(true);
+    W_h->set_requires_grad(true);
+    bias->set_requires_grad(true);
 }
 
 pair<TensorPtr, TensorPtr> RNN::forward(TensorPtr input, TensorPtr h0){
-    int seq_len   = input->shape[0];
-    int batch     = input->shape[1];
-    int input_sz  = input->shape[2];
+    int seq_len   = input->shape()[0];
+    int batch     = input->shape()[1];
+    int input_sz  = input->shape()[2];
 
     // initialize hidden state to zeros if not provided
     TensorPtr h = h0 ? h0 : Tensor::zeros({batch, hidden_size});

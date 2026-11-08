@@ -26,8 +26,8 @@ void RMSprop::step(){
 
         for (int j = 0; j < p->num_el(); j++){
             
-            v[i][j] = beta * v[i][j] + (1 - beta) * (pow(p->grad[j], 2));
-            p->data[j] -= lr * p->grad[j] / (sqrt(v[i][j]) + eps);   
+            v[i][j] = beta * v[i][j] + (1 - beta) * (pow(p->grad()[j], 2));
+            p->data()[j] -= lr * p->grad()[j] / (sqrt(v[i][j]) + eps);   
         }
     }
 }

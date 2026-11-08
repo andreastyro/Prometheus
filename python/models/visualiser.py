@@ -1036,10 +1036,10 @@ def _gpt_attention(model, token_ids, layer=0, max_heads=4):
     hd = emb // heads
 
     ids = p.Tensor([1, seq], [float(t) for t in token_ids])
-    x = p.reshape_op(model.tok_emb.forward(ids), [seq, emb])
+    x = p.reshape(model.tok_emb.forward(ids), [seq, emb])
     if not getattr(model, "rope", False):
         pos = p.Tensor([1, seq], [float(i) for i in range(seq)])
-        x = p.add(x, p.reshape_op(model.pos_emb.forward(pos), [seq, emb]))
+        x = p.add(x, p.reshape(model.pos_emb.forward(pos), [seq, emb]))
 
     q = _flat(p.matmul(x, attn.W_q))
     k = _flat(p.matmul(x, attn.W_k))

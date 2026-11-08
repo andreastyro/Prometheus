@@ -22,7 +22,7 @@ GradCheckResult gradcheck(const function<TensorPtr()>& forward,
         // A tensor that does not require grad has no analytical gradient to
         // compare against; skipping it silently would hide a missing flag, so
         // report it instead.
-        if (!p->requires_grad) {
+        if (!p->requires_grad()) {
             snprintf(line, sizeof(line),
                      "  tensor %zu: requires_grad is false, nothing to check\n", t);
             r.report += line;
@@ -36,7 +36,7 @@ GradCheckResult gradcheck(const function<TensorPtr()>& forward,
         // A forward that produced no graph cannot be differentiated. Report it
         // as the detachment it is, rather than letting backward() throw out of
         // a diagnostic routine.
-        if (!loss->grad_fn) {
+        if (!loss->grad_fn()) {
             snprintf(line, sizeof(line),
                      "  tensor %zu: the forward pass produced no computation "
                      "graph, so every analytical gradient is zero\n", t);
@@ -48,7 +48,7 @@ GradCheckResult gradcheck(const function<TensorPtr()>& forward,
         }
 
         loss->backward();
-        vector<float> analytic = p->grad;
+        vector<float> analytic = p->grad_vector();
 
         const int n    = p->num_el();
         int step = 1;
@@ -56,15 +56,15 @@ GradCheckResult gradcheck(const function<TensorPtr()>& forward,
             step = (n + opts.max_points - 1) / opts.max_points;
 
         for (int i = 0; i < n; i += step) {
-            const float orig = p->data[i];
+            const float orig = p->data()[i];
 
-            p->data[i] = orig + opts.eps;
-            const float lp = scalarise(forward())->data[0];
+            p->data()[i] = orig + opts.eps;
+            const float lp = scalarise(forward())->data()[0];
 
-            p->data[i] = orig - opts.eps;
-            const float lm = scalarise(forward())->data[0];
+            p->data()[i] = orig - opts.eps;
+            const float lm = scalarise(forward())->data()[0];
 
-            p->data[i] = orig;
+            p->data()[i] = orig;
 
             const double numeric = (double)(lp - lm) / (2.0 * opts.eps);
             const double got     = (i < (int)analytic.size()) ? analytic[i] : 0.0;

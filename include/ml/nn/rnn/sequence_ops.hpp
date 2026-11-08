@@ -4,8 +4,8 @@
 /// RNN, LSTM and GRU all walk a sequence one timestep at a time. Both ends of
 /// that walk used to be done with raw buffer copies:
 ///
-///     x_t->data[...]   = input->data[...];    // slice  input[t]
-///     output->data[...] = h->data[...];       // stack  h_t into output[t]
+///     x_t->data()[...]   = input->data()[...];    // slice  input[t]
+///     output->data()[...] = h->data()[...];       // stack  h_t into output[t]
 ///
 /// A raw copy produces a tensor with no grad_fn, so the gradient could not flow
 /// from the output sequence back into the per-timestep graph, nor from the

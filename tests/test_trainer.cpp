@@ -16,12 +16,10 @@ int main(){
     Tensor::manual_seed(42);
 
     // 6 samples, 2 features
-    auto x = make_shared<Tensor>(
-        vector<int>{6, 2},
+    auto x = make_shared<Tensor>(Shape{6, 2},
         vector<float>{1,2, 3,4, 5,6, 7,8, 9,10, 11,12}
     );
-    auto y = make_shared<Tensor>(
-        vector<int>{6, 1},
+    auto y = make_shared<Tensor>(Shape{6, 1},
         vector<float>{0, 1, 0, 1, 0, 1}
     );
 
@@ -65,10 +63,10 @@ int main(){
                history.accuracy.back() >= 0.0f && history.accuracy.back() <= 1.0f);
 
     // bce_loss must survive a saturated sigmoid rather than throwing on log(0)
-    auto sat = make_shared<Tensor>(vector<int>{1, 1}, vector<float>{1.0f});
-    auto tgt = make_shared<Tensor>(vector<int>{1, 1}, vector<float>{0.0f});
+    auto sat = make_shared<Tensor>(Shape{1, 1}, vector<float>{1.0f});
+    auto tgt = make_shared<Tensor>(Shape{1, 1}, vector<float>{0.0f});
     bool ok = true;
-    try { auto l = bce_loss(sat, tgt); ok = std::isfinite(l->data[0]); }
+    try { auto l = bce_loss(sat, tgt); ok = std::isfinite(l->data()[0]); }
     catch (const std::exception&) { ok = false; }
     CHECK_TRUE("bce_loss(p=1, y=0) is finite, not a throw", ok);
 

@@ -14,8 +14,8 @@ GroupNorm::GroupNorm(int num_groups, int num_channels, float eps)
 
     gamma = Tensor::ones({num_channels});
     beta  = Tensor::zeros({num_channels});
-    gamma->requires_grad = true;
-    beta->requires_grad  = true;
+    gamma->set_requires_grad(true);
+    beta->set_requires_grad(true);
 }
 
 // Backward for y = gamma * x_hat + beta, where x_hat = (x - mean) / std and the
@@ -33,15 +33,15 @@ GroupNorm::GroupNorm(int num_groups, int num_channels, float eps)
 TensorPtr GroupNorm::forward(TensorPtr input) {
     // input: [batch, num_channels, spatial]
     // spatial = product of all dims after channels
-    int batch    = input->shape[0];
-    int channels = input->shape[1];
+    int batch    = input->shape()[0];
+    int channels = input->shape()[1];
     int spatial  = input->num_el() / (batch * channels);
 
     if (channels != num_channels)
         throw runtime_error("GroupNorm: input channels do not match num_channels");
 
     int group_size = num_channels / num_groups;  // channels per group
-    auto output = make_shared<Tensor>(input->shape);
+    auto output = make_shared<Tensor>(input->shape());
 
     // saved for the backward pass
     vector<float> x_hat(input->num_el());
@@ -57,14 +57,14 @@ TensorPtr GroupNorm::forward(TensorPtr input) {
             int count  = group_size * spatial;
             for (int c = c_start; c < c_end; c++)
                 for (int s = 0; s < spatial; s++)
-                    mean += input->data[(b * channels + c) * spatial + s];
+                    mean += input->data()[(b * channels + c) * spatial + s];
             mean /= count;
 
             // compute variance
             float var = 0.0f;
             for (int c = c_start; c < c_end; c++)
                 for (int s = 0; s < spatial; s++) {
-                    float diff = input->data[(b * channels + c) * spatial + s] - mean;
+                    float diff = input->data()[(b * channels + c) * spatial + s] - mean;
                     var += diff * diff;
                 }
             var /= count;
@@ -76,14 +76,14 @@ TensorPtr GroupNorm::forward(TensorPtr input) {
             for (int c = c_start; c < c_end; c++)
                 for (int s = 0; s < spatial; s++) {
                     int idx = (b * channels + c) * spatial + s;
-                    float norm = (input->data[idx] - mean) * inv_std;
+                    float norm = (input->data()[idx] - mean) * inv_std;
                     x_hat[idx] = norm;
-                    output->data[idx] = gamma->data[c] * norm + beta->data[c];
+                    output->data()[idx] = gamma->data()[c] * norm + beta->data()[c];
                 }
         }
     }
 
-    if (input->requires_grad || gamma->requires_grad || beta->requires_grad) {
+    if (input->requires_grad() || gamma->requires_grad() || beta->requires_grad()) {
         auto node = make_node(output, {input, gamma, beta});
 
         auto gamma_ = gamma;
@@ -105,7 +105,7 @@ TensorPtr GroupNorm::forward(TensorPtr input) {
                     for (int c = c_start; c < c_end; c++)
                         for (int s = 0; s < spatial; s++) {
                             const int idx = (b * channels + c) * spatial + s;
-                            const float gi = gamma_->data[c] * output->grad[idx];
+                            const float gi = gamma_->data()[c] * output->grad()[idx];
                             sum_g      += gi;
                             sum_g_xhat += gi * x_hat[idx];
                         }
@@ -116,18 +116,18 @@ TensorPtr GroupNorm::forward(TensorPtr input) {
                     for (int c = c_start; c < c_end; c++)
                         for (int s = 0; s < spatial; s++) {
                             const int idx = (b * channels + c) * spatial + s;
-                            const float gi = gamma_->data[c] * output->grad[idx];
+                            const float gi = gamma_->data()[c] * output->grad()[idx];
 
-                            if (input->requires_grad)
-                                input->grad[idx] +=
+                            if (input->requires_grad())
+                                input->grad()[idx] +=
                                     inv_std * (gi - mean_g - x_hat[idx] * mean_g_xhat);
 
                             // gamma and beta are per channel, so accumulate
                             // across every batch item and spatial position.
-                            if (gamma_->requires_grad)
-                                gamma_->grad[c] += output->grad[idx] * x_hat[idx];
-                            if (beta_->requires_grad)
-                                beta_->grad[c] += output->grad[idx];
+                            if (gamma_->requires_grad())
+                                gamma_->grad()[c] += output->grad()[idx] * x_hat[idx];
+                            if (beta_->requires_grad())
+                                beta_->grad()[c] += output->grad()[idx];
                         }
                 }
             }

@@ -12,8 +12,8 @@ BatchNorm::BatchNorm(int num_features, float eps, bool training, float momentum)
       running_mean(num_features, 0.0f), running_var(num_features, 1.0f) {
     gamma = Tensor::ones({num_features});
     beta  = Tensor::zeros({num_features});
-    gamma->requires_grad = true;
-    beta->requires_grad  = true;
+    gamma->set_requires_grad(true);
+    beta->set_requires_grad(true);
 }
 
 // Statistics are per feature/channel, taken over the batch and, for conv input,
@@ -34,22 +34,22 @@ BatchNorm::BatchNorm(int num_features, float eps, bool training, float momentum)
 // with g[i] = gamma[c] * dL/dy[i]. In eval mode the statistics come from the
 // running estimate and are constants, so the last two terms vanish.
 TensorPtr BatchNorm::forward(TensorPtr input) {
-    const int ndim = (int)input->shape.size();
+    const int ndim = (int)input->shape().size();
     if (ndim < 2)
         throw runtime_error("BatchNorm: expected at least 2 dimensions "
                             "[batch, features, ...]");
 
-    const int N = input->shape[0];
-    const int C = input->shape[1];
+    const int N = input->shape()[0];
+    const int C = input->shape()[1];
     if (C != (int)running_mean.size())
         throw runtime_error("BatchNorm: input has " + to_string(C) +
                             " channels but the layer was built for " +
                             to_string(running_mean.size()));
 
     int S = 1;
-    for (int d = 2; d < ndim; d++) S *= input->shape[d];
+    for (int d = 2; d < ndim; d++) S *= input->shape()[d];
 
-    auto output = make_shared<Tensor>(input->shape);
+    auto output = make_shared<Tensor>(input->shape());
 
     // saved for the backward pass
     vector<float> x_hat(input->num_el());
@@ -64,13 +64,13 @@ TensorPtr BatchNorm::forward(TensorPtr input) {
             mean = 0.0f;
             for (int n = 0; n < N; n++)
                 for (int s = 0; s < S; s++)
-                    mean += input->data[(n * C + c) * S + s];
+                    mean += input->data()[(n * C + c) * S + s];
             mean /= count;
 
             var = 0.0f;
             for (int n = 0; n < N; n++)
                 for (int s = 0; s < S; s++) {
-                    float diff = input->data[(n * C + c) * S + s] - mean;
+                    float diff = input->data()[(n * C + c) * S + s] - mean;
                     var += diff * diff;
                 }
             var /= count;
@@ -89,13 +89,13 @@ TensorPtr BatchNorm::forward(TensorPtr input) {
         for (int n = 0; n < N; n++)
             for (int s = 0; s < S; s++) {
                 const int idx = (n * C + c) * S + s;
-                const float norm = (input->data[idx] - mean) * inv_std;
+                const float norm = (input->data()[idx] - mean) * inv_std;
                 x_hat[idx] = norm;
-                output->data[idx] = gamma->data[c] * norm + beta->data[c];
+                output->data()[idx] = gamma->data()[c] * norm + beta->data()[c];
             }
     }
 
-    if (input->requires_grad || gamma->requires_grad || beta->requires_grad) {
+    if (input->requires_grad() || gamma->requires_grad() || beta->requires_grad()) {
         auto node = make_node(output, {input, gamma, beta});
 
         auto gamma_ = gamma;
@@ -112,7 +112,7 @@ TensorPtr BatchNorm::forward(TensorPtr input) {
                     for (int n = 0; n < N; n++)
                         for (int s = 0; s < S; s++) {
                             const int idx = (n * C + c) * S + s;
-                            const float gi = gamma_->data[c] * output->grad[idx];
+                            const float gi = gamma_->data()[c] * output->grad()[idx];
                             sum_g      += gi;
                             sum_g_xhat += gi * x_hat[idx];
                         }
@@ -124,20 +124,20 @@ TensorPtr BatchNorm::forward(TensorPtr input) {
                 for (int n = 0; n < N; n++)
                     for (int s = 0; s < S; s++) {
                         const int idx = (n * C + c) * S + s;
-                        const float gi = gamma_->data[c] * output->grad[idx];
+                        const float gi = gamma_->data()[c] * output->grad()[idx];
 
-                        if (input->requires_grad) {
+                        if (input->requires_grad()) {
                             if (was_training)
-                                input->grad[idx] +=
+                                input->grad()[idx] +=
                                     inv_std * (gi - mean_g - x_hat[idx] * mean_g_xhat);
                             else
-                                input->grad[idx] += inv_std * gi;
+                                input->grad()[idx] += inv_std * gi;
                         }
 
-                        if (gamma_->requires_grad)
-                            gamma_->grad[c] += output->grad[idx] * x_hat[idx];
-                        if (beta_->requires_grad)
-                            beta_->grad[c] += output->grad[idx];
+                        if (gamma_->requires_grad())
+                            gamma_->grad()[c] += output->grad()[idx] * x_hat[idx];
+                        if (beta_->requires_grad())
+                            beta_->grad()[c] += output->grad()[idx];
                     }
             }
         };

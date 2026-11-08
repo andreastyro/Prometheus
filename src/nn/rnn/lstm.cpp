@@ -7,26 +7,26 @@ using namespace std;
 LSTM::LSTM(int input_size, int hidden_size)
     : input_size(input_size), hidden_size(hidden_size) {
 
-    W_xi = Tensor::randn({input_size, hidden_size}); W_xi->requires_grad = true;
-    W_xf = Tensor::randn({input_size, hidden_size}); W_xf->requires_grad = true;
-    W_xo = Tensor::randn({input_size, hidden_size}); W_xo->requires_grad = true;
-    W_xg = Tensor::randn({input_size, hidden_size}); W_xg->requires_grad = true;
+    W_xi = Tensor::randn({input_size, hidden_size}); W_xi->set_requires_grad(true);
+    W_xf = Tensor::randn({input_size, hidden_size}); W_xf->set_requires_grad(true);
+    W_xo = Tensor::randn({input_size, hidden_size}); W_xo->set_requires_grad(true);
+    W_xg = Tensor::randn({input_size, hidden_size}); W_xg->set_requires_grad(true);
 
-    W_hi = Tensor::randn({hidden_size, hidden_size}); W_hi->requires_grad = true;
-    W_hf = Tensor::randn({hidden_size, hidden_size}); W_hf->requires_grad = true;
-    W_ho = Tensor::randn({hidden_size, hidden_size}); W_ho->requires_grad = true;
-    W_hg = Tensor::randn({hidden_size, hidden_size}); W_hg->requires_grad = true;
+    W_hi = Tensor::randn({hidden_size, hidden_size}); W_hi->set_requires_grad(true);
+    W_hf = Tensor::randn({hidden_size, hidden_size}); W_hf->set_requires_grad(true);
+    W_ho = Tensor::randn({hidden_size, hidden_size}); W_ho->set_requires_grad(true);
+    W_hg = Tensor::randn({hidden_size, hidden_size}); W_hg->set_requires_grad(true);
 
-    b_i = Tensor::zeros({hidden_size}); b_i->requires_grad = true;
-    b_f = Tensor::zeros({hidden_size}); b_f->requires_grad = true;
-    b_o = Tensor::zeros({hidden_size}); b_o->requires_grad = true;
-    b_g = Tensor::zeros({hidden_size}); b_g->requires_grad = true;
+    b_i = Tensor::zeros({hidden_size}); b_i->set_requires_grad(true);
+    b_f = Tensor::zeros({hidden_size}); b_f->set_requires_grad(true);
+    b_o = Tensor::zeros({hidden_size}); b_o->set_requires_grad(true);
+    b_g = Tensor::zeros({hidden_size}); b_g->set_requires_grad(true);
 }
 
 tuple<TensorPtr, TensorPtr, TensorPtr> LSTM::forward(TensorPtr input, TensorPtr h0, TensorPtr c0) {
-    int seq_len  = input->shape[0];
-    int batch    = input->shape[1];
-    int input_sz = input->shape[2];
+    int seq_len  = input->shape()[0];
+    int batch    = input->shape()[1];
+    int input_sz = input->shape()[2];
 
     TensorPtr h = h0 ? h0 : Tensor::zeros({batch, hidden_size});
     TensorPtr c = c0 ? c0 : Tensor::zeros({batch, hidden_size});

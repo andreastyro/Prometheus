@@ -5,8 +5,8 @@
 // Usage:
 //     #include "ml/utils/testing.hpp"
 //     int main() {
-//         CHECK_NEAR("pos 1 dim 0", pe->data[4], 0.8415f, 1e-4f);
-//         CHECK_TRUE("output is finite", all_finite(out->data));
+//         CHECK_NEAR("pos 1 dim 0", pe->data()[4], 0.8415f, 1e-4f);
+//         CHECK_TRUE("output is finite", all_finite(out->to_vector()));
 //         return test_report();
 //     }
 

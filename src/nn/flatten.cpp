@@ -12,18 +12,18 @@ using namespace std;
 // gradient of exactly zero while the Linear head trained normally.
 TensorPtr Flatten::forward(TensorPtr input){
 
-    int n = input->shape[0];
+    int n = input->shape()[0];
     int flat_size = input->num_el() / n;
 
-    auto result = make_shared<Tensor>(vector<int>{n, flat_size});
-    result->data = input->data;
+    auto result = make_shared<Tensor>(Shape{n, flat_size});
+    result->set_data(input->to_vector());
 
-    if (input->requires_grad) {
+    if (input->requires_grad()) {
         auto node = make_node(result, {input});
 
         node->backward_fn = [input, result]() {
             for (int i = 0; i < result->num_el(); i++)
-                input->grad[i] += result->grad[i];
+                input->grad()[i] += result->grad()[i];
         };
     }
 

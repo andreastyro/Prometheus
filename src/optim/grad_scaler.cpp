@@ -14,16 +14,16 @@ GradScaler::GradScaler(float init_scale, float growth_factor,
 // silently disables training for anyone using the mixed-precision path.
 TensorPtr GradScaler::scale_loss(TensorPtr loss) {
     if (!enabled) return loss;
-    auto out = make_shared<Tensor>(loss->shape);
-    for (int i = 0; i < (int)loss->data.size(); i++)
-        out->data[i] = loss->data[i] * scale;
+    auto out = make_shared<Tensor>(loss->shape());
+    for (int i = 0; i < (int)loss->numel(); i++)
+        out->data()[i] = loss->data()[i] * scale;
 
-    if (loss->requires_grad) {
+    if (loss->requires_grad()) {
         float s = scale;
         auto node = make_node(out, {loss});
         node->backward_fn = [loss, out, s]() {
             for (int i = 0; i < out->num_el(); i++)
-                loss->grad[i] += out->grad[i] * s;
+                loss->grad()[i] += out->grad()[i] * s;
         };
     }
 
@@ -34,7 +34,7 @@ bool GradScaler::unscale(vector<TensorPtr> params) {
     if (!enabled) return true;
     bool clean = true;
     for (auto& p : params) {
-        for (float& g : p->grad) {
+        for (float& g : p->grad_values()) {
             if (std::isinf(g) || std::isnan(g)) {
                 clean = false;
                 g = 0.0f;

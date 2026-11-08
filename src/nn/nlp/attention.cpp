@@ -53,10 +53,10 @@ MultiHeadAttention::MultiHeadAttention(int embed_dim, int num_heads, bool causal
     if (embed_dim % num_heads != 0)
         throw runtime_error("MultiHeadAttention: embed_dim must be divisible by num_heads");
 
-    W_q = Tensor::randn({embed_dim, embed_dim}); W_q->requires_grad = true;
-    W_k = Tensor::randn({embed_dim, embed_dim}); W_k->requires_grad = true;
-    W_v = Tensor::randn({embed_dim, embed_dim}); W_v->requires_grad = true;
-    W_o = Tensor::randn({embed_dim, embed_dim}); W_o->requires_grad = true;
+    W_q = Tensor::randn({embed_dim, embed_dim}); W_q->set_requires_grad(true);
+    W_k = Tensor::randn({embed_dim, embed_dim}); W_k->set_requires_grad(true);
+    W_v = Tensor::randn({embed_dim, embed_dim}); W_v->set_requires_grad(true);
+    W_o = Tensor::randn({embed_dim, embed_dim}); W_o->set_requires_grad(true);
 }
 
 // Fused multi-head attention forward + backward.
@@ -71,7 +71,7 @@ TensorPtr MultiHeadAttention::forward(TensorPtr input) {
 }
 
 TensorPtr MultiHeadAttention::forward(TensorPtr input, int batch) {
-    int rows = input->shape[0];
+    int rows = input->shape()[0];
     if (batch <= 0 || rows % batch != 0)
         throw runtime_error("MultiHeadAttention: row count " + to_string(rows) +
                             " is not divisible by batch " + to_string(batch));
@@ -92,12 +92,12 @@ TensorPtr MultiHeadAttention::forward(TensorPtr input, int batch) {
     const int E3 = 3 * E;
     vector<float> W_qkv((size_t)E * E3);
     for (int e = 0; e < E; e++) {
-        memcpy(&W_qkv[(size_t)e*E3        ], &W_q->data[(size_t)e*E], E*sizeof(float));
-        memcpy(&W_qkv[(size_t)e*E3 + E    ], &W_k->data[(size_t)e*E], E*sizeof(float));
-        memcpy(&W_qkv[(size_t)e*E3 + 2*E  ], &W_v->data[(size_t)e*E], E*sizeof(float));
+        memcpy(&W_qkv[(size_t)e*E3        ], &W_q->data()[(size_t)e*E], E*sizeof(float));
+        memcpy(&W_qkv[(size_t)e*E3 + E    ], &W_k->data()[(size_t)e*E], E*sizeof(float));
+        memcpy(&W_qkv[(size_t)e*E3 + 2*E  ], &W_v->data()[(size_t)e*E], E*sizeof(float));
     }
     vector<float> QKV((size_t)rows * E3);
-    matmul_forward(rows, E3, E, input->data.data(), W_qkv.data(), QKV.data());
+    matmul_forward(rows, E3, E, input->data(), W_qkv.data(), QKV.data());
 
     // Heads are read straight out of the fused QKV buffer: head h of row t
     // starts at QKV[t*E3 + h*D], so every gemm below takes a row stride of E3
@@ -165,12 +165,12 @@ TensorPtr MultiHeadAttention::forward(TensorPtr input, int batch) {
     }   // serial BLAS scope ends
 
     // output = concat @ W_o  [S, E]
-    auto result = make_shared<Tensor>(vector<int>{rows, E});
-    matmul_forward(rows, E, E, concat_all.data(), W_o->data.data(), result->data.data());
+    auto result = make_shared<Tensor>(Shape{rows, E});
+    matmul_forward(rows, E, E, concat_all.data(), W_o->data(), result->data());
 
     // ── Backward ─────────────────────────────────────────────────────────────
-    bool need_grad = input->requires_grad || W_q->requires_grad ||
-                     W_k->requires_grad   || W_v->requires_grad || W_o->requires_grad;
+    bool need_grad = input->requires_grad() || W_q->requires_grad() ||
+                     W_k->requires_grad()   || W_v->requires_grad() || W_o->requires_grad();
 
     if (need_grad) {
         auto node = make_node(result, {input, W_q, W_k, W_v, W_o});
@@ -190,16 +190,16 @@ TensorPtr MultiHeadAttention::forward(TensorPtr input, int batch) {
             W_qkv       = std::move(W_qkv),
             rows, B, S, E, E3, H, D, attn_scale, rope
         ]() {
-            const float* grad_out = result->grad.data();
+            const float* grad_out = result->grad();
 
             // ── Output projection backward ────────────────────────────────
             // output = concat @ W_o:
             //   grad_concat = grad_out @ W_o^T
             //   grad_W_o   += concat^T @ grad_out
             vector<float> grad_concat(rows * E, 0.0f);
-            matmul_backward_a(rows, E, E, grad_out, W_o->data.data(), grad_concat.data());
-            if (W_o->requires_grad)
-                matmul_backward_b(rows, E, E, grad_out, concat_all.data(), W_o->grad.data());
+            matmul_backward_a(rows, E, E, grad_out, W_o->data(), grad_concat.data());
+            if (W_o->requires_grad())
+                matmul_backward_b(rows, E, E, grad_out, concat_all.data(), W_o->grad());
 
             // Full gradient accumulators for the Q, K, V projections  [rows, E]
             // one interleaved [rows, 3E] accumulator, laid out to match
@@ -261,25 +261,25 @@ TensorPtr MultiHeadAttention::forward(TensorPtr input, int batch) {
             // Q = input @ W_q:
             //   grad_W_q   += input^T @ grad_Q
             //   grad_input += grad_Q @ W_q^T   (and similarly for K, V)
-            if (W_q->requires_grad || W_k->requires_grad || W_v->requires_grad) {
+            if (W_q->requires_grad() || W_k->requires_grad() || W_v->requires_grad()) {
                 // one gemm for all three weight gradients, then split the
                 // [E, 3E] result back into the three parameter tensors
                 vector<float> W_qkv_grad((size_t)E * E3, 0.0f);
                 matmul_backward_b(rows, E, E3, grad_QKV.data(),
-                                  input->data.data(), W_qkv_grad.data());
+                                  input->data(), W_qkv_grad.data());
                 for (int e = 0; e < E; e++)
                     for (int j = 0; j < E; j++) {
                         const size_t src = (size_t)e*E3 + j;
                         const size_t dst = (size_t)e*E  + j;
-                        if (W_q->requires_grad) W_q->grad[dst] += W_qkv_grad[src];
-                        if (W_k->requires_grad) W_k->grad[dst] += W_qkv_grad[src + E];
-                        if (W_v->requires_grad) W_v->grad[dst] += W_qkv_grad[src + 2*E];
+                        if (W_q->requires_grad()) W_q->grad()[dst] += W_qkv_grad[src];
+                        if (W_k->requires_grad()) W_k->grad()[dst] += W_qkv_grad[src + E];
+                        if (W_v->requires_grad()) W_v->grad()[dst] += W_qkv_grad[src + 2*E];
                     }
             }
 
-            if (input->requires_grad)
+            if (input->requires_grad())
                 matmul_backward_a(rows, E, E3, grad_QKV.data(), W_qkv.data(),
-                                  input->grad.data());
+                                  input->grad());
         };
     }
 

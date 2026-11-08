@@ -43,7 +43,7 @@ def test_bindings_present():
                  "Embedding", "MultiHeadAttention", "TransformerBlock", "GPT",
                  "RNN", "LSTM", "GRU", "Sequential", "Flatten", "Dropout",
                  "ResidualBlock", "Adam", "AdamW", "SGD", "RMSprop",
-                 "gradcheck", "gelu", "transpose_op", "reshape_op"):
+                 "gradcheck", "gelu", "transpose", "reshape", "permute", "contiguous"):
         check("exposed: " + name, hasattr(p, name))
 
     check("GPT is a Module subclass", issubclass(p.GPT, p.Module))
@@ -102,7 +102,7 @@ def test_gradcheck_from_python():
     # gradcheck is capable of saying no
     det = tensor([2, 2], [0.3, -0.4, 0.5, 0.2])
     det.requires_grad = True
-    r = p.gradcheck(lambda: det.transpose(), [det])   # transpose() detaches by design
+    r = p.gradcheck(lambda: det.detach(), [det])      # detach() leaves the graph by design
     check("gradcheck rejects a detached op", not r["passed"])
 
 

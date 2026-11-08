@@ -63,18 +63,18 @@ static TensorPtr tin(vector<int> shape, bool grad = true) {
     auto t = make_shared<Tensor>(shape);
     // offset by 0.05 so no element lands on 0, where relu/mae/huber have a
     // kink and a central difference straddles the non-differentiable point
-    for (int i = 0; i < t->num_el(); i++) t->data[i] = 0.1f * ((i % 7) - 3) + 0.05f;
-    t->requires_grad = grad;
-    if (grad) t->grad.assign(t->num_el(), 0.0f);
+    for (int i = 0; i < t->num_el(); i++) t->data()[i] = 0.1f * ((i % 7) - 3) + 0.05f;
+    t->set_requires_grad(grad);
+    if (grad) t->zero_grad();
     return t;
 }
 
 // Probabilities strictly inside (0, 1), for the losses that take them.
 static TensorPtr tprob(vector<int> shape) {
     auto t = make_shared<Tensor>(shape);
-    for (int i = 0; i < t->num_el(); i++) t->data[i] = 0.2f + 0.1f * (i % 6);
-    t->requires_grad = true;
-    t->grad.assign(t->num_el(), 0.0f);
+    for (int i = 0; i < t->num_el(); i++) t->data()[i] = 0.2f + 0.1f * (i % 6);
+    t->set_requires_grad(true);
+    t->zero_grad();
     return t;
 }
 
@@ -89,14 +89,27 @@ int main() {
         check("sigmoid",      [&]{ return sigmoid(x); },            {x});
         check("tanh_op",      [&]{ return tanh_op(x); },            {x});
         check("softmax",      [&]{ return softmax(x); },            {x});
-        check("transpose_op", [&]{ return transpose_op(x); },       {x});
         auto bt = tin({2, 4});
         check("matmul_bt", [&]{ return matmul_bt(x, bt); }, {x, bt});
-        check("transpose_view + contiguous",
-              [&]{ return contiguous(transpose_view(x)); }, {x});
-        check("reshape_view + contiguous",
-              [&]{ return contiguous(reshape_view(x, {4, 3})); }, {x});
-        check("reshape_op",   [&]{ return reshape_op(x, {4, 3}); }, {x});
+        // Views. Each output is weighted by distinct values before the mean:
+        // a plain mean gives every position the same gradient, so a view
+        // whose backward mapped positions wrongly would still pass.
+        auto w43 = tin({4, 3});
+        auto w26 = tin({2, 6});
+        check("transpose (view)",
+              [&]{ return multiply(transpose(x), w43); }, {x});
+        check("transpose + contiguous",
+              [&]{ return multiply(contiguous(transpose(x)), w43); }, {x});
+        check("reshape (view)",
+              [&]{ return multiply(reshape(x, {4, 3}), w43); }, {x});
+        check("reshape of a transposed view",
+              [&]{ return multiply(reshape(transpose(x), {2, 6}), w26); }, {x});
+        check("op on a non-contiguous view",
+              [&]{ return multiply(relu(transpose(x)), w43); }, {x});
+        auto x3   = tin({2, 3, 4});
+        auto w342 = tin({3, 4, 2});
+        check("permute 3-D (view)",
+              [&]{ return multiply(permute(x3, {1, 2, 0}), w342); }, {x3});
         check("exp_op",       [&]{ return exp_op(x); },             {x});
 
         auto y = tin({3, 4});
@@ -114,8 +127,8 @@ int main() {
         // sits exactly at its minimum, the true gradient is zero, and a
         // detached loss passes the check for the wrong reason.
         auto pred = tin({3, 2});
-        auto targ = make_shared<Tensor>(vector<int>{3, 2});
-        for (int i = 0; i < targ->num_el(); i++) targ->data[i] = -0.4f + 0.3f * i;
+        auto targ = make_shared<Tensor>(Shape{3, 2});
+        for (int i = 0; i < targ->num_el(); i++) targ->data()[i] = -0.4f + 0.3f * i;
         check("mse_loss",            [&]{ return mse_loss(pred, targ); },            {pred});
         check("mae_loss",            [&]{ return mae_loss(pred, targ); },            {pred});
         check("huber_loss",          [&]{ return huber_loss(pred, targ); },          {pred});
@@ -123,13 +136,13 @@ int main() {
 
         auto p = tprob({3, 2});
         auto q = tprob({3, 2});
-        for (int i = 0; i < q->num_el(); i++) q->data[i] = 1.0f - q->data[i];  // differ from p
-        q->requires_grad = false;
+        for (int i = 0; i < q->num_el(); i++) q->data()[i] = 1.0f - q->data()[i];  // differ from p
+        q->set_requires_grad(false);
         check("bce_loss",      [&]{ return bce_loss(p, q); },      {p});
         check("kl_divergence", [&]{ return kl_divergence(p, q); }, {p});
 
         auto logits = tprob({2, 4});
-        auto onehot = make_shared<Tensor>(vector<int>{2, 4},
+        auto onehot = make_shared<Tensor>(Shape{2, 4},
                                           vector<float>{1, 0, 0, 0, 0, 0, 1, 0});
         check("cross_entropy_loss",
               [&]{ return cross_entropy_loss(logits, onehot); }, {logits});
@@ -140,9 +153,9 @@ int main() {
 
         // three distinct points, and far enough apart to keep the hinge active
         auto a   = tin({1, 3});
-        auto pos = make_shared<Tensor>(vector<int>{1, 3});
-        auto neg = make_shared<Tensor>(vector<int>{1, 3});
-        for (int i = 0; i < 3; i++) { pos->data[i] = -0.1f + 0.2f * i; neg->data[i] = 0.7f - 0.2f * i; }
+        auto pos = make_shared<Tensor>(Shape{1, 3});
+        auto neg = make_shared<Tensor>(Shape{1, 3});
+        for (int i = 0; i < 3; i++) { pos->data()[i] = -0.1f + 0.2f * i; neg->data()[i] = 0.7f - 0.2f * i; }
         check("contrastive_loss",
               [&]{ return contrastive_loss(a, pos, neg); }, {a, pos, neg});
     }
@@ -169,10 +182,10 @@ int main() {
               {bn.parameters()[0], bn.parameters()[1], xb});
 
         Embedding emb(6, 4);
-        auto ids = make_shared<Tensor>(vector<int>{1, 3});
-        ids->data[0] = 1;
-        ids->data[1] = 4;
-        ids->data[2] = 1;                     // repeated id: backward must accumulate
+        auto ids = make_shared<Tensor>(Shape{1, 3});
+        ids->data()[0] = 1;
+        ids->data()[1] = 4;
+        ids->data()[2] = 1;                     // repeated id: backward must accumulate
         GradCheckOptions all;
         all.max_points = 0;                   // probe every element
         check("Embedding (repeated id)", [&]{ return emb.forward(ids); },
@@ -301,8 +314,8 @@ int main() {
 
         // the whole GPT model, not just its pieces
         GPT gpt(16, 8, 8, 2, 1);
-        auto ids = make_shared<Tensor>(vector<int>{3});
-        ids->data[0] = 1; ids->data[1] = 5; ids->data[2] = 2;
+        auto ids = make_shared<Tensor>(Shape{3});
+        ids->data()[0] = 1; ids->data()[1] = 5; ids->data()[2] = 2;
         GradCheckOptions few; few.max_points = 3;
         check("GPT (whole model)", [&]{ return gpt.forward(ids); },
               {gpt.tok_emb.weight, gpt.ln_f.parameters()[0]}, few);
@@ -319,10 +332,10 @@ int main() {
         // ambiguous (the analytic form picks the first occurrence, the central
         // difference averages the two sides), so use strictly increasing data
         // where the extremum is unique.
-        auto u = make_shared<Tensor>(vector<int>{3, 4});
-        for (int i = 0; i < u->num_el(); i++) u->data[i] = -0.5f + 0.17f * i;
-        u->requires_grad = true;
-        u->grad.assign(u->num_el(), 0.0f);
+        auto u = make_shared<Tensor>(Shape{3, 4});
+        for (int i = 0; i < u->num_el(); i++) u->data()[i] = -0.5f + 0.17f * i;
+        u->set_requires_grad(true);
+        u->zero_grad();
         GradCheckOptions all_pts;
         all_pts.max_points = 0;
         check("max_op", [&]{ return max_op(u); }, {u}, all_pts);
@@ -396,8 +409,8 @@ int main() {
 
         // a deeper GPT than the single-layer smoke check
         GPT gpt2(24, 12, 16, 4, 3);
-        auto ids2 = make_shared<Tensor>(vector<int>{6});
-        for (int i = 0; i < 6; i++) ids2->data[i] = (float)(i * 3 + 1);
+        auto ids2 = make_shared<Tensor>(Shape{6});
+        for (int i = 0; i < 6; i++) ids2->data()[i] = (float)(i * 3 + 1);
         check("GPT 3 layers 4 heads seq 6", [&]{ return gpt2.forward(ids2); },
               {gpt2.tok_emb.weight, gpt2.ln_f.parameters()[0]}, few);
     }

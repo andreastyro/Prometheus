@@ -47,7 +47,7 @@ public:
     void reshuffle();
 
     // Total number of batches per epoch (ceiling division of dataset size / batch_size)
-    int size() { return (int)std::ceil((float)x->shape[0] / batch_size); }
+    int size() { return (int)std::ceil((float)x->shape()[0] / batch_size); }
 };
 
 // Split a dataset into train/val/test subsets.

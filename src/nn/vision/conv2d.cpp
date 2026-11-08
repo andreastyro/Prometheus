@@ -24,28 +24,28 @@ Conv2D::Conv2D(int in_channels, int out_channels, int kernel_size, int stride, i
 
     if (weight_init == "xavier"){
         float std = sqrt(2.0f / (inputs_per_filter + outputs_per_filter));
-        for (auto& v : weights->data) v *= std;
+        for (auto& v : weights->values()) v *= std;
     } else if (weight_init == "kaiming"){
         float std = sqrt(2.0f / inputs_per_filter);
-        for (auto& v : weights->data) v *= std;
+        for (auto& v : weights->values()) v *= std;
     }
 
-    weights->requires_grad = true;
-    bias->requires_grad = true;
+    weights->set_requires_grad(true);
+    bias->set_requires_grad(true);
 
 }
 TensorPtr Conv2D::forward(TensorPtr input){
     // your implementation here
 
-    int batch_size = input->shape[0]; 
-    int in_channels = input->shape[1]; // number of input channels
-    int h_in = input->shape[2]; // input height, like image or feature map
-    int w_in = input->shape[3]; // input width
+    int batch_size = input->shape()[0]; 
+    int in_channels = input->shape()[1]; // number of input channels
+    int h_in = input->shape()[2]; // input height, like image or feature map
+    int w_in = input->shape()[3]; // input width
 
     int h_out = (h_in + 2 * padding - kernel_size) / stride + 1;
     int w_out = (w_in + 2 * padding - kernel_size) / stride + 1;
 
-    auto output = make_shared<Tensor>(vector<int>{batch_size, out_channels, h_out, w_out});
+    auto output = make_shared<Tensor>(Shape{batch_size, out_channels, h_out, w_out});
 
     for (int b = 0; b < batch_size; b++){
         for (int f = 0; f < out_channels; f++){ // filter
@@ -70,17 +70,17 @@ TensorPtr Conv2D::forward(TensorPtr input){
                                 // weights[f][ic][kh][kw] — flat index into weights tensor
                                 int weight_idx = f * (in_channels * kernel_size * kernel_size) + ic * (kernel_size * kernel_size) + kh * kernel_size + kw;
 
-                                output->data[output_idx] += input->data[input_idx] * weights->data[weight_idx];
+                                output->data()[output_idx] += input->data()[input_idx] * weights->data()[weight_idx];
                             }
                         }
                     }
-                    output->data[output_idx] += bias->data[f];
+                    output->data()[output_idx] += bias->data()[f];
                 }
             }
         }
     }
 
-    if (input->requires_grad || weights->requires_grad) {
+    if (input->requires_grad() || weights->requires_grad()) {
         
         auto node = make_node(output, {input, weights, bias});
 
@@ -91,11 +91,11 @@ TensorPtr Conv2D::forward(TensorPtr input){
                         for (int j = 0; j < w_out; j++){
 
                             int output_idx = b * (out_channels * h_out * w_out) + f * (h_out * w_out) + i * w_out + j;
-                            float grad = output->grad[output_idx];
+                            float grad = output->grad()[output_idx];
 
 
                             // bias grad: one bias per filter, accumulate from every output position
-                            bias->grad[f] += grad;
+                            bias->grad()[f] += grad;
 
                             for (int ic = 0; ic < in_channels; ic++){
                                 for (int kh = 0; kh < kernel_size; kh++){
@@ -109,10 +109,10 @@ TensorPtr Conv2D::forward(TensorPtr input){
                                         int weight_idx = f * (in_channels * kernel_size * kernel_size) + ic * (kernel_size * kernel_size) + kh * kernel_size + kw;
 
                                         // weight grad: input value * upstream grad
-                                        weights->grad[weight_idx] += input->data[input_idx] * grad;
+                                        weights->grad()[weight_idx] += input->data()[input_idx] * grad;
 
                                         // input grad: weight value * upstream grad
-                                        input->grad[input_idx] += weights->data[weight_idx] * grad;
+                                        input->grad()[input_idx] += weights->data()[weight_idx] * grad;
                                     }
                                 }
                             }

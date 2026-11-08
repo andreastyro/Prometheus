@@ -24,7 +24,7 @@ void AdamW::step() {
     for (int i = 0; i < (int)parameters.size(); i++) {
         auto& p = parameters[i];
         for (int j = 0; j < p->num_el(); j++) {
-            float g = p->grad[j];
+            float g = p->grad()[j];
 
             m[i][j] = beta1 * m[i][j] + (1.0f - beta1) * g;
             v[i][j] = beta2 * v[i][j] + (1.0f - beta2) * g * g;
@@ -33,9 +33,9 @@ void AdamW::step() {
             float v_hat = v[i][j] / bc2;
 
             // adaptive update (same as Adam)
-            p->data[j] -= lr * m_hat / (std::sqrt(v_hat) + eps);
+            p->data()[j] -= lr * m_hat / (std::sqrt(v_hat) + eps);
             // decoupled weight decay (NOT folded into gradient)
-            p->data[j] -= lr * weight_decay * p->data[j];
+            p->data()[j] -= lr * weight_decay * p->data()[j];
         }
     }
 }
