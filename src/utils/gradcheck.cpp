@@ -58,15 +58,27 @@ GradCheckResult gradcheck(const function<TensorPtr()>& forward,
         for (int i = 0; i < n; i += step) {
             const float orig = p->data()[i];
 
-            p->data()[i] = orig + opts.eps;
-            const float lp = scalarise(forward())->data()[0];
+            // A central difference over the step actually taken: orig + h is
+            // rounded to float32, so dividing by 2h was itself an error of up
+            // to an ulp of orig over h.
+            auto central = [&](float h) -> double {
+                const float up = orig + h, dn = orig - h;
+                p->data()[i] = up;
+                const double lp = scalarise(forward())->data()[0];
+                p->data()[i] = dn;
+                const double lm = scalarise(forward())->data()[0];
+                p->data()[i] = orig;
+                return (lp - lm) / ((double)up - (double)dn);
+            };
 
-            p->data()[i] = orig - opts.eps;
-            const float lm = scalarise(forward())->data()[0];
-
-            p->data()[i] = orig;
-
-            const double numeric = (double)(lp - lm) / (2.0 * opts.eps);
+            // Richardson extrapolation. A central difference is off by
+            // c*h^2 + O(h^4); combining steps h and h/2 cancels the h^2 term.
+            // Without it a sharp function -- attention's softmax, ten steps of
+            // a recurrence -- left truncation error of several percent at the
+            // default step, failing correct gradients depending on which random
+            // weights a test happened to draw. A smaller step would trade that
+            // for float32 rounding; this removes it instead.
+            const double numeric = (4.0 * central(opts.eps * 0.5f) - central(opts.eps)) / 3.0;
             const double got     = (i < (int)analytic.size()) ? analytic[i] : 0.0;
 
             const double abs_err = fabs(got - numeric);

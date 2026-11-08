@@ -8,17 +8,17 @@ using namespace std;
 GRU::GRU(int input_size, int hidden_size)
     : input_size(input_size), hidden_size(hidden_size) {
 
-    W_xr = Tensor::randn({input_size, hidden_size}); W_xr->set_requires_grad(true);
-    W_xz = Tensor::randn({input_size, hidden_size}); W_xz->set_requires_grad(true);
-    W_xn = Tensor::randn({input_size, hidden_size}); W_xn->set_requires_grad(true);
+    W_xr = rnn_kernel::init_param({input_size, hidden_size}, hidden_size); W_xr->set_requires_grad(true);
+    W_xz = rnn_kernel::init_param({input_size, hidden_size}, hidden_size); W_xz->set_requires_grad(true);
+    W_xn = rnn_kernel::init_param({input_size, hidden_size}, hidden_size); W_xn->set_requires_grad(true);
 
-    W_hr = Tensor::randn({hidden_size, hidden_size}); W_hr->set_requires_grad(true);
-    W_hz = Tensor::randn({hidden_size, hidden_size}); W_hz->set_requires_grad(true);
-    W_hn = Tensor::randn({hidden_size, hidden_size}); W_hn->set_requires_grad(true);
+    W_hr = rnn_kernel::init_param({hidden_size, hidden_size}, hidden_size); W_hr->set_requires_grad(true);
+    W_hz = rnn_kernel::init_param({hidden_size, hidden_size}, hidden_size); W_hz->set_requires_grad(true);
+    W_hn = rnn_kernel::init_param({hidden_size, hidden_size}, hidden_size); W_hn->set_requires_grad(true);
 
-    b_r = Tensor::zeros({hidden_size}); b_r->set_requires_grad(true);
-    b_z = Tensor::zeros({hidden_size}); b_z->set_requires_grad(true);
-    b_n = Tensor::zeros({hidden_size}); b_n->set_requires_grad(true);
+    b_r = rnn_kernel::init_param({hidden_size}, hidden_size); b_r->set_requires_grad(true);
+    b_z = rnn_kernel::init_param({hidden_size}, hidden_size); b_z->set_requires_grad(true);
+    b_n = rnn_kernel::init_param({hidden_size}, hidden_size); b_n->set_requires_grad(true);
 }
 
 // The whole sequence in one fused kernel; see fused_rnn.hpp.

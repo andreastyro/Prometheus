@@ -8,9 +8,9 @@ using namespace std;
 RNN::RNN(int input_size, int hidden_size)
     : input_size(input_size), hidden_size(hidden_size) {
 
-    W_x  = Tensor::randn({input_size, hidden_size});
-    W_h  = Tensor::randn({hidden_size, hidden_size});
-    bias = Tensor::zeros({hidden_size});
+    W_x  = rnn_kernel::init_param({input_size, hidden_size}, hidden_size);
+    W_h  = rnn_kernel::init_param({hidden_size, hidden_size}, hidden_size);
+    bias = rnn_kernel::init_param({hidden_size}, hidden_size);
 
     W_x->set_requires_grad(true);
     W_h->set_requires_grad(true);

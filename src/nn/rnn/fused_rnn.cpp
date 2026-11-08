@@ -3,6 +3,7 @@
 #include "ml/ops.hpp"
 #include <algorithm>
 #include <cmath>
+#include <random>
 #include <cstring>
 #include <memory>
 #include <stdexcept>
@@ -58,6 +59,12 @@ TensorPtr slice_of(const TensorPtr& src, int64_t offset, Shape shape) {
     if (src->requires_grad()) {
         auto node = make_node(v, {src});
         node->name = "rnn output";
+        autograd::attach_reference(*node, [offset, shape](const std::vector<TensorPtr>& in) -> TensorPtr {
+            auto idx = make_shared<vector<int64_t>>();
+            int64_t n = 1; for (auto v : shape) n *= v;
+            for (int64_t i = 0; i < n; i++) idx->push_back(offset + i);
+            return gather_flat(in[0], idx, shape);
+        });
         node->backward_fn = [src, offset](const TensorPtr& out) {
             const float* g = out->grad();
             float* gs = src->grad() + offset;
@@ -92,6 +99,15 @@ void unpack_add(const float* packed, const vector<TensorPtr>& parts, int rows, i
 }
 
 } // namespace
+
+TensorPtr init_param(Shape shape, int H) {
+    auto t = make_shared<Tensor>(shape);
+    const float bound = 1.0f / std::sqrt((float)H);
+    std::uniform_real_distribution<float> dist(-bound, bound);
+    for (float& v : t->values()) v = dist(prometheus_rng());
+    t->set_requires_grad(true);
+    return t;
+}
 
 Result run(Cell cell, TensorPtr input, TensorPtr h0, TensorPtr c0, int H,
            const vector<TensorPtr>& Wx, const vector<TensorPtr>& Wh, const vector<TensorPtr>& b) {
@@ -204,6 +220,40 @@ Result run(Cell cell, TensorPtr input, TensorPtr h0, TensorPtr c0, int H,
     if (need) {
         auto node = make_node(packed, inputs);
         node->name = name;
+        autograd::attach_reference(*node, [cell, S, B, I, H, G, lstm, has_h0 = (bool)h0, has_c0 = (bool)c0](const std::vector<TensorPtr>& in) -> TensorPtr {
+            // the recurrence unrolled from ops, in the cell's own formulas
+            size_t k = 0;
+            auto X = in[k++];
+            TensorPtr h = has_h0 ? in[k++] : Tensor::zeros({(int64_t)B, (int64_t)H});
+            TensorPtr c = (lstm && has_c0) ? in[k++] : Tensor::zeros({(int64_t)B, (int64_t)H});
+            vector<TensorPtr> Wx(in.begin() + k, in.begin() + k + G); k += G;
+            vector<TensorPtr> Wh(in.begin() + k, in.begin() + k + G); k += G;
+            vector<TensorPtr> bb(in.begin() + k, in.begin() + k + G);
+            auto lin = [&](const TensorPtr& x, const TensorPtr& hh, int g) {
+                return add(add(matmul(x, Wx[g]), matmul(hh, Wh[g])), bb[g]);
+            };
+            vector<TensorPtr> hs;
+            for (int t = 0; t < S; t++) {
+                auto idx = make_shared<vector<int64_t>>((size_t)B * I);
+                for (int64_t q = 0; q < (int64_t)B * I; q++) (*idx)[q] = (int64_t)t * B * I + q;
+                auto x = gather_flat(X, idx, {(int64_t)B, (int64_t)I});
+                if (cell == Cell::RNN) {
+                    h = tanh_op(lin(x, h, 0));
+                } else if (lstm) {
+                    auto ig = sigmoid(lin(x, h, 0)), fg = sigmoid(lin(x, h, 1));
+                    auto og = sigmoid(lin(x, h, 2)), gg = tanh_op(lin(x, h, 3));
+                    c = add(multiply(fg, c), multiply(ig, gg));
+                    h = multiply(og, tanh_op(c));
+                } else {
+                    auto r = sigmoid(lin(x, h, 0)), z = sigmoid(lin(x, h, 1));
+                    auto n = tanh_op(add(add(matmul(x, Wx[2]), matmul(multiply(r, h), Wh[2])), bb[2]));
+                    h = add(multiply(subtract(1.0f, z), n), multiply(z, h));
+                }
+                hs.push_back(reshape(h, {(int64_t)B * H}));
+            }
+            auto seq = concat_op(hs, 0);
+            return lstm ? concat_op({seq, reshape(c, {(int64_t)B * H})}, 0) : seq;
+        });
         node->backward_fn = [cell, input, h0, c0, H, S, B, I, G, GH, BH, SB, lstm,
                              Wxp, Whp, gates, cell_state, rh, Wx, Wh, b]
                             (const TensorPtr& packed) {
@@ -253,7 +303,6 @@ Result run(Cell cell, TensorPtr input, TensorPtr h0, TensorPtr c0, int H,
                     pgemm(false, true, B, H, GH, da, GH, Whp->data(), GH, 1.0f, dh.data(), H);
                 } else {
                     const int H2 = 2 * H;
-                    const float* rht = rh->data() + (size_t)t * BH;
                     vector<float> dh_prev((size_t)BH);
             #pragma omp parallel for schedule(static) if(BH >= 4096)
             for (int bb = 0; bb < B; bb++) {

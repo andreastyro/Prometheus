@@ -48,6 +48,17 @@ static GradCheckOptions fine_opts() {
     return o;
 }
 
+// For the recurrent layers. With PyTorch's init their recurrence is smooth,
+// and their input and weight gradients are small -- down to ~1e-5, the size
+// of float32 rounding in a finite difference at a fine step. A larger step
+// cuts that noise in proportion; Richardson extrapolation in gradcheck keeps
+// the truncation error negligible at this step on a smooth function.
+static GradCheckOptions smooth_opts() {
+    GradCheckOptions o;
+    o.eps = 5e-2f;
+    return o;
+}
+
 // Run one check and fold the result into the pass/fail accounting of the suite.
 static void check(const string& name,
                   function<TensorPtr()> f,
@@ -244,19 +255,19 @@ int main() {
         RNN rnn(3, 4);
         auto xr = tin({5, 1, 3});
         auto pr = rnn.parameters();
-        check("RNN", [&]{ return rnn.forward(xr); }, {pr[0], pr[1], pr[2], xr}, fine_opts());
+        check("RNN", [&]{ return rnn.forward(xr); }, {pr[0], pr[1], pr[2], xr}, smooth_opts());
 
         LSTM lstm(3, 4);
         auto xl = tin({5, 1, 3});
         vector<TensorPtr> li = lstm.parameters();
         li.push_back(xl);
-        check("LSTM", [&]{ return lstm.forward(xl); }, li, fine_opts());
+        check("LSTM", [&]{ return lstm.forward(xl); }, li, smooth_opts());
 
         GRU gru(3, 4);
         auto xu = tin({5, 1, 3});
         vector<TensorPtr> ui = gru.parameters();
         ui.push_back(xu);
-        check("GRU", [&]{ return gru.forward(xu); }, ui, fine_opts());
+        check("GRU", [&]{ return gru.forward(xu); }, ui, smooth_opts());
     }
 
     printf("\n=== vision layers ===\n");
@@ -343,8 +354,11 @@ int main() {
         check("Tanh (Module)",    [&]{ return tanh_m.forward(xa); }, {xa});
         check("Softmax (Module)", [&]{ return soft_m.forward(xa); }, {xa});
 
-        // Sequential must chain gradients through every child
-        Sequential seq({ new Linear(4, 6), new ReLU(), new Linear(6, 2) });
+        // Sequential must chain gradients through every child. Tanh rather
+        // than ReLU between them: which activation is beside the point here,
+        // and ReLU's kink made the check depend on whether a random weight
+        // put a hidden unit within one finite-difference step of zero.
+        Sequential seq({ new Linear(4, 6), new Tanh(), new Linear(6, 2) });
         auto xs = tin({2, 4});
         check("Sequential", [&]{ return seq.forward(xs); },
               {seq.parameters()[0], seq.parameters()[2], xs});
@@ -396,13 +410,15 @@ int main() {
         GradCheckOptions few;
         few.max_points = 3;
 
-        // A plain RNN composes tanh ten times, so the loss is strongly
-        // nonlinear in each parameter and the central difference picks up real
-        // truncation error at the default eps of 1e-2. The error falls as eps^2
-        // (4.8e-3 -> 4.7e-4 -> 1.2e-5 at eps 1e-2, 3e-3, 1e-3), which is the
-        // signature of a correct analytical gradient being compared against a
-        // too-coarse difference, so use a finer step for the deep sequences.
-        GradCheckOptions deep = fine_opts();
+        // The recurrent layers used to start from randn weights (std 1),
+        // which made ten steps of tanh chaotic: the loss was so nonlinear that
+        // the default eps of 1e-2 left real truncation error, and these checks
+        // needed a finer step. With PyTorch's U(-1/sqrt(H), 1/sqrt(H)) init the
+        // recurrence is smooth, and the trade-off reverses: input gradients are
+        // ~1e-5, the size of float32 rounding at a fine step (a GRU element
+        // failed at 2.8e-5 on macOS). The default step keeps truncation
+        // negligible and rounding 10x smaller.
+        GradCheckOptions deep = smooth_opts();
         deep.max_points = 3;
 
         // recurrent layers with batch > 1 and a longer sequence, so the

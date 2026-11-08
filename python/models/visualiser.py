@@ -649,6 +649,12 @@ def _diagnostics(model, trace, lr):
 # the numeric one is plainly not. Per-element precision is covered properly by
 # tests/test_gradcheck.cpp, on inputs chosen to avoid kinks.
 CONNECT_ATOL = 1e-3
+
+# A parameter is dead weight when it moves the output by less than this
+# fraction of the most influential parameter. Influence is probed with a
+# large step so that rounding is small beside any real effect.
+INFLUENCE_STEP = 0.1
+DEAD_RELATIVE = 1e-4
 CONNECT_RTOL = 0.5
 
 
@@ -663,8 +669,21 @@ def run_gradcheck(model, x, max_tensors=8, max_points=1, eps=1e-3):
     if forward is None:
         return None
 
+    # How much each parameter moves the output. Measured first, for all of
+    # them, because "no effect" has to be judged relative to the rest: a
+    # parameter whose effect is pure rounding -- a conv bias straight before
+    # BatchNorm, which the mean subtraction cancels exactly -- measures as
+    # anything from 0 to a few ulps depending on the compiler and the order
+    # it sums in. An absolute threshold flipped between platforms. Against
+    # the largest influence in the model, rounding is many orders smaller
+    # than any parameter that genuinely matters.
+    params = model.parameters()[:max_tensors]
+    influence = [(_numeric_influence(forward, t, INFLUENCE_STEP)
+                  if t.requires_grad else None) for t in params]
+    largest = max([v for v in influence if v is not None] or [0.0])
+
     results = []
-    for i, t in enumerate(model.parameters()[:max_tensors]):
+    for i, t in enumerate(params):
         if not t.requires_grad:
             results.append((i, None, "requires_grad is false"))
             continue
@@ -675,7 +694,7 @@ def run_gradcheck(model, x, max_tensors=8, max_points=1, eps=1e-3):
             # tensor is dead weight the optimizer will never move. pos_emb
             # under rope=True is the benign version; a layer accidentally left
             # out of forward() is the bug version.
-            if _numeric_influence(forward, t, eps) == 0.0:
+            if influence[i] <= DEAD_RELATIVE * largest:
                 results.append((i, None,
                                 "no effect on the output; nothing to learn"))
                 continue
@@ -714,14 +733,7 @@ def _numeric_influence(forward, t, eps, probes=3):
         data[idx] = orig
         t.data = data
 
-        # A difference within a few float32 ulps of the output is rounding,
-        # not influence. Without this floor, a parameter that truly has no
-        # effect -- a conv bias straight before BatchNorm, whose mean
-        # subtraction cancels it exactly -- came out "alive" or "dead"
-        # depending on the order the BLAS library happened to sum in.
-        noise = 8 * 2.0 ** -23 * max(abs(hi), abs(lo))
-        if abs(hi - lo) > noise:
-            worst = max(worst, abs(hi - lo) / (2.0 * eps))
+        worst = max(worst, abs(hi - lo) / (2.0 * eps))
     return worst
 
 

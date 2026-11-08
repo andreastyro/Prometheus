@@ -8,20 +8,20 @@ using namespace std;
 LSTM::LSTM(int input_size, int hidden_size)
     : input_size(input_size), hidden_size(hidden_size) {
 
-    W_xi = Tensor::randn({input_size, hidden_size}); W_xi->set_requires_grad(true);
-    W_xf = Tensor::randn({input_size, hidden_size}); W_xf->set_requires_grad(true);
-    W_xo = Tensor::randn({input_size, hidden_size}); W_xo->set_requires_grad(true);
-    W_xg = Tensor::randn({input_size, hidden_size}); W_xg->set_requires_grad(true);
+    W_xi = rnn_kernel::init_param({input_size, hidden_size}, hidden_size); W_xi->set_requires_grad(true);
+    W_xf = rnn_kernel::init_param({input_size, hidden_size}, hidden_size); W_xf->set_requires_grad(true);
+    W_xo = rnn_kernel::init_param({input_size, hidden_size}, hidden_size); W_xo->set_requires_grad(true);
+    W_xg = rnn_kernel::init_param({input_size, hidden_size}, hidden_size); W_xg->set_requires_grad(true);
 
-    W_hi = Tensor::randn({hidden_size, hidden_size}); W_hi->set_requires_grad(true);
-    W_hf = Tensor::randn({hidden_size, hidden_size}); W_hf->set_requires_grad(true);
-    W_ho = Tensor::randn({hidden_size, hidden_size}); W_ho->set_requires_grad(true);
-    W_hg = Tensor::randn({hidden_size, hidden_size}); W_hg->set_requires_grad(true);
+    W_hi = rnn_kernel::init_param({hidden_size, hidden_size}, hidden_size); W_hi->set_requires_grad(true);
+    W_hf = rnn_kernel::init_param({hidden_size, hidden_size}, hidden_size); W_hf->set_requires_grad(true);
+    W_ho = rnn_kernel::init_param({hidden_size, hidden_size}, hidden_size); W_ho->set_requires_grad(true);
+    W_hg = rnn_kernel::init_param({hidden_size, hidden_size}, hidden_size); W_hg->set_requires_grad(true);
 
-    b_i = Tensor::zeros({hidden_size}); b_i->set_requires_grad(true);
-    b_f = Tensor::zeros({hidden_size}); b_f->set_requires_grad(true);
-    b_o = Tensor::zeros({hidden_size}); b_o->set_requires_grad(true);
-    b_g = Tensor::zeros({hidden_size}); b_g->set_requires_grad(true);
+    b_i = rnn_kernel::init_param({hidden_size}, hidden_size); b_i->set_requires_grad(true);
+    b_f = rnn_kernel::init_param({hidden_size}, hidden_size); b_f->set_requires_grad(true);
+    b_o = rnn_kernel::init_param({hidden_size}, hidden_size); b_o->set_requires_grad(true);
+    b_g = rnn_kernel::init_param({hidden_size}, hidden_size); b_g->set_requires_grad(true);
 }
 
 // The whole sequence in one fused kernel; see fused_rnn.hpp.

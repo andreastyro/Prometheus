@@ -29,6 +29,12 @@ struct Result {
     TensorPtr c_n;      ///< [batch, H] for an LSTM, null otherwise
 };
 
+/// Initial values for a recurrent layer's weights and biases:
+/// U(-1/sqrt(H), 1/sqrt(H)), PyTorch's choice. Plain randn (std 1) made the
+/// recurrence chaotic from the first step -- a spectral radius around 12 at
+/// H = 128 -- so hidden states saturated and gradients exploded or vanished.
+TensorPtr init_param(Shape shape, int H);
+
 /// input [seq, batch, in]; h0 / c0 [batch, H] or null for zeros.
 /// Wx[k] is [in, H], Wh[k] is [H, H] and b[k] is [H], one per gate in the
 /// cell's order: RNN {h}, LSTM {i, f, o, g}, GRU {r, z, n}.
