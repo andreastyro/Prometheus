@@ -10,6 +10,9 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
+#include <new>
+#include <unordered_map>
+#include <mutex>
 
 using namespace std;
 
@@ -124,6 +127,102 @@ void store(void* base, DType d, int64_t i, double v) {
 
 } // namespace strided
 
+// ── Caching allocator ────────────────────────────────────────────────────────
+
+namespace mem {
+namespace {
+
+constexpr size_t MIN_CACHED = 64 * 1024;          // below this the heap is cheap
+constexpr size_t MAX_IDLE   = (size_t)2 << 30;    // never hold more than 2 GB idle
+constexpr size_t ALIGN      = 64;
+
+struct Cache {
+    std::mutex mu;
+    std::unordered_map<size_t, std::vector<void*>> free;
+    size_t idle = 0;
+};
+
+// Leaked on purpose: tensors held in statics are destroyed late and must
+// still find the cache.
+Cache& cache() {
+    static Cache* c = new Cache;
+    return *c;
+}
+
+size_t rounded(size_t n) { return (n + ALIGN - 1) / ALIGN * ALIGN; }
+
+} // namespace
+
+void* alloc(size_t nbytes) {
+    if (nbytes == 0) return nullptr;
+    const size_t n = rounded(nbytes);
+    if (n >= MIN_CACHED) {
+        Cache& c = cache();
+        std::lock_guard<std::mutex> lk(c.mu);
+        auto it = c.free.find(n);
+        if (it != c.free.end() && !it->second.empty()) {
+            void* p = it->second.back();
+            it->second.pop_back();
+            c.idle -= n;
+            return p;
+        }
+    }
+    void* p = ::operator new(n, std::align_val_t(ALIGN));
+    return p;
+}
+
+void free(void* ptr, size_t nbytes) noexcept {
+    if (!ptr) return;
+    const size_t n = rounded(nbytes);
+    if (n >= MIN_CACHED) {
+        try {
+            Cache& c = cache();
+            std::lock_guard<std::mutex> lk(c.mu);
+            if (c.idle + n <= MAX_IDLE) {
+                c.free[n].push_back(ptr);
+                c.idle += n;
+                return;
+            }
+        } catch (...) {
+            // could not grow the free list: release the block instead
+        }
+    }
+    ::operator delete(ptr, std::align_val_t(ALIGN));
+}
+
+size_t cached_bytes() {
+    Cache& c = cache();
+    std::lock_guard<std::mutex> lk(c.mu);
+    return c.idle;
+}
+
+void empty_cache() {
+    Cache& c = cache();
+    std::lock_guard<std::mutex> lk(c.mu);
+    for (auto& kv : c.free)
+        for (void* p : kv.second) ::operator delete(p, std::align_val_t(ALIGN));
+    c.free.clear();
+    c.idle = 0;
+}
+
+} // namespace mem
+
+void FloatBuffer::assign(size_t n, float v) {
+    if (n != n_) {
+        reset();
+        if (n) p_ = static_cast<float*>(mem::alloc(n * sizeof(float)));
+        n_ = n;
+    }
+    if (v == 0.0f) { if (n) std::memset(p_, 0, n * sizeof(float)); }
+    else std::fill(p_, p_ + n, v);
+}
+
+void FloatBuffer::reset() {
+    mem::free(p_, n_ * sizeof(float));
+    p_ = nullptr;
+    n_ = 0;
+}
+
 // ── Storage ──────────────────────────────────────────────────────────────────
 
 Storage::Storage(size_t nbytes, DType dtype, Device device)
@@ -131,8 +230,12 @@ Storage::Storage(size_t nbytes, DType dtype, Device device)
     if (device != Device::CPU)
         throw runtime_error(string("device '") + device_name(device) +
                             "' is not available in this build; only cpu is");
-    bytes_.assign(nbytes, 0);
+    nbytes_ = nbytes;
+    ptr_ = static_cast<unsigned char*>(mem::alloc(nbytes));
+    if (nbytes) std::memset(ptr_, 0, nbytes);
 }
+
+Storage::~Storage() { mem::free(ptr_, nbytes_); }
 
 // ── Tensor: construction and layout ──────────────────────────────────────────
 
@@ -306,7 +409,8 @@ void Tensor::set_grad(const vector<float>& g) {
     if ((int64_t)g.size() != numel_)
         throw runtime_error("set_grad: " + to_string(g.size()) + " values for " +
                             to_string(numel_) + " elements");
-    grad_ = g;
+    grad_.assign(g.size(), 0.0f);
+    if (!g.empty()) std::memcpy(grad_.data(), g.data(), g.size() * sizeof(float));
 }
 
 void Tensor::ensure_grad() {

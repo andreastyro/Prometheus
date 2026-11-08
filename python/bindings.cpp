@@ -198,6 +198,10 @@ PYBIND11_MODULE(_C, m) {
           py::arg("grad_output") = nullptr,
           "Gradients of output w.r.t. inputs as tensors, like torch.autograd.grad. With "
           "create_graph=True they can be differentiated again (MAML, Hessian-vector products).");
+    m.def("cached_bytes", &mem::cached_bytes,
+          "Bytes of tensor memory held idle by the caching allocator, ready for reuse.");
+    m.def("empty_cache",  &mem::empty_cache,
+          "Return every idle cached buffer to the operating system.");
     m.def("transpose",     &transpose, py::arg("a"), py::arg("dim0") = -2, py::arg("dim1") = -1,
           "Swap two dimensions: an O(1), differentiable view sharing storage.");
     m.def("permute",       &permute, py::arg("a"), py::arg("dims"),

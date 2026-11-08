@@ -47,18 +47,61 @@ private:
     Shape v_;
 };
 
+/// Caching allocator for tensor memory.
+///
+/// A new 4 MB buffer from the OS costs about 0.5 ms on Windows -- not to zero
+/// (0.03 ms) but to page-fault in, since large blocks go straight back to the
+/// OS when freed. Every op makes an output and a gradient buffer, so on a
+/// [16, 64, 32, 32] activation that was the entire cost of a relu, and made
+/// BatchNorm 7x slower than PyTorch. Freed buffers are kept, by exact size,
+/// and handed to the next request of that size with their pages still mapped:
+/// what PyTorch's caching allocator does. Small blocks bypass it; the heap
+/// already recycles those cheaply.
+namespace mem {
+    /// At least `nbytes`, 64-byte aligned, contents unspecified.
+    void* alloc(std::size_t nbytes);
+    void  free(void* ptr, std::size_t nbytes) noexcept;
+    /// Bytes held idle, ready for reuse.
+    std::size_t cached_bytes();
+    /// Return every idle buffer to the OS.
+    void empty_cache();
+}
+
+/// A float buffer from the caching allocator: the gradient storage.
+class FloatBuffer {
+public:
+    FloatBuffer() = default;
+    ~FloatBuffer() { reset(); }
+    FloatBuffer(const FloatBuffer&) = delete;
+    FloatBuffer& operator=(const FloatBuffer&) = delete;
+    float*       data()       { return p_; }
+    const float* data() const { return p_; }
+    std::size_t  size()  const { return n_; }
+    bool         empty() const { return n_ == 0; }
+    /// n elements, every one set to v.
+    void assign(std::size_t n, float v);
+    void reset();
+private:
+    float*      p_ = nullptr;
+    std::size_t n_ = 0;
+};
+
 /// The bytes behind one or more tensors. A view and the tensor it was taken
 /// from share one Storage; nothing else does.
 class Storage {
 public:
     Storage(std::size_t nbytes, DType dtype, Device device);
-    void*       data()         { return bytes_.data(); }
-    const void* data()   const { return bytes_.data(); }
-    std::size_t nbytes() const { return bytes_.size(); }
+    ~Storage();
+    Storage(const Storage&) = delete;
+    Storage& operator=(const Storage&) = delete;
+    void*       data()         { return ptr_; }
+    const void* data()   const { return ptr_; }
+    std::size_t nbytes() const { return nbytes_; }
     DType       dtype()  const { return dtype_; }
     Device      device() const { return device_; }
 private:
-    std::vector<unsigned char> bytes_;   // zero-filled on allocation
+    unsigned char* ptr_ = nullptr;       // zero-filled on allocation, from mem::alloc
+    std::size_t    nbytes_ = 0;
     DType  dtype_;
     Device device_;
 };
@@ -157,7 +200,9 @@ public:
     float*       grad()       { return grad_.empty() ? nullptr : grad_.data(); }
     const float* grad() const { return grad_.empty() ? nullptr : grad_.data(); }
     FloatSpan    grad_values();
-    std::vector<float> grad_vector() const { return grad_; }
+    std::vector<float> grad_vector() const {
+        return std::vector<float>(grad_.data(), grad_.data() + grad_.size());
+    }
     void set_grad(const std::vector<float>& g);
     bool has_grad() const { return (std::int64_t)grad_.size() == numel_; }
     /// Allocate a zeroed gradient buffer if there is not one already.
@@ -210,7 +255,7 @@ private:
     bool         contiguous_    = true;
     bool         is_view_       = false;
     bool         requires_grad_ = false;
-    std::vector<float>        grad_;
+    FloatBuffer               grad_;
     std::shared_ptr<GradNode> grad_fn_;
 };
 

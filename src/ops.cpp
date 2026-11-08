@@ -803,9 +803,21 @@ static TensorPtr reduce_sum(const char* name, TensorPtr a, int dim, bool keepdim
         Shape out_shape = keepdim ? Shape(max(nd, 1), 1) : Shape{1};
         auto result = make_shared<Tensor>(out_shape);
         const int64_t n = a->numel();
-        double acc = 0.0;                       // a float sum of millions drifts
+        // Parallel, in blocks: each block sums in float, blocks combine in
+        // double so a sum of millions does not drift. This was one serial loop
+        // -- 1 ms over a million elements, slower than most of the layers
+        // whose output it reduces.
         const float* A = a->data();
-        for (int64_t i = 0; i < n; i++) acc += A[i];
+        const int64_t BLK = 4096;
+        const int nblk = (int)((n + BLK - 1) / BLK);
+        double acc = 0.0;
+        #pragma omp parallel for reduction(+:acc) schedule(static) if(n >= 65536)
+        for (int b = 0; b < nblk; b++) {
+            const int64_t lo = (int64_t)b * BLK, hi = std::min(n, lo + BLK);
+            float part = 0.0f;
+            for (int64_t i = lo; i < hi; i++) part += A[i];
+            acc += part;
+        }
         result->data()[0] = (float)(mean ? acc / (double)n : acc);
         if (a->requires_grad()) {
             auto node = make_node(result, {a});
@@ -817,7 +829,9 @@ static TensorPtr reduce_sum(const char* name, TensorPtr a, int dim, bool keepdim
             node->backward_fn = [a, n, mean](const TensorPtr& result) {
                 const float g = result->grad()[0] / (mean ? (float)n : 1.0f);
                 float* GA = a->grad();
-                for (int64_t i = 0; i < n; i++) GA[i] += g;
+                const int ni = (int)n;
+                #pragma omp parallel for schedule(static) if(ni >= 65536)
+                for (int i = 0; i < ni; i++) GA[i] += g;
             };
         }
         return result;
