@@ -15,6 +15,8 @@ TensorPtr Flatten::forward(TensorPtr input){
 
     int n = input->shape()[0];
     int flat_size = input->num_el() / n;
+    if (input->device() == Device::CUDA)
+        return reshape(input, {(int64_t)n, (int64_t)flat_size});
 
     auto result = make_shared<Tensor>(Shape{n, flat_size});
     result->set_data(input->to_vector());

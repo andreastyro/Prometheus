@@ -11,7 +11,7 @@ MaxPool2D::MaxPool2D(int kernel_size, int stride)
 // plane and its argmax indices only point into it, so the backward scatter is
 // race-free per plane even when windows overlap (stride < kernel).
 TensorPtr MaxPool2D::forward(TensorPtr input){
-    input = checked_input("MaxPool2D", input);
+    if (input->device() != Device::CUDA) input = checked_input("MaxPool2D", input);
     if (input->dim() != 4)
         throw runtime_error("MaxPool2D: input must be [batch, channels, height, width]");
     const int n = (int)input->shape()[0], channels = (int)input->shape()[1];
@@ -22,6 +22,29 @@ TensorPtr MaxPool2D::forward(TensorPtr input){
         throw runtime_error("MaxPool2D: window larger than the input");
     const int planes = n * channels;
     const int64_t in_hw = (int64_t)h_in * w_in, out_hw = (int64_t)h_out * w_out;
+
+    if (input->device() == Device::CUDA) {
+        // every window as a row, its argmax on the device, then a gather of the
+        // winners -- which is linear in the input, so it carries the gradient
+        const int64_t KK = (int64_t)K * K, nout = (int64_t)planes * out_hw;
+        auto win = make_shared<vector<int64_t>>((size_t)(nout * KK));
+        size_t q = 0;
+        for (int pl = 0; pl < planes; pl++)
+            for (int i = 0; i < h_out; i++)
+                for (int j = 0; j < w_out; j++)
+                    for (int kh = 0; kh < K; kh++)
+                        for (int kw = 0; kw < K; kw++)
+                            (*win)[q++] = pl * in_hw + (int64_t)(i * s + kh) * w_in + j * s + kw;
+        TensorPtr am;
+        {
+            NoGrad off;
+            am = argmax(gather_flat(input, win, Shape{nout, KK}))->to(Device::CPU);
+        }
+        const float* a = am->data();
+        auto pick = make_shared<vector<int64_t>>((size_t)nout);
+        for (int64_t o = 0; o < nout; o++) (*pick)[(size_t)o] = (*win)[(size_t)(o * KK + (int64_t)a[o])];
+        return gather_flat(input, pick, Shape{n, channels, h_out, w_out});
+    }
 
     auto output = make_shared<Tensor>(Shape{n, channels, h_out, w_out});
     // argmax of each window as an offset within its plane, for the backward

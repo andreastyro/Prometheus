@@ -45,7 +45,7 @@ BatchNorm::BatchNorm(int num_features, float eps, bool training, float momentum)
 // x_hat is not stored: the backward recomputes it from x and two numbers per
 // channel. Storing it cost a full write and read of the activation.
 TensorPtr BatchNorm::forward(TensorPtr input) {
-    input = checked_input("BatchNorm", input);
+    if (input->device() != Device::CUDA) input = checked_input("BatchNorm", input);
     const int ndim = (int)input->shape().size();
     if (ndim < 2)
         throw runtime_error("BatchNorm: expected at least 2 dimensions "
@@ -63,6 +63,36 @@ TensorPtr BatchNorm::forward(TensorPtr input) {
     const int64_t rows  = N * C;
     const int64_t count = N * S;
     const bool    big   = rows * S >= 65536;
+
+    if (input->device() == Device::CUDA || gamma->device() == Device::CUDA) {
+        auto x3 = reshape(input, {N, C, S});
+        TensorPtr xh;
+        if (training) {
+            auto m   = mean(mean(x3, 2, true), 0, true);
+            auto d   = subtract(x3, m);
+            auto var = mean(mean(multiply(d, d), 2, true), 0, true);
+            xh = divide(d, sqrt_op(add(eps, var)));
+            // the running estimate: C numbers, updated on the host as on the CPU
+            vector<float> mh, vh;
+            {
+                NoGrad off;
+                mh = m->to(Device::CPU)->to_vector();
+                vh = var->to(Device::CPU)->to_vector();
+            }
+            for (int64_t c = 0; c < C; c++) {
+                const float unbiased = count > 1 ? vh[c] * (float)count / (float)(count - 1) : vh[c];
+                running_mean[c] = (1.0f - momentum) * running_mean[c] + momentum * mh[c];
+                running_var[c]  = (1.0f - momentum) * running_var[c]  + momentum * unbiased;
+            }
+        } else {
+            vector<float> mv(C), iv(C);
+            for (int64_t c = 0; c < C; c++) { mv[c] = running_mean[c]; iv[c] = 1.0f / std::sqrt(running_var[c] + eps); }
+            xh = multiply(subtract(x3, make_shared<Tensor>(Shape{1, C, 1}, mv)->to(Device::CUDA)),
+                          make_shared<Tensor>(Shape{1, C, 1}, iv)->to(Device::CUDA));
+        }
+        auto out = add(multiply(xh, reshape(gamma, {1, C, 1})), reshape(beta, {1, C, 1}));
+        return reshape(out, input->shape());
+    }
 
     auto output = Tensor::empty(input->shape());
     const float* X  = input->data();

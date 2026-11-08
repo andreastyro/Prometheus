@@ -20,6 +20,7 @@ ap.add_argument("--heads", type=int, default=4)
 ap.add_argument("--layers", type=int, default=4)
 ap.add_argument("--batch", type=int, default=8)
 ap.add_argument("--steps", type=int, default=20)
+ap.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
 args = ap.parse_args()
 
 import numpy as np
@@ -31,12 +32,15 @@ tokens_per_step = args.batch * args.seq
 
 if args.lib == "prometheus":
     import prometheus as p
-    print("prometheus:", p.cuda_status())
+    print("prometheus:", p.cuda_status() if args.device == "cuda" else p.backend())
     p.Tensor.manual_seed(0)
     model = p.GPT(args.vocab, args.seq, args.embed, args.heads, args.layers)
-    model.cuda()
+    if args.device == "cuda":
+        model.cuda()
     opt = p.AdamW(model.parameters(), 3e-4)
-    x = p.Tensor([args.batch, args.seq], [float(v) for v in ids.reshape(-1)], p.int64).cuda()
+    x = p.Tensor([args.batch, args.seq], [float(v) for v in ids.reshape(-1)], p.int64)
+    if args.device == "cuda":
+        x = x.cuda()
     tg = [int(t) for t in targets]
 
     def step():
@@ -47,13 +51,14 @@ if args.lib == "prometheus":
         return loss
 
     def sync():
-        p.cuda_synchronize()
+        if args.device == "cuda":
+            p.cuda_synchronize()
 else:
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
-    dev = torch.device("cuda")
-    print("torch:", torch.__version__, torch.cuda.get_device_name(0))
+    dev = torch.device(args.device)
+    print("torch:", torch.__version__, torch.cuda.get_device_name(0) if args.device == "cuda" else "cpu, %d threads" % torch.get_num_threads())
     torch.manual_seed(0)
 
     class Block(nn.Module):
@@ -102,7 +107,8 @@ else:
         return loss
 
     def sync():
-        torch.cuda.synchronize()
+        if args.device == "cuda":
+            torch.cuda.synchronize()
 
 for _ in range(3):          # warm-up: kernel compilation, allocator, cuBLAS heuristics
     step()
@@ -114,6 +120,6 @@ for _ in range(args.steps):
     sync()
     times.append(time.perf_counter() - t0)
 best, med = min(times), sorted(times)[len(times) // 2]
-print("%-10s batch %d x seq %d, embed %d, %d layers: median %.1f ms/step, best %.1f ms -> %.0f tokens/s (loss %.3f)"
-      % (args.lib, args.batch, args.seq, args.embed, args.layers, med * 1e3, best * 1e3,
+print("%-10s %-4s batch %d x seq %d, embed %d, %d layers: median %.1f ms/step, best %.1f ms -> %.0f tokens/s (loss %.3f)"
+      % (args.lib, args.device, args.batch, args.seq, args.embed, args.layers, med * 1e3, best * 1e3,
          tokens_per_step / med, float(loss.item())))

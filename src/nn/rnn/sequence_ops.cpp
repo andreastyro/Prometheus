@@ -15,21 +15,26 @@ TensorPtr rnn_slice_step(TensorPtr input, int t) {
 
     if (t < 0 || t >= seq_len)
         throw runtime_error("rnn_slice_step: timestep out of range");
+    const int base = t * batch * features;
+
+    // The forward written with ops: the GPU path, and the reference the
+    // higher-order gradients differentiate.
+    auto reference = [base, batch, features](const std::vector<TensorPtr>& in) -> TensorPtr {
+            auto idx = make_shared<vector<int64_t>>((size_t)batch * features);
+            for (int64_t i = 0; i < (int64_t)batch * features; i++) (*idx)[i] = base + i;
+            return gather_flat(in[0], idx, {(int64_t)batch, (int64_t)features});
+        };
+    if (input->device() == Device::CUDA)
+        return reference({input});
 
     auto out = make_shared<Tensor>(Shape{batch, features});
-
-    const int base = t * batch * features;
     for (int i = 0; i < batch * features; i++)
         out->data()[i] = input->data()[base + i];
 
     if (input->requires_grad()) {
         auto node = make_node(out, {input});
         node->name = "rnn_slice_step";
-        autograd::attach_reference(*node, [base, batch, features](const std::vector<TensorPtr>& in) -> TensorPtr {
-            auto idx = make_shared<vector<int64_t>>((size_t)batch * features);
-            for (int64_t i = 0; i < (int64_t)batch * features; i++) (*idx)[i] = base + i;
-            return gather_flat(in[0], idx, {(int64_t)batch, (int64_t)features});
-        });
+        autograd::attach_reference(*node, reference);
         node->backward_fn = [input, base, batch, features](const TensorPtr& out) {
             for (int i = 0; i < batch * features; i++)
                 input->grad()[base + i] += out->grad()[i];
@@ -48,6 +53,16 @@ TensorPtr rnn_stack_steps(const vector<TensorPtr>& steps) {
     const int hidden  = steps[0]->shape()[1];
     const int stride  = batch * hidden;
 
+    // The forward written with ops: the GPU path, and the reference the
+    // higher-order gradients differentiate.
+    auto reference = [seq_len, batch, hidden](const std::vector<TensorPtr>& in) -> TensorPtr {
+            vector<TensorPtr> flat;
+            for (auto& t : in) flat.push_back(reshape(t, {t->numel()}));
+            return reshape(concat_op(flat, 0), {(int64_t)seq_len, (int64_t)batch, (int64_t)hidden});
+        };
+    if (steps[0]->device() == Device::CUDA)
+        return reference(steps);
+
     auto out = make_shared<Tensor>(Shape{seq_len, batch, hidden});
 
     bool any_grad = false;
@@ -62,11 +77,7 @@ TensorPtr rnn_stack_steps(const vector<TensorPtr>& steps) {
     if (any_grad) {
         auto node = make_node(out, steps);
         node->name = "rnn_stack_steps";
-        autograd::attach_reference(*node, [seq_len, batch, hidden](const std::vector<TensorPtr>& in) -> TensorPtr {
-            vector<TensorPtr> flat;
-            for (auto& t : in) flat.push_back(reshape(t, {t->numel()}));
-            return reshape(concat_op(flat, 0), {(int64_t)seq_len, (int64_t)batch, (int64_t)hidden});
-        });
+        autograd::attach_reference(*node, reference);
         node->backward_fn = [steps, seq_len, stride](const TensorPtr& out) {
             for (int t = 0; t < seq_len; t++) {
                 if (!steps[t]->requires_grad()) continue;

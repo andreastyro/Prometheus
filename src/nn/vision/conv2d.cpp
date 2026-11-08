@@ -51,7 +51,7 @@ Conv2D::Conv2D(int in_channels, int out_channels, int kernel_size, int stride, i
 // PyTorch at [16, 32, 32, 32] -> 64 channels, and a backward that wrote the
 // bias gradient from inside its innermost loop.
 TensorPtr Conv2D::forward(TensorPtr input){
-    input = checked_input("Conv2D", input);
+    if (input->device() != Device::CUDA) input = checked_input("Conv2D", input);
     if (input->dim() != 4)
         throw runtime_error("Conv2D: input must be [batch, channels, height, width]");
     const int B = (int)input->shape()[0], C = (int)input->shape()[1];
@@ -65,6 +65,33 @@ TensorPtr Conv2D::forward(TensorPtr input){
         throw runtime_error("Conv2D: kernel larger than the padded input");
     const int HW = Ho * Wo, CKK = C * K * K;
     const int64_t in_sz = (int64_t)C * H * W, out_sz = (int64_t)F * HW;
+
+    // The forward written with ops: the GPU path, and the reference the
+    // higher-order gradients differentiate.
+    auto reference = [B, C, H, W, K, F, s, p, Ho, Wo, HW, CKK](const std::vector<TensorPtr>& in) -> TensorPtr {
+            const int CC = C, IH = H, IW = W, OH = Ho, OW = Wo;
+            // the patch of every output position, as flat indices into the input;
+            // -1 marks padding, which gathers as 0
+            auto idx = make_shared<vector<int64_t>>((size_t)B * CKK * HW);
+            for (int b = 0; b < B; b++)
+                for (int c = 0; c < CC; c++)
+                    for (int kh = 0; kh < K; kh++)
+                        for (int kw = 0; kw < K; kw++) {
+                            const int64_t row = ((int64_t)b * CKK + (c * K + kh) * K + kw) * HW;
+                            for (int i = 0; i < OH; i++)
+                                for (int j = 0; j < OW; j++) {
+                                    const int y = i * s + kh - p, x = j * s + kw - p;
+                                    (*idx)[row + i * OW + j] = (y < 0 || y >= IH || x < 0 || x >= IW)
+                                        ? -1 : (((int64_t)b * CC + c) * IH + y) * IW + x;
+                                }
+                        }
+            auto col = gather_flat(in[0], idx, {(int64_t)B, (int64_t)CKK, (int64_t)HW});   // im2col
+            auto out = matmul(reshape(in[1], {(int64_t)F, (int64_t)CKK}), col);            // [B, F, HW]
+            out = add(out, reshape(in[2], {1, (int64_t)F, 1}));
+            return reshape(out, {(int64_t)B, (int64_t)F, (int64_t)Ho, (int64_t)Wo});
+        };
+    if (input->device() == Device::CUDA || weights->device() == Device::CUDA)
+        return reference({input, weights, bias});
 
     auto output = make_shared<Tensor>(Shape{B, F, Ho, Wo});
     const float* X = input->data();
@@ -86,28 +113,7 @@ TensorPtr Conv2D::forward(TensorPtr input){
     if (input->requires_grad() || weights->requires_grad() || bias->requires_grad()) {
         auto node = make_node(output, {input, weights, bias});
         node->name = "Conv2D";
-        autograd::attach_reference(*node, [B, C, H, W, K, F, s, p, Ho, Wo, HW, CKK](const std::vector<TensorPtr>& in) -> TensorPtr {
-            const int CC = C, IH = H, IW = W, OH = Ho, OW = Wo;
-            // the patch of every output position, as flat indices into the input;
-            // -1 marks padding, which gathers as 0
-            auto idx = make_shared<vector<int64_t>>((size_t)B * CKK * HW);
-            for (int b = 0; b < B; b++)
-                for (int c = 0; c < CC; c++)
-                    for (int kh = 0; kh < K; kh++)
-                        for (int kw = 0; kw < K; kw++) {
-                            const int64_t row = ((int64_t)b * CKK + (c * K + kh) * K + kw) * HW;
-                            for (int i = 0; i < OH; i++)
-                                for (int j = 0; j < OW; j++) {
-                                    const int y = i * s + kh - p, x = j * s + kw - p;
-                                    (*idx)[row + i * OW + j] = (y < 0 || y >= IH || x < 0 || x >= IW)
-                                        ? -1 : (((int64_t)b * CC + c) * IH + y) * IW + x;
-                                }
-                        }
-            auto col = gather_flat(in[0], idx, {(int64_t)B, (int64_t)CKK, (int64_t)HW});   // im2col
-            auto out = matmul(reshape(in[1], {(int64_t)F, (int64_t)CKK}), col);            // [B, F, HW]
-            out = add(out, reshape(in[2], {1, (int64_t)F, 1}));
-            return reshape(out, {(int64_t)B, (int64_t)F, (int64_t)Ho, (int64_t)Wo});
-        });
+        autograd::attach_reference(*node, reference);
         auto w = weights;
         auto bvec = bias;
         node->backward_fn = [input, w, bvec, B, C, H, W, K, s, p, Ho, Wo, F, HW, CKK, in_sz, out_sz]

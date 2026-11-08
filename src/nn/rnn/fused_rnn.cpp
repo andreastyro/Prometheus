@@ -115,7 +115,7 @@ TensorPtr init_param(Shape shape, int H) {
 Result run(Cell cell, TensorPtr input, TensorPtr h0, TensorPtr c0, int H,
            const vector<TensorPtr>& Wx, const vector<TensorPtr>& Wh, const vector<TensorPtr>& b) {
     const char* name = cell == Cell::RNN ? "RNN" : cell == Cell::LSTM ? "LSTM" : "GRU";
-    input = checked_input(name, input);
+    if (input->device() != Device::CUDA) input = checked_input(name, input);
     if (input->dim() != 3)
         throw runtime_error(string(name) + ": input must be [seq, batch, features]");
     const int S = (int)input->size(0), B = (int)input->size(1), I = (int)input->size(2);
@@ -124,8 +124,57 @@ Result run(Cell cell, TensorPtr input, TensorPtr h0, TensorPtr c0, int H,
                             " input features, got " + to_string(I));
     const int G = (int)Wx.size(), GH = G * H, BH = B * H;
     const int64_t SB = (int64_t)S * B;
-    if (h0) h0 = checked_input(name, h0);
-    if (c0) c0 = checked_input(name, c0);
+    if (h0 && h0->device() != Device::CUDA) h0 = checked_input(name, h0);
+    if (c0 && c0->device() != Device::CUDA) c0 = checked_input(name, c0);
+
+    // The recurrence unrolled from ops: the GPU path, and the reference the
+    // higher-order gradients differentiate.
+    auto reference = [cell, S, B, I, H, G, lstm = (cell == Cell::LSTM), has_h0 = (bool)h0, has_c0 = (bool)c0](const std::vector<TensorPtr>& in) -> TensorPtr {
+            // the recurrence unrolled from ops, in the cell's own formulas
+            size_t k = 0;
+            auto X = in[k++];
+            TensorPtr h = has_h0 ? in[k++] : Tensor::zeros({(int64_t)B, (int64_t)H})->to(X->device());
+            TensorPtr c = (lstm && has_c0) ? in[k++] : Tensor::zeros({(int64_t)B, (int64_t)H})->to(X->device());
+            vector<TensorPtr> Wx(in.begin() + k, in.begin() + k + G); k += G;
+            vector<TensorPtr> Wh(in.begin() + k, in.begin() + k + G); k += G;
+            vector<TensorPtr> bb(in.begin() + k, in.begin() + k + G);
+            auto lin = [&](const TensorPtr& x, const TensorPtr& hh, int g) {
+                return add(add(matmul(x, Wx[g]), matmul(hh, Wh[g])), bb[g]);
+            };
+            vector<TensorPtr> hs;
+            for (int t = 0; t < S; t++) {
+                auto idx = make_shared<vector<int64_t>>((size_t)B * I);
+                for (int64_t q = 0; q < (int64_t)B * I; q++) (*idx)[q] = (int64_t)t * B * I + q;
+                auto x = gather_flat(X, idx, {(int64_t)B, (int64_t)I});
+                if (cell == Cell::RNN) {
+                    h = tanh_op(lin(x, h, 0));
+                } else if (lstm) {
+                    auto ig = sigmoid(lin(x, h, 0)), fg = sigmoid(lin(x, h, 1));
+                    auto og = sigmoid(lin(x, h, 2)), gg = tanh_op(lin(x, h, 3));
+                    c = add(multiply(fg, c), multiply(ig, gg));
+                    h = multiply(og, tanh_op(c));
+                } else {
+                    auto r = sigmoid(lin(x, h, 0)), z = sigmoid(lin(x, h, 1));
+                    auto n = tanh_op(add(add(matmul(x, Wx[2]), matmul(multiply(r, h), Wh[2])), bb[2]));
+                    h = add(multiply(subtract(1.0f, z), n), multiply(z, h));
+                }
+                hs.push_back(reshape(h, {(int64_t)B * H}));
+            }
+            auto seq = concat_op(hs, 0);
+            return lstm ? concat_op({seq, reshape(c, {(int64_t)B * H})}, 0) : seq;
+        };
+    if (input->device() == Device::CUDA || Wx[0]->device() == Device::CUDA) {
+        vector<TensorPtr> ins = {input};
+        if (h0) ins.push_back(h0);
+        if (cell == Cell::LSTM && c0) ins.push_back(c0);
+        for (auto* group : {&Wx, &Wh, &b}) for (auto& w : *group) ins.push_back(w);
+        auto packed = contiguous(reference(ins));
+        Result r;
+        r.output = slice_of(packed, 0, Shape{S, B, H});
+        r.h_n    = slice_of(packed, (int64_t)(S - 1) * BH, Shape{B, H});
+        r.c_n    = cell == Cell::LSTM ? slice_of(packed, SB * H, Shape{B, H}) : nullptr;
+        return r;
+    }
 
     // packed weights: gates side by side
     auto Wxp = make_shared<vector<float>>(pack_cols(Wx, I, H));         // [I, GH]
@@ -223,40 +272,7 @@ Result run(Cell cell, TensorPtr input, TensorPtr h0, TensorPtr c0, int H,
     if (need) {
         auto node = make_node(packed, inputs);
         node->name = name;
-        autograd::attach_reference(*node, [cell, S, B, I, H, G, lstm, has_h0 = (bool)h0, has_c0 = (bool)c0](const std::vector<TensorPtr>& in) -> TensorPtr {
-            // the recurrence unrolled from ops, in the cell's own formulas
-            size_t k = 0;
-            auto X = in[k++];
-            TensorPtr h = has_h0 ? in[k++] : Tensor::zeros({(int64_t)B, (int64_t)H});
-            TensorPtr c = (lstm && has_c0) ? in[k++] : Tensor::zeros({(int64_t)B, (int64_t)H});
-            vector<TensorPtr> Wx(in.begin() + k, in.begin() + k + G); k += G;
-            vector<TensorPtr> Wh(in.begin() + k, in.begin() + k + G); k += G;
-            vector<TensorPtr> bb(in.begin() + k, in.begin() + k + G);
-            auto lin = [&](const TensorPtr& x, const TensorPtr& hh, int g) {
-                return add(add(matmul(x, Wx[g]), matmul(hh, Wh[g])), bb[g]);
-            };
-            vector<TensorPtr> hs;
-            for (int t = 0; t < S; t++) {
-                auto idx = make_shared<vector<int64_t>>((size_t)B * I);
-                for (int64_t q = 0; q < (int64_t)B * I; q++) (*idx)[q] = (int64_t)t * B * I + q;
-                auto x = gather_flat(X, idx, {(int64_t)B, (int64_t)I});
-                if (cell == Cell::RNN) {
-                    h = tanh_op(lin(x, h, 0));
-                } else if (lstm) {
-                    auto ig = sigmoid(lin(x, h, 0)), fg = sigmoid(lin(x, h, 1));
-                    auto og = sigmoid(lin(x, h, 2)), gg = tanh_op(lin(x, h, 3));
-                    c = add(multiply(fg, c), multiply(ig, gg));
-                    h = multiply(og, tanh_op(c));
-                } else {
-                    auto r = sigmoid(lin(x, h, 0)), z = sigmoid(lin(x, h, 1));
-                    auto n = tanh_op(add(add(matmul(x, Wx[2]), matmul(multiply(r, h), Wh[2])), bb[2]));
-                    h = add(multiply(subtract(1.0f, z), n), multiply(z, h));
-                }
-                hs.push_back(reshape(h, {(int64_t)B * H}));
-            }
-            auto seq = concat_op(hs, 0);
-            return lstm ? concat_op({seq, reshape(c, {(int64_t)B * H})}, 0) : seq;
-        });
+        autograd::attach_reference(*node, reference);
         node->backward_fn = [cell, input, h0, c0, H, S, B, I, G, GH, BH, SB, lstm,
                              Wxp, Whp, gates, cell_state, rh, Wx, Wh, b]
                             (const TensorPtr& packed) {

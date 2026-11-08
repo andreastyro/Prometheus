@@ -42,7 +42,7 @@ GroupNorm::GroupNorm(int num_groups, int num_channels, float eps)
 // gradients and the group means of the formula above, so the activation is
 // read twice in the backward and x_hat is never stored.
 TensorPtr GroupNorm::forward(TensorPtr input) {
-    input = checked_input("GroupNorm", input);
+    if (input->device() != Device::CUDA) input = checked_input("GroupNorm", input);
     if (input->dim() < 2)
         throw runtime_error("GroupNorm: expected [batch, channels, ...]");
     const int64_t batch    = input->shape()[0];
@@ -56,6 +56,21 @@ TensorPtr GroupNorm::forward(TensorPtr input) {
     const int64_t rows       = batch * channels;
     const int64_t count      = group_size * spatial;
     const bool    big        = rows * spatial >= 65536;
+
+    // The forward written with ops: the GPU path, and the reference the
+    // higher-order gradients differentiate.
+    auto reference = [batch, channels, spatial, groups, eps = eps](const std::vector<TensorPtr>& in) -> TensorPtr {
+            auto xg  = reshape(in[0], {batch, groups, (channels / groups) * spatial});
+            auto m   = mean(xg, 2, true);
+            auto d   = subtract(xg, m);
+            auto var = mean(multiply(d, d), 2, true);
+            auto xh  = reshape(divide(d, sqrt_op(add(eps, var))), {batch, channels, spatial});
+            auto out = add(multiply(xh, reshape(in[1], {1, channels, 1})),
+                           reshape(in[2], {1, channels, 1}));
+            return reshape(out, in[0]->shape());
+        };
+    if (input->device() == Device::CUDA || gamma->device() == Device::CUDA)
+        return reference({input, gamma, beta});
 
     auto output = Tensor::empty(input->shape());
     const float* X  = input->data();
@@ -95,16 +110,7 @@ TensorPtr GroupNorm::forward(TensorPtr input) {
     if (input->requires_grad() || gamma->requires_grad() || beta->requires_grad()) {
         auto node = make_node(output, {input, gamma, beta});
         node->name = "GroupNorm::forward";
-        autograd::attach_reference(*node, [batch, channels, spatial, groups, eps = eps](const std::vector<TensorPtr>& in) -> TensorPtr {
-            auto xg  = reshape(in[0], {batch, groups, (channels / groups) * spatial});
-            auto m   = mean(xg, 2, true);
-            auto d   = subtract(xg, m);
-            auto var = mean(multiply(d, d), 2, true);
-            auto xh  = reshape(divide(d, sqrt_op(add(eps, var))), {batch, channels, spatial});
-            auto out = add(multiply(xh, reshape(in[1], {1, channels, 1})),
-                           reshape(in[2], {1, channels, 1}));
-            return reshape(out, in[0]->shape());
-        });
+        autograd::attach_reference(*node, reference);
 
         auto gamma_ = gamma;
         auto beta_  = beta;

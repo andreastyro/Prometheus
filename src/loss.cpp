@@ -58,6 +58,13 @@ TensorPtr cross_entropy_loss(TensorPtr pred, TensorPtr target){
 // with r = pred - target. Previously this looped over raw floats and returned a
 // detached scalar, so pred never received a gradient.
 TensorPtr huber_loss(TensorPtr pred, TensorPtr target, float delta) {
+    if (pred->device() == Device::CUDA) {
+        auto d = subtract(pred, target);
+        auto a = abs_op(d);
+        auto quad = multiply(0.5f, multiply(d, d));
+        auto lin  = multiply(delta, subtract(a, 0.5f * delta));
+        return mean(where(le(a, (double)delta), quad, lin), -1);
+    }
     int n = pred->num_el();
     auto out = Tensor::zeros({1});
     float total = 0.0f;
@@ -132,6 +139,10 @@ TensorPtr reconstruction_loss(TensorPtr input, TensorPtr output) {
 // and all three are zero once the hinge is satisfied. Previously this returned
 // a detached scalar, so none of the three inputs received a gradient.
 TensorPtr contrastive_loss(TensorPtr anchor, TensorPtr positive, TensorPtr negative, float margin) {
+    if (anchor->device() == Device::CUDA) {
+        auto dp = subtract(anchor, positive), dn = subtract(anchor, negative);
+        return relu(add(margin, subtract(sum(multiply(dp, dp), -1), sum(multiply(dn, dn), -1))));
+    }
     int n = anchor->num_el();
     float d_pos = 0.0f, d_neg = 0.0f;
     for (int i = 0; i < n; i++) {
@@ -173,6 +184,11 @@ TensorPtr contrastive_loss(TensorPtr anchor, TensorPtr positive, TensorPtr negat
 // L1 penalty: lambda * sum(|w|).  d/dw = lambda * sign(w)
 // (sign(0) is taken as 0, the usual subgradient choice).
 TensorPtr l1_regularization(std::vector<TensorPtr> params, float lambda_) {
+    if (!params.empty() && params[0]->device() == Device::CUDA) {
+        TensorPtr total;
+        for (auto& t : params) { auto s = sum(abs_op(t), -1); total = total ? add(total, s) : s; }
+        return multiply(lambda_, total);
+    }
     auto out = Tensor::zeros({1});
     float total = 0.0f;
     for (auto& p : params)
@@ -210,6 +226,11 @@ TensorPtr l1_regularization(std::vector<TensorPtr> params, float lambda_) {
 
 // L2 penalty: lambda * sum(w^2).  d/dw = 2 * lambda * w
 TensorPtr l2_regularization(std::vector<TensorPtr> params, float lambda_) {
+    if (!params.empty() && params[0]->device() == Device::CUDA) {
+        TensorPtr total;
+        for (auto& t : params) { auto s = sum(multiply(t, t), -1); total = total ? add(total, s) : s; }
+        return multiply(lambda_, total);
+    }
     auto out = Tensor::zeros({1});
     float total = 0.0f;
     for (auto& p : params)

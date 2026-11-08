@@ -15,6 +15,16 @@
 #include <cstdio>
 #include "ml/nn/linear.hpp"
 #include "ml/nn/dropout.hpp"
+#include "ml/nn/batchnorm.hpp"
+#include "ml/nn/flatten.hpp"
+#include "ml/nn/groupnorm.hpp"
+#include "ml/nn/rnn/gru.hpp"
+#include "ml/nn/rnn/lstm.hpp"
+#include "ml/nn/rnn/rnn.hpp"
+#include "ml/nn/vision/avgpool2d.hpp"
+#include "ml/nn/vision/conv2d.hpp"
+#include "ml/nn/vision/convtranspose2d.hpp"
+#include "ml/nn/vision/maxpool2d.hpp"
 #include "ml/nn/nlp/attention.hpp"
 #include "ml/nn/nlp/embedding.hpp"
 #include "ml/nn/nlp/gpt.hpp"
@@ -283,6 +293,65 @@ int main() {
         ids->set_data({1, 4, 4, 0, 9, 3, 3, 7, 2, 1});
         layer_check("Embedding", [] { return std::make_shared<Embedding>(10, 6); }, ids, 1e-6f);
         auto pe_in = random_tensor({5, 6}, 51);
+        // ── phase 2: vision, normalisation, recurrent ──
+        auto img = random_tensor({2, 3, 9, 9}, 53);
+        layer_check("Conv2D k3 s1 p1", [] { return std::make_shared<Conv2D>(3, 5, 3, 1, 1); }, img, 1e-5f);
+        layer_check("Conv2D k3 s2 p0", [] { return std::make_shared<Conv2D>(3, 4, 3, 2, 0); }, img, 1e-5f);
+        layer_check("ConvTranspose2D k4 s2 p1", [] { return std::make_shared<ConvTranspose2D>(3, 4, 4, 2, 1); }, img, 1e-5f);
+        layer_check("MaxPool2D k2", [] { return std::make_shared<MaxPool2D>(2); }, img, 0.0f);
+        layer_check("MaxPool2D k3 s2 (overlapping)", [] { return std::make_shared<MaxPool2D>(3, 2); }, img, 0.0f);
+        layer_check("AvgPool2D k3", [] { return std::make_shared<AvgPool2D>(3); }, img, 1e-6f);
+        layer_check("GroupNorm 3 groups", [] { return std::make_shared<GroupNorm>(3, 6); }, random_tensor({2, 6, 4, 4}, 54), 1e-5f);
+        layer_check("Flatten", [] { return std::make_shared<Flatten>(); }, img, 0.0f);
+        {
+            // BatchNorm: output, gradients, and the running estimate it updates
+            std::shared_ptr<BatchNorm> keep_c, keep_g;
+            layer_check("BatchNorm (training)", [&] {
+                auto b = std::make_shared<BatchNorm>(3);
+                (keep_c ? keep_g : keep_c) = b;
+                return b;
+            }, img, 1e-5f);
+            float m = 0;
+            for (int c = 0; c < 3; c++)
+                m = std::max(m, std::max(std::fabs(keep_g->running_mean[c] - keep_c->running_mean[c]),
+                                         std::fabs(keep_g->running_var[c] - keep_c->running_var[c])));
+            CHECK_NEAR("BatchNorm running statistics", m, 0.0f, 1e-5f);
+            layer_check("BatchNorm (eval)", [] {
+                auto b = std::make_shared<BatchNorm>(3);
+                b->running_mean = {0.1f, -0.2f, 0.3f};
+                b->running_var = {1.5f, 0.7f, 2.0f};
+                b->eval();
+                return b;
+            }, img, 1e-6f);
+        }
+        auto seq = random_tensor({6, 3, 5}, 55);
+        layer_check("RNN", [] { return std::make_shared<RNN>(5, 7); }, seq, 1e-5f);
+        layer_check("LSTM", [] { return std::make_shared<LSTM>(5, 7); }, seq, 1e-5f);
+        layer_check("GRU", [] { return std::make_shared<GRU>(5, 7); }, seq, 1e-5f);
+
+        // the losses written with raw loops on the CPU
+        auto pa = random_tensor({4, 6}, 56), pb = random_tensor({4, 6}, 57), pn = random_tensor({4, 6}, 58);
+        auto loss_pair = [&](const char* what, const std::function<TensorPtr(TensorPtr, TensorPtr, TensorPtr)>& f) {
+            auto a = pa->detach(), ag = G(pa);
+            a->set_requires_grad(true);
+            ag->set_requires_grad(true);
+            auto lc = f(a, pb, pn), lgg = f(ag, G(pb), G(pn));
+            lc->backward();
+            lgg->backward();
+            double m = 0;
+            const auto x1 = ag->grad_doubles(), x2 = a->grad_doubles();
+            for (size_t j = 0; j < x2.size(); j++) m = std::max(m, std::fabs(x1[j] - x2[j]));
+            CHECK_NEAR((std::string(what) + ": value").c_str(),
+                       (float)std::fabs(lgg->item_double() - lc->item_double()), 0.0f, 1e-5f);
+            CHECK_NEAR((std::string(what) + ": gradient").c_str(), (float)m, 0.0f, 1e-5f);
+        };
+        loss_pair("huber_loss", [](TensorPtr a, TensorPtr b, TensorPtr) { return huber_loss(a, b, 0.3f); });
+        loss_pair("contrastive_loss", [](TensorPtr a, TensorPtr b, TensorPtr n) { return contrastive_loss(a, b, n, 5.0f); });
+        loss_pair("l1_regularization", [](TensorPtr a, TensorPtr, TensorPtr) { return l1_regularization({a}, 0.1f); });
+        loss_pair("l2_regularization", [](TensorPtr a, TensorPtr, TensorPtr) { return l2_regularization({a}, 0.1f); });
+        loss_pair("mse_loss", [](TensorPtr a, TensorPtr b, TensorPtr) { return mse_loss(a, b); });
+        loss_pair("bce_loss", [](TensorPtr a, TensorPtr b, TensorPtr) { return bce_loss(sigmoid(a), divide(b, 2.5f)); });
+
         PositionalEncoding pe(16, 6);
         CHECK_NEAR("PositionalEncoding", rel(pe.forward(G(pe_in)), pe.forward(pe_in)), 0.0f, 1e-6f);
 
