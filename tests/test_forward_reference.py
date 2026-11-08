@@ -558,6 +558,55 @@ def test_wider_shapes():
           arr(cv.forward(tensor([4, 3, 8, 8], xi))),
           conv2d_ref(xi, k, bias, 1, 1), atol=1e-3)
 
+    # A batch big enough that the convolutions run images in parallel, each
+    # with a single-threaded BLAS gemm -- a different code path from the small
+    # batches above. Forward against numpy; gradients against the same layer
+    # run one image at a time, which takes the sequential path.
+    rng = np.random.default_rng(11)
+    for name, layer, shape in (
+            ("Conv2D", p.Conv2D(3, 5, 3, 2, 1), (16, 3, 9, 9)),
+            ("ConvTranspose2D", p.ConvTranspose2D(4, 3, 4, 2, 1), (16, 4, 5, 5))):
+        X = rng.uniform(-1, 1, shape)
+        if name == "Conv2D":
+            k, bias = arr(layer.parameters()[0]), arr(layer.parameters()[1])
+            check("Conv2D batch 16 (parallel images) == numpy",
+                  arr(layer.forward(tensor(list(shape), X))), conv2d_ref(X, k, bias, 2, 1), atol=1e-4)
+
+        def grads(xs):
+            for t in layer.parameters():
+                t.reset_grad()
+            xt = tensor(list(xs.shape), xs)
+            xt.requires_grad = True
+            xt.reset_grad()
+            out = layer.forward(xt)
+            w = tensor(out.shape, np.linspace(-1, 1, int(np.prod(out.shape))))
+            p.sum(p.multiply(out, w), -1).backward()
+            return np.array(xt.grad), [np.array(t.grad) for t in layer.parameters()], arr(out)
+
+        gx_all, gp_all, out_all = grads(X)
+        n = int(np.prod(out_all.shape[1:]))
+        gx_one, gp_one, out_one = [], None, []
+        for b in range(shape[0]):
+            # the same per-position weights as the batched run
+            for t in layer.parameters():
+                t.reset_grad()
+            xt = tensor([1] + list(shape[1:]), X[b:b + 1])
+            xt.requires_grad = True
+            xt.reset_grad()
+            out = layer.forward(xt)
+            w = tensor(out.shape, np.linspace(-1, 1, int(np.prod(out_all.shape)))[b * n:(b + 1) * n])
+            p.sum(p.multiply(out, w), -1).backward()
+            gx_one.append(np.array(xt.grad))
+            g = [np.array(t.grad) for t in layer.parameters()]
+            gp_one = g if gp_one is None else [a + c for a, c in zip(gp_one, g)]
+            out_one.append(arr(out))
+        check("%s batch 16 forward == one image at a time" % name,
+              out_all, np.concatenate(out_one), atol=1e-5)
+        check("%s batch 16 input grad == one image at a time" % name,
+              gx_all, np.concatenate(gx_one), atol=1e-5)
+        check("%s batch 16 weight + bias grads == summed per image" % name,
+              np.concatenate(gp_all), np.concatenate(gp_one), atol=1e-4)
+
     # recurrent layers with batch > 1 and a longer sequence
     sig = lambda v: 1 / (1 + np.exp(-v))
     rnn = p.RNN(4, 6)
