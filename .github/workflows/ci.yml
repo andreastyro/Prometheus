@@ -88,6 +88,11 @@ jobs:
       - name: Python API and binding checks
         run: python tests/test_python_api.py
 
+      # Every name the README shows a reader must exist in the module. A
+      # commit that renames or removes an op fails here until the docs say so.
+      - name: README matches the API
+        run: python tests/check_readme_api.py
+
       # Every Prometheus Model: shapes, parameter bookkeeping, and that
       # gradients actually reach every parameter.
       - name: Prometheus Models

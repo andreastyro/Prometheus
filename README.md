@@ -54,9 +54,9 @@ model = p.GPT(vocab_size, max_seq_len, embed_dim=64, num_heads=4, num_layers=2, 
 opt   = p.AdamW(model.parameters(), lr=3e-3, weight_decay=0.1)
 sched = p.CosineAnnealingLR(base_lr=3e-3, T_max=200, min_lr=3e-4)
 
-ids    = p.Tensor([seq_len], [float(t) for t in input_ids])
-logits = model.forward(ids)                            # [seq_len, vocab_size]
-loss   = p.cross_entropy_sparse_seq(logits, target_ids)
+ids    = p.Tensor([batch, seq_len], input_ids, p.int64)   # token ids, exact as int64
+logits = model.forward(ids)                            # [batch, seq_len, vocab_size]
+loss   = p.cross_entropy_sparse_seq(logits, target_ids)  # targets flattened, batch * seq_len
 
 loss.backward()
 p.clip_grad_norm(model.parameters(), 1.0)
@@ -84,10 +84,12 @@ python examples/gpt_shakespeare.py path/to/text.txt  # your own corpus
 
 | | |
 |---|---|
-| **Tensor** | N-dimensional, flat storage; `zeros`, `ones`, `randn`, `reshape`, `transpose`, `detach`, `half`/`to_float`, NumPy interop via `numpy()` / `from_numpy()` |
+| **Tensor** | N-dimensional, strided storage with 64-bit shapes; `zeros`, `ones`, `full`, `randn`, `detach`, `half`/`to_float`, NumPy interop via `numpy()` / `from_numpy()` |
+| **dtype / device** | `float32`, `float64`, `float16`, `bfloat16`, `int64`, `int32`, `bool`, converted with `to`; kernels compute in float32 and refuse other dtypes rather than misread them. Device is `cpu` (the field exists so a GPU is an addition, not a redesign) |
+| **Views** | `transpose`, `permute`, `reshape`, `contiguous` — O(1), share storage, differentiable; every op accepts a view |
 | **Autograd** | Reverse-mode AD, graph built dynamically on the forward pass, `backward()` via topological sort, per-tensor `requires_grad` |
-| **Ops** | `add`, `subtract`, `multiply`, `divide`, `matmul`, `pow`, `sqrt`, `abs`, `exp`, `log`, `clip`, `sum`, `mean`, `max`, `min`, `argmax`, `broadcast_add`, `reshape_op` |
-| **Activations** | `relu`, `gelu`, `sigmoid`, `tanh`, `softmax` |
+| **Ops** | `add`, `subtract`, `multiply`, `divide` (numpy broadcasting), `matmul` (batched, broadcast batch dims), `sum`, `mean` (any dim, with keepdim), `pow_op`, `sqrt_op`, `abs_op`, `exp_op`, `log_op`, `clip`, `max_op`, `min_op`, `argmax`, `concat_op`, `linear_op` |
+| **Activations** | `relu`, `gelu`, `sigmoid`, `tanh_op`, `softmax` |
 
 ### Layers
 
@@ -114,11 +116,11 @@ Adam and AdamW persist their momentum buffers through `save_state()` / `load_sta
 
 ### Data, metrics, utilities
 
-- `DataLoader` — batching, per-epoch reshuffle; `data_split` for train/val/test
-- `read_csv`, `load_image` (PNG/JPG → tensor)
 - `accuracy`, `precision`, `recall`, `f1_score`, `confusion_matrix`, `r2_score`
 - `save_model` / `load_model`, `save_checkpoint` / `load_checkpoint` (weights + epoch + best loss)
-- `EarlyStopping`, `model_summary`, `train()` loop helper
+- `train()` loop helper
+- (C++) `DataLoader` — batching, per-epoch reshuffle; `data_split` for train/val/test
+- (C++) `read_csv`, `load_image` (PNG/JPG → tensor), `EarlyStopping`, `model_summary`
 - ONNX export via [prometheus_onnx.py](prometheus_onnx.py)
 
 ---
