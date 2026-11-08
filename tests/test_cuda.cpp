@@ -7,6 +7,12 @@
 #include "ml/tensor.hpp"
 #include "ml/utils/testing.hpp"
 #include "ml/loss.hpp"
+#include "ml/optim/adam.hpp"
+#include "ml/optim/adamw.hpp"
+#include "ml/optim/rmsprop.hpp"
+#include "ml/optim/sgd.hpp"
+#include "ml/utils/grad_clip.hpp"
+#include <cstdio>
 #include "ml/nn/linear.hpp"
 #include "ml/nn/dropout.hpp"
 #include "ml/nn/nlp/attention.hpp"
@@ -249,7 +255,30 @@ int main() {
         layer_check("Linear", [] { return std::make_shared<Linear>(16, 8); }, x3, 1e-5f);
         layer_check("MultiHeadAttention", [] { return std::make_shared<MultiHeadAttention>(16, 4); }, x3, 1e-5f);
         layer_check("causal attention with RoPE", [] { return std::make_shared<MultiHeadAttention>(16, 4, true, true); }, x3, 1e-5f);
-        layer_check("Dropout (seeded, same mask)", [] { return std::make_shared<Dropout>(0.3f); }, x3, 1e-6f);
+        {
+            // Dropout on the GPU: Philox masks. Not the CPU's mask, so check
+            // what a mask must be: the drop rate, the scale, the gradient,
+            // and exact reproduction under a seed
+            Dropout drop(0.3f);
+            auto ones = G(std::make_shared<Tensor>(Shape{100000}, std::vector<float>(100000, 1.0f)));
+            ones->set_requires_grad(true);
+            Tensor::manual_seed(4);
+            auto y = drop.forward(ones);
+            const auto v = y->to_vector();
+            int dropped = 0, scaled = 0;
+            for (float e : v) { dropped += e == 0.0f; scaled += std::fabs(e - 1.0f / 0.7f) < 1e-6f; }
+            CHECK_NEAR("dropout rate on the GPU (100k draws)", dropped / 100000.0f, 0.3f, 0.01f);
+            CHECK_TRUE("kept units scaled by 1/(1-rate)", dropped + scaled == 100000);
+            sum(y, -1)->backward();
+            const auto gv = ones->grad_doubles();
+            bool same = true;
+            for (size_t i = 0; i < v.size(); i++) same = same && std::fabs(gv[i] - v[i]) < 1e-6;
+            CHECK_TRUE("dropout gradient is the mask", same);
+            Tensor::manual_seed(4);
+            CHECK_TRUE("a seed reproduces the GPU mask", max_diff(drop.forward(ones), y) == 0.0f);
+            Tensor::manual_seed(5);
+            CHECK_TRUE("another seed gives another mask", max_diff(drop.forward(ones), y) > 0.0f);
+        }
         auto ids = std::make_shared<Tensor>(Shape{2, 5}, DType::Int64);
         ids->set_data({1, 4, 4, 0, 9, 3, 3, 7, 2, 1});
         layer_check("Embedding", [] { return std::make_shared<Embedding>(10, 6); }, ids, 1e-6f);
@@ -299,6 +328,101 @@ int main() {
         }
         CHECK_TRUE("GPT: every parameter lives on the GPU", all_on_gpu);
         CHECK_NEAR("GPT: every parameter's gradient matches the CPU", (float)(m / std::max(s, 1e-12)), 0.0f, 1e-4f);
+    }
+
+    // ── optimizers on the GPU ──
+    {
+        // run `steps` updates with fixed gradients on both devices, compare weights
+        auto opt_check = [&](const char* what, auto make_opt, int steps, float tol) {
+            auto w0 = random_tensor({300}, 61);
+            auto wc = w0->detach(), wg = G(w0);
+            wc->set_requires_grad(true);
+            wg->set_requires_grad(true);
+            auto oc = make_opt(std::vector<TensorPtr>{wc});
+            auto og = make_opt(std::vector<TensorPtr>{wg});
+            for (int s = 0; s < steps; s++) {
+                std::vector<float> g(300);
+                for (int j = 0; j < 300; j++) g[j] = std::sin(0.37f * j + 1.3f * s);
+                wc->set_grad(g);
+                wg->set_grad(g);
+                oc->step();
+                og->step();
+            }
+            CHECK_NEAR(what, rel(wg, wc), 0.0f, tol);
+        };
+        opt_check("SGD with momentum, 20 steps", [](std::vector<TensorPtr> p) { return std::make_shared<SGD>(p, 0.05f, 0.9f); }, 20, 1e-6f);
+        opt_check("SGD, 20 steps", [](std::vector<TensorPtr> p) { return std::make_shared<SGD>(p, 0.05f); }, 20, 1e-6f);
+        opt_check("Adam, 20 steps", [](std::vector<TensorPtr> p) { return std::make_shared<Adam>(p, 0.01f); }, 20, 1e-6f);
+        opt_check("AdamW, 20 steps", [](std::vector<TensorPtr> p) { return std::make_shared<AdamW>(p, 0.01f); }, 20, 1e-6f);
+        opt_check("RMSprop, 20 steps", [](std::vector<TensorPtr> p) { return std::make_shared<RMSprop>(p, 0.01f); }, 20, 1e-6f);
+
+        // gradient clipping: the same norm and the same clipped gradients
+        auto pc = random_tensor({1000}, 62), pg = G(pc);
+        pc->set_requires_grad(true);
+        pg->set_requires_grad(true);
+        std::vector<float> g(1000);
+        for (int j = 0; j < 1000; j++) g[j] = std::cos(0.11f * j) * 3.0f;
+        pc->set_grad(g);
+        pg->set_grad(g);
+        std::vector<TensorPtr> lc{pc}, lg{pg};
+        const float nc = clip_grad_norm(lc, 1.0f), ng = clip_grad_norm(lg, 1.0f);
+        CHECK_NEAR("clip_grad_norm: the norm", std::fabs(nc - ng) / nc, 0.0f, 1e-6f);
+        double m = 0;
+        const auto a = pg->grad_doubles(), b = pc->grad_doubles();
+        for (size_t j = 0; j < b.size(); j++) m = std::max(m, std::fabs(a[j] - b[j]));
+        CHECK_NEAR("clip_grad_norm: the clipped gradients", (float)m, 0.0f, 1e-6f);
+    }
+
+    // ── the milestone: training a GPT on the GPU tracks the CPU step for step ──
+    {
+        Tensor::manual_seed(8);
+        GPT cpu(40, 16, 32, 4, 2);
+        Tensor::manual_seed(8);
+        GPT gpu(40, 16, 32, 4, 2);
+        AdamW oc(cpu.parameters(), 3e-3f);
+        AdamW og(gpu.parameters(), 3e-3f);    // built before the move: must follow it
+        gpu.to(Device::CUDA);
+        auto ids = std::make_shared<Tensor>(Shape{2, 12}, DType::Int64);
+        std::vector<float> v(24);
+        std::vector<int> targets(24);
+        for (int i = 0; i < 24; i++) { v[i] = (float)((i * 5 + 1) % 40); targets[i] = (i * 5 + 6) % 40; }
+        ids->set_data(v);
+        auto idg = ids->to(Device::CUDA);
+        float first = 0, last_c = 0, last_g = 0, worst = 0, first_gap = 0;
+        for (int step = 0; step < 15; step++) {
+            oc.zero_grad();
+            og.zero_grad();
+            auto lc = cross_entropy_sparse_seq(cpu.forward(ids), targets);
+            auto lg = cross_entropy_sparse_seq(gpu.forward(idg), targets);
+            lc->backward();
+            lg->backward();
+            std::vector<TensorPtr> pc = cpu.parameters(), pg = gpu.parameters();
+            clip_grad_norm(pc, 1.0f);
+            clip_grad_norm(pg, 1.0f);
+            oc.step();
+            og.step();
+            last_c = (float)lc->item_double();
+            last_g = (float)lg->item_double();
+            const float gap = std::fabs(last_c - last_g) / last_c;
+            if (step == 0) { first = last_c; first_gap = gap; }
+            worst = std::max(worst, gap);
+        }
+        std::printf("  GPT, 15 AdamW steps: loss %.4f -> CPU %.4f, GPU %.4f\n", first, last_c, last_g);
+        CHECK_TRUE("GPT training on the GPU lowers the loss", last_g < first * 0.8f);
+        // A wrong kernel shows at step 0. After that the two devices' float
+        // rounding differs by ~1e-6 a step, and Adam's m / sqrt(v) magnifies
+        // differences in near-zero gradients, so the curves drift apart
+        // slowly: bounded, not exact.
+        CHECK_NEAR("GPT step 0: the same loss on both devices", first_gap, 0.0f, 1e-5f);
+        CHECK_NEAR("GPT loss curve on the GPU tracks the CPU (15 steps, drift)", worst, 0.0f, 1e-3f);
+
+        // optimizer state round-trips through a file from the GPU
+        og.save_state("_test_cuda_adamw.bin");
+        AdamW og2(gpu.parameters(), 3e-3f);
+        og2.load_state("_test_cuda_adamw.bin");
+        std::remove("_test_cuda_adamw.bin");
+        CHECK_TRUE("AdamW state saved from the GPU reloads", og2.t == og.t && og2.m.size() == og.m.size() &&
+                   og2.m[0] == og.m[0] && og2.v[3] == og.v[3]);
     }
 
     // a CPU leaf that goes to the GPU and back gets its gradient on the CPU

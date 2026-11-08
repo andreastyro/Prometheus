@@ -2,6 +2,7 @@
 #include <cmath>
 #include "ml/autograd.hpp"
 #include "ml/optim/rmsprop.hpp"
+#include "../ops_internal.hpp"
 #include <stdio.h>
 #include <algorithm>
 #include <vector>
@@ -26,6 +27,12 @@ void RMSprop::step(){
     const float b = beta, lr_ = lr, eps_ = eps;
     for (int i = 0; i < (int)parameters.size(); i++){
         auto& p = parameters[i];
+        if (p->device() == Device::CUDA) {   // the update runs on the GPU
+            const float* gd = device_grad(p);
+            if (!gd) continue;
+            cuda_ops::rmsprop_step(device_weights(p), gd, v_dev.get(i, v[i]), p->numel(), lr_, b, eps_);
+            continue;
+        }
         const int n = (int)p->numel();
         float* w = p->data();
         const float* g = p->grad();

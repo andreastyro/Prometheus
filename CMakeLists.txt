@@ -24,6 +24,7 @@ set(SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/dropout.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/sequential.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/optim/sgd.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/optim/device_state.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/optim/adam.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/optim/rmsprop.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/data/dataloader.cpp

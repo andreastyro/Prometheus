@@ -852,4 +852,157 @@ TensorPtr matmul(const TensorPtr& a0, const TensorPtr& b0) {
     return out;
 }
 
+// ── fused LayerNorm forward, dropout masks, optimizer updates ─────────────────
+
+static const string& FUSED_SRC() {
+    static const string s = src(R"(
+// y = (x - mean) / sqrt(var + eps) * gamma + beta over rows of `cols`; one block per row
+extern "C" __global__ void f_layernorm(const float* x, const float* g, const float* b, float* y,
+                                       long long cols, float eps) {
+    __shared__ float s[256];
+    const float* row = x + (long long)blockIdx.x * cols;
+    float* out = y + (long long)blockIdx.x * cols;
+    float t = 0.0f;
+    for (long long j = threadIdx.x; j < cols; j += blockDim.x) t += row[j];
+    s[threadIdx.x] = t;
+    __syncthreads();
+    for (int w = blockDim.x / 2; w > 0; w >>= 1) { if (threadIdx.x < w) s[threadIdx.x] += s[threadIdx.x + w]; __syncthreads(); }
+    const float mean = s[0] / (float)cols;
+    __syncthreads();
+    t = 0.0f;
+    for (long long j = threadIdx.x; j < cols; j += blockDim.x) { float d = row[j] - mean; t += d * d; }
+    s[threadIdx.x] = t;
+    __syncthreads();
+    for (int w = blockDim.x / 2; w > 0; w >>= 1) { if (threadIdx.x < w) s[threadIdx.x] += s[threadIdx.x + w]; __syncthreads(); }
+    const float inv = rsqrtf(s[0] / (float)cols + eps);
+    for (long long j = threadIdx.x; j < cols; j += blockDim.x) out[j] = (row[j] - mean) * inv * g[j] + b[j];
+}
+
+// Philox-4x32-10 (Salmon et al. 2011, what cuRAND and PyTorch use): element
+// i's uniform comes from counter i and the key, so the mask is the same
+// whatever the launch shape, and a seed reproduces it exactly
+__device__ unsigned int mulhi(unsigned int a, unsigned int b) { return (unsigned int)(((unsigned long long)a * b) >> 32); }
+__device__ float philox_uniform(unsigned long long seed, unsigned long long i) {
+    unsigned int c0 = (unsigned int)i, c1 = (unsigned int)(i >> 32), c2 = 0, c3 = 0;
+    unsigned int k0 = (unsigned int)seed, k1 = (unsigned int)(seed >> 32);
+    for (int r = 0; r < 10; r++) {
+        unsigned int h0 = mulhi(0xD2511F53u, c0), l0 = 0xD2511F53u * c0;
+        unsigned int h1 = mulhi(0xCD9E8D57u, c2), l1 = 0xCD9E8D57u * c2;
+        unsigned int n0 = h1 ^ c1 ^ k0, n2 = h0 ^ c3 ^ k1;
+        c0 = n0; c1 = l1; c2 = n2; c3 = l0;
+        k0 += 0x9E3779B9u; k1 += 0xBB67AE85u;
+    }
+    return (c0 >> 8) * (1.0f / 16777216.0f);      // 24 bits: [0, 1)
+}
+extern "C" __global__ void f_dropout_mask(float* mask, long long n, unsigned long long seed, float rate, float scale) {
+    long long i = gid(); if (i >= n) return;
+    mask[i] = philox_uniform(seed, (unsigned long long)i) < rate ? 0.0f : scale;
+}
+
+// optimizer updates, one thread per parameter element
+extern "C" __global__ void o_sgd(float* w, const float* g, float* v, long long n, float lr, float mu) {
+    long long i = gid(); if (i >= n) return;
+    if (v) { v[i] = mu * v[i] + g[i]; w[i] -= lr * v[i]; }
+    else w[i] -= lr * g[i];
+}
+extern "C" __global__ void o_adam(float* w, const float* g, float* m, float* v, long long n, float lr,
+                                  float b1, float b2, float bc1, float bc2, float eps, float decay) {
+    long long i = gid(); if (i >= n) return;
+    float gi = g[i];
+    m[i] = b1 * m[i] + (1.0f - b1) * gi;
+    v[i] = b2 * v[i] + (1.0f - b2) * gi * gi;
+    w[i] = w[i] * decay - lr * (m[i] / bc1) / (sqrtf(v[i] / bc2) + eps);
+}
+extern "C" __global__ void o_rmsprop(float* w, const float* g, float* v, long long n, float lr, float b, float eps) {
+    long long i = gid(); if (i >= n) return;
+    float gi = g[i];
+    v[i] = b * v[i] + (1.0f - b) * gi * gi;
+    w[i] -= lr * gi / (sqrtf(v[i]) + eps);
+}
+// sum of squares, one partial per block; and in-place scaling
+extern "C" __global__ void o_sumsq(const float* a, float* part, long long n) {
+    __shared__ float s[256];
+    float acc = 0.0f;
+    for (long long i = gid(); i < n; i += (long long)gridDim.x * blockDim.x) acc += a[i] * a[i];
+    s[threadIdx.x] = acc;
+    __syncthreads();
+    for (int w = blockDim.x / 2; w > 0; w >>= 1) { if (threadIdx.x < w) s[threadIdx.x] += s[threadIdx.x + w]; __syncthreads(); }
+    if (threadIdx.x == 0) part[blockIdx.x] = s[0];
+}
+extern "C" __global__ void o_scale(float* a, long long n, float c) {
+    long long i = gid(); if (i >= n) return;
+    a[i] *= c;
+}
+)");
+    return s;
+}
+
+TensorPtr layernorm(const TensorPtr& x0, const TensorPtr& g0, const TensorPtr& b0, float eps) {
+    auto x = contiguous_on_device(f32(x0, "LayerNorm"));
+    auto g = contiguous_on_device(f32(g0, "LayerNorm")), b = contiguous_on_device(f32(b0, "LayerNorm"));
+    long long cols = x->shape().back();
+    if (g->numel() != cols || b->numel() != cols)
+        throw runtime_error("LayerNorm: gamma and beta must have " + to_string(cols) + " elements");
+    const long long rows = cols ? x->numel() / cols : 0;
+    auto out = empty_cuda(x->shape());
+    const void* px = base(x);
+    const void* pg = base(g);
+    const void* pb = base(b);
+    void* py = out->storage()->data();
+    void* args[] = {&px, &pg, &pb, &py, &cols, &eps};
+    if (rows) cuda::launch(K("f_layernorm", FUSED_SRC()), (unsigned)rows, 1, 1, 256, 1, 1, 0, args);
+    return out;
+}
+
+TensorPtr dropout_mask(const Shape& shape, uint64_t seed, float rate) {
+    auto mask = empty_cuda(shape);
+    void* pm = mask->storage()->data();
+    long long n = mask->numel();
+    unsigned long long s = seed;
+    float r = rate, scale = 1.0f / (1.0f - rate);
+    void* args[] = {&pm, &n, &s, &r, &scale};
+    cuda::launch(K("f_dropout_mask", FUSED_SRC()), n, args);
+    return mask;
+}
+
+void sgd_step(float* w, const float* g, float* v, int64_t n, float lr, float mu) {
+    long long nn = n;
+    void* args[] = {&w, &g, &v, &nn, &lr, &mu};
+    cuda::launch(K("o_sgd", FUSED_SRC()), nn, args);
+}
+
+void adam_step(float* w, const float* g, float* m, float* v, int64_t n, float lr, float b1, float b2,
+               float bc1, float bc2, float eps, float decay) {
+    long long nn = n;
+    void* args[] = {&w, &g, &m, &v, &nn, &lr, &b1, &b2, &bc1, &bc2, &eps, &decay};
+    cuda::launch(K("o_adam", FUSED_SRC()), nn, args);
+}
+
+void rmsprop_step(float* w, const float* g, float* v, int64_t n, float lr, float b, float eps) {
+    long long nn = n;
+    void* args[] = {&w, &g, &v, &nn, &lr, &b, &eps};
+    cuda::launch(K("o_rmsprop", FUSED_SRC()), nn, args);
+}
+
+double sum_squares(const float* a, int64_t n) {
+    if (n <= 0) return 0.0;
+    const long long blocks = min<long long>((n + 255) / 256, 1024);
+    auto part = empty_cuda({blocks});
+    void* pp = part->storage()->data();
+    long long nn = n;
+    void* args[] = {&a, &pp, &nn};
+    cuda::launch(K("o_sumsq", FUSED_SRC()), (unsigned)blocks, 1, 1, 256, 1, 1, 0, args);
+    vector<float> h((size_t)blocks);
+    cuda::copy_to_host(h.data(), pp, h.size() * sizeof(float));
+    double total = 0.0;
+    for (float v : h) total += v;
+    return total;
+}
+
+void scale_inplace(float* a, int64_t n, float c) {
+    long long nn = n;
+    void* args[] = {&a, &nn, &c};
+    cuda::launch(K("o_scale", FUSED_SRC()), nn, args);
+}
+
 } // namespace cuda_ops

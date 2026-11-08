@@ -1,3 +1,4 @@
+#include "../ops_internal.hpp"
 #include "ml/nn/dropout.hpp"
 #include "ml/ops.hpp"
 #include "ml/tensor.hpp"
@@ -29,11 +30,12 @@ TensorPtr Dropout::forward(TensorPtr input){
     const int   n     = input->num_el();
 
     if (input->device() == Device::CUDA) {
-        // the mask comes from the same host RNG as on the CPU, so a seeded
-        // run drops the same units on either device
-        vector<float> mask(n);
-        for (int i = 0; i < n; i++) mask[i] = dist(prometheus_rng()) < rate ? 0.0f : scale;
-        return multiply(input, make_shared<Tensor>(input->shape(), mask)->to(Device::CUDA));
+        // the mask is made on the device by Philox, keyed from the library's
+        // RNG: Tensor::manual_seed reproduces it exactly, though it is not
+        // the CPU's mask for the same seed
+        const uint64_t seed = ((uint64_t)prometheus_rng()() << 32) ^ (uint64_t)prometheus_rng()();
+        (void)scale;
+        return multiply(input, cuda_ops::dropout_mask(input->shape(), seed, rate));
     }
 
     auto result = make_shared<Tensor>(input->shape());

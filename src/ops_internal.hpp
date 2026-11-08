@@ -121,4 +121,15 @@ TensorPtr concat(const std::vector<TensorPtr>& inputs, int axis);
 TensorPtr matmul(const TensorPtr& a, const TensorPtr& b);
 /// mean over rows of -log softmax(logits)[target]
 TensorPtr cross_entropy(const TensorPtr& logits, const std::vector<int>& targets);
+/// LayerNorm forward over the last dim, one fused kernel (no graph)
+TensorPtr layernorm(const TensorPtr& x, const TensorPtr& gamma, const TensorPtr& beta, float eps);
+/// float32 mask of `shape`: 0 with probability `rate`, else 1/(1-rate). Philox, keyed by `seed`.
+TensorPtr dropout_mask(const Shape& shape, uint64_t seed, float rate);
+// optimizer updates on device buffers; v may be null for plain SGD
+void sgd_step(float* w, const float* g, float* v, int64_t n, float lr, float mu);
+void adam_step(float* w, const float* g, float* m, float* v, int64_t n, float lr, float b1, float b2,
+               float bc1, float bc2, float eps, float decay);
+void rmsprop_step(float* w, const float* g, float* v, int64_t n, float lr, float b, float eps);
+double sum_squares(const float* a, int64_t n);
+void scale_inplace(float* a, int64_t n, float c);
 }

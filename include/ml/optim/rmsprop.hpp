@@ -22,6 +22,7 @@ public:
     float eps;  // small constant to prevent division by zero
 
     std::vector<std::vector<float>> v; // running average of squared gradients per parameter
+    DeviceBuffers v_dev;               // its GPU copy, for GPU parameters
 
     RMSprop(std::vector<TensorPtr> params, float lr = 0.001f, float beta = 0.9f, float eps = 1e-8f);
 

@@ -25,6 +25,7 @@ public:
     float momentum; // 0 = no momentum (plain SGD), 0.9 is a common value
 
     std::vector<std::vector<float>> velocity; // one velocity vector per parameter tensor
+    DeviceBuffers velocity_dev;               // its GPU copy, for GPU parameters
 
     SGD(std::vector<TensorPtr> params, float lr, float momentum = 0.0f);
 

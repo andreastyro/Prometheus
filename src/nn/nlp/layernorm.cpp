@@ -1,3 +1,4 @@
+#include "../../ops_internal.hpp"
 #include "ml/nn/nlp/layernorm.hpp"
 #include "ml/ops.hpp"
 #include "ml/autograd.hpp"
@@ -31,8 +32,18 @@ static TensorPtr layernorm_ops(const TensorPtr& x, const TensorPtr& g, const Ten
 }
 
 TensorPtr LayerNorm::forward(TensorPtr input) {
-    if (input->device() == Device::CUDA || gamma->device() == Device::CUDA)
-        return layernorm_ops(input, gamma, beta, eps);
+    if (input->device() == Device::CUDA || gamma->device() == Device::CUDA) {
+        // one fused kernel forward; the gradient differentiates the op form
+        auto out = cuda_ops::layernorm(input, gamma, beta, eps);
+        if (input->requires_grad() || gamma->requires_grad() || beta->requires_grad()) {
+            auto node = make_node(out, {input, gamma, beta});
+            node->name = "LayerNorm::forward";
+            autograd::attach_reference(*node, [eps = eps](const std::vector<TensorPtr>& in) -> TensorPtr {
+                return layernorm_ops(in[0], in[1], in[2], eps);
+            });
+        }
+        return out;
+    }
     input = checked_input("LayerNorm", input);
     int N       = normalized_shape;
     int num_rows = input->num_el() / N;

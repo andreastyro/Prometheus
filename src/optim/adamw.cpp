@@ -1,4 +1,5 @@
 #include "ml/optim/adamw.hpp"
+#include "../ops_internal.hpp"
 #include <cmath>
 #include <fstream>
 #include <stdexcept>
@@ -29,6 +30,13 @@ void AdamW::step() {
 
     for (int i = 0; i < (int)parameters.size(); i++) {
         auto& p = parameters[i];
+        if (p->device() == Device::CUDA) {   // the update runs on the GPU
+            const float* gd = device_grad(p);
+            if (!gd) continue;
+            cuda_ops::adam_step(device_weights(p), gd, m_dev.get(i, m[i]), v_dev.get(i, v[i]), p->numel(),
+                                lr_, b1, b2, bc1, bc2, eps_, decay);
+            continue;
+        }
         const int n = (int)p->numel();
         float* w = p->data();
         const float* g = p->grad();
@@ -47,6 +55,10 @@ void AdamW::step() {
 }
 
 void AdamW::save_state(const string& path) const {
+    for (size_t i = 0; i < m.size(); i++) {       // GPU state comes home first
+        m_dev.to_host(i, const_cast<vector<float>&>(m[i]));
+        v_dev.to_host(i, const_cast<vector<float>&>(v[i]));
+    }
     ofstream file(path, ios::binary);
     if (!file) throw runtime_error("AdamW::save_state: cannot open " + path);
 
@@ -72,6 +84,8 @@ void AdamW::load_state(const string& path) {
 
     m.resize(n_params);
     v.resize(n_params);
+    m_dev.reset();
+    v_dev.reset();
     for (int i = 0; i < n_params; i++) {
         int sz;
         file.read(reinterpret_cast<char*>(&sz), sizeof(int));

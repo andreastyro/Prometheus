@@ -1,6 +1,7 @@
 #include "ml/tensor.hpp"
 #include "ml/autograd.hpp"
 #include "ml/optim/adam.hpp"
+#include "../ops_internal.hpp"
 #include <stdio.h>
 #include <algorithm>
 #include <vector>
@@ -33,6 +34,13 @@ void Adam::step(){
     for (int i = 0; i < (int)parameters.size(); i++){
 
         auto& p = parameters[i];
+        if (p->device() == Device::CUDA) {   // the update runs on the GPU
+            const float* gd = device_grad(p);
+            if (!gd) continue;
+            cuda_ops::adam_step(device_weights(p), gd, m_dev.get(i, m[i]), v_dev.get(i, v[i]), p->numel(),
+                                lr, beta1, beta2, bc1, bc2, eps, 1.0f);
+            continue;
+        }
         const int n = p->num_el();
 
         // m_hat and v_hat used to be declared outside both loops, which made
@@ -51,6 +59,10 @@ void Adam::step(){
 }
 
 void Adam::save_state(const std::string& path) const {
+    for (size_t i = 0; i < m.size(); i++) {       // GPU state comes home first
+        m_dev.to_host(i, const_cast<std::vector<float>&>(m[i]));
+        v_dev.to_host(i, const_cast<std::vector<float>&>(v[i]));
+    }
     std::ofstream file(path, std::ios::binary);
     if (!file) throw std::runtime_error("Adam::save_state: cannot open " + path);
 
@@ -76,6 +88,8 @@ void Adam::load_state(const std::string& path) {
 
     m.resize(n_params);
     v.resize(n_params);
+    m_dev.reset();
+    v_dev.reset();
     for (int i = 0; i < n_params; i++) {
         int sz;
         file.read(reinterpret_cast<char*>(&sz), sizeof(int));

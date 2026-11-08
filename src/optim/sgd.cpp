@@ -2,6 +2,7 @@
 #include <cmath>
 #include "ml/autograd.hpp"
 #include "ml/optim/sgd.hpp"
+#include "../ops_internal.hpp"
 #include <stdio.h>
 #include <algorithm>
 #include <vector>
@@ -27,6 +28,13 @@ SGD::SGD(vector<TensorPtr> params, float lr, float momentum){
 void SGD::step(){
     for (int i = 0; i < (int)parameters.size(); i++){
         auto& p = parameters[i];
+        if (p->device() == Device::CUDA) {   // the update runs on the GPU
+            const float* gd = device_grad(p);
+            if (!gd) continue;
+            cuda_ops::sgd_step(device_weights(p), gd, momentum != 0.0f ? velocity_dev.get(i, velocity[i]) : nullptr,
+                               p->numel(), lr, momentum);
+            continue;
+        }
         const int n = (int)p->numel();
         float* w = p->data();
         const float* g = p->grad();
