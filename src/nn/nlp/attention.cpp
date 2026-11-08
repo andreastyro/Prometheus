@@ -1,3 +1,4 @@
+#include "../../ops_internal.hpp"
 #include "ml/nn/nlp/attention.hpp"
 #include "ml/ops.hpp"
 #include "ml/autograd.hpp"
@@ -125,8 +126,13 @@ TensorPtr MultiHeadAttention::forward_rows(TensorPtr input, int batch) {
             O = reshape(permute(O, {0, 2, 1, 3}), {b * s, e});
             return matmul(O, in[4]);
         };
-    if (input->device() == Device::CUDA || W_q->device() == Device::CUDA)
-        return reference({input, W_q, W_k, W_v, W_o});
+    if (input->device() == Device::CUDA || W_q->device() == Device::CUDA) {
+        if (rope_) return reference({input, W_q, W_k, W_v, W_o});     // RoPE: the op form
+        // the fused GPU kernel reads every head straight out of the projections
+        auto x3 = reshape(input, {(int64_t)B, (int64_t)S, (int64_t)E});
+        auto o = cuda_ops::attention(matmul(x3, W_q), matmul(x3, W_k), matmul(x3, W_v), H, causal_);
+        return matmul(reshape(o, {(int64_t)B * S, (int64_t)E}), W_o);
+    }
 
     // ── Forward ──────────────────────────────────────────────────────────────
     // Q = input @ W_q,  K = input @ W_k,  V = input @ W_v   each [S, E]

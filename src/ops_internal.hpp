@@ -139,4 +139,6 @@ std::vector<TensorPtr> layernorm_backward(const TensorPtr& x, const TensorPtr& g
 TensorPtr gelu_backward(const TensorPtr& x, const TensorPtr& G);
 /// rows of W picked by ids, as `out_shape`; backward is a scatter-add kernel
 TensorPtr embedding(const TensorPtr& W, const std::vector<int64_t>& ids, const Shape& out_shape);
+/// softmax(Q K^T / sqrt(D) + causal mask) V per head; q, k, v and the result [B, S, E]
+TensorPtr attention(const TensorPtr& q, const TensorPtr& k, const TensorPtr& v, int heads, bool causal);
 }

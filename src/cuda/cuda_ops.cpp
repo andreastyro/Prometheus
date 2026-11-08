@@ -7,6 +7,7 @@
 // keep in step with the forward, and the gradients are differentiable again.
 #include "../ops_internal.hpp"
 #include "ml/cuda.hpp"
+#include <cmath>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -1337,6 +1338,148 @@ TensorPtr embedding(const TensorPtr& W0, const vector<int64_t>& ids, const Shape
         };
     }
     return out;
+}
+
+// ── fused attention ──────────────────────────────────────────────────────────
+//
+// softmax(scale * Q K^T + causal mask) V for every head, with Q, K, V and the
+// output in [B, S, E] -- heads side by side in each row, as the projections
+// produce them. Head h of sequence b starts at b*S*E + h*D with a row stride
+// of E, and the H heads of one sequence are a strided batch of stride D, so
+// cuBLAS reads them in place: no permute, no copies. Per sequence: one batched
+// gemm for the scores, one kernel for scale + mask + softmax, one batched gemm
+// for P V. The backward is four batched gemms and one kernel for the softmax
+// gradient. With create_graph the op form runs instead.
+
+static const string& ATTN_SRC() {
+    static const string s = src(R"(
+// rows of S scores: P = softmax(scale * s), with j > i masked when causal; in place
+extern "C" __global__ void a_softmax(float* sc, long long cols, float scale, int causal) {
+    __shared__ float s[256];
+    float* row = sc + (long long)blockIdx.x * cols;
+    const long long i = blockIdx.x % cols;              // the query's position
+    const long long last = causal ? i : cols - 1;
+    float m = -3.402823466e38f;
+    for (long long j = threadIdx.x; j <= last; j += blockDim.x) m = fmaxf(m, row[j] * scale);
+    s[threadIdx.x] = m;
+    __syncthreads();
+    for (int w = blockDim.x / 2; w > 0; w >>= 1) { if (threadIdx.x < w) s[threadIdx.x] = fmaxf(s[threadIdx.x], s[threadIdx.x + w]); __syncthreads(); }
+    m = s[0];
+    __syncthreads();
+    float t = 0.0f;
+    for (long long j = threadIdx.x; j < cols; j += blockDim.x) {
+        const float e = j <= last ? expf(row[j] * scale - m) : 0.0f;
+        row[j] = e;
+        t += e;
+    }
+    s[threadIdx.x] = t;
+    __syncthreads();
+    for (int w = blockDim.x / 2; w > 0; w >>= 1) { if (threadIdx.x < w) s[threadIdx.x] += s[threadIdx.x + w]; __syncthreads(); }
+    const float inv = 1.0f / s[0];
+    for (long long j = threadIdx.x; j < cols; j += blockDim.x) row[j] *= inv;
+}
+// dS = scale * P * (dP - sum(dP * P)) per row, in place on dP
+extern "C" __global__ void a_softmax_back(const float* P, float* dP, long long cols, float scale) {
+    __shared__ float s[256];
+    const float* p = P + (long long)blockIdx.x * cols;
+    float* d = dP + (long long)blockIdx.x * cols;
+    float t = 0.0f;
+    for (long long j = threadIdx.x; j < cols; j += blockDim.x) t += d[j] * p[j];
+    s[threadIdx.x] = t;
+    __syncthreads();
+    for (int w = blockDim.x / 2; w > 0; w >>= 1) { if (threadIdx.x < w) s[threadIdx.x] += s[threadIdx.x + w]; __syncthreads(); }
+    const float dot = s[0];
+    for (long long j = threadIdx.x; j < cols; j += blockDim.x) d[j] = scale * p[j] * (d[j] - dot);
+}
+)");
+    return s;
+}
+
+TensorPtr attention(const TensorPtr& q0, const TensorPtr& k0, const TensorPtr& v0, int heads, bool causal) {
+    auto q = contiguous_on_device(f32(q0, "attention")), k = contiguous_on_device(f32(k0, "attention"));
+    auto v = contiguous_on_device(f32(v0, "attention"));
+    if (q->dim() != 3 || q->shape() != k->shape() || q->shape() != v->shape())
+        throw runtime_error("attention: q, k and v must all be [batch, seq, embed]");
+    const int64_t B = q->size(0), S = q->size(1), E = q->size(2), H = heads, D = E / H;
+    if (D * H != E) throw runtime_error("attention: embed must divide by heads");
+    const float scale = 1.0f / std::sqrt((float)D);
+    auto P = empty_cuda({B, H, S, S});
+    auto O = empty_cuda({B, S, E});
+    const float* pq = static_cast<const float*>(base(q));
+    const float* pk = static_cast<const float*>(base(k));
+    const float* pv = static_cast<const float*>(base(v));
+    float* pp = static_cast<float*>(P->storage()->data());
+    float* po = static_cast<float*>(O->storage()->data());
+    const int s_ = (int)S, d_ = (int)D, e_ = (int)E, h_ = (int)H;
+    for (int64_t b = 0; b < B; b++)       // scores = Q K^T, every head of sequence b
+        cuda::sgemm_batched(false, true, s_, s_, d_, 1.0f, pq + b * S * E, e_, D, pk + b * S * E, e_, D,
+                            0.0f, pp + b * H * S * S, s_, S * S, h_);
+    long long cols = S;
+    int cz = causal ? 1 : 0;
+    float sc = scale;
+    void* a1[] = {&pp, &cols, &sc, &cz};
+    if (B * H * S) cuda::launch(K("a_softmax", ATTN_SRC()), (unsigned)(B * H * S), 1, 1, 256, 1, 1, 0, a1);
+    for (int64_t b = 0; b < B; b++)       // O = P V, written into the heads' columns
+        cuda::sgemm_batched(false, false, s_, d_, s_, 1.0f, pp + b * H * S * S, s_, S * S, pv + b * S * E, e_, D,
+                            0.0f, po + b * S * E, e_, D, h_);
+
+    if (q->requires_grad() || k->requires_grad() || v->requires_grad()) {
+        auto node = make_node(O, {q, k, v});
+        node->name = "attention";
+        // the op form: what higher-order gradients differentiate
+        autograd::attach_reference(*node, [B, S, E, H, D, scale, causal](const vector<TensorPtr>& in) -> TensorPtr {
+            auto heads_of = [&](const TensorPtr& t) { return permute(reshape(t, {B, S, H, D}), {0, 2, 1, 3}); };
+            auto scores = multiply(scale, ::matmul(heads_of(in[0]), transpose(heads_of(in[1]))));
+            if (causal) {
+                vector<float> m((size_t)(S * S), 0.0f);
+                for (int64_t i = 0; i < S; i++) for (int64_t j = i + 1; j < S; j++) m[(size_t)(i * S + j)] = -1e9f;
+                scores = add(scores, make_shared<Tensor>(Shape{S, S}, m)->to(Device::CUDA));
+            }
+            auto o = ::matmul(::softmax(scores), heads_of(in[2]));
+            return reshape(permute(o, {0, 2, 1, 3}), {B, S, E});
+        });
+        auto reference = node->backward_graph;
+        node->backward_graph = [reference, q, k, v, P, B, S, E, H, D, scale](const TensorPtr& out,
+                                                                           const TensorPtr& G0) -> vector<TensorPtr> {
+            if (grad_enabled()) return reference(out, G0);
+            auto G = contiguous_on_device(f32(G0, "attention"));
+            auto dP = empty_cuda({B, H, S, S});
+            auto dQ = empty_cuda({B, S, E}), dK = empty_cuda({B, S, E}), dV = empty_cuda({B, S, E});
+            const float* pq = static_cast<const float*>(base(q));
+            const float* pk = static_cast<const float*>(base(k));
+            const float* pv = static_cast<const float*>(base(v));
+            const float* pp = static_cast<const float*>(base(P));
+            const float* pg = static_cast<const float*>(base(G));
+            float* pdp = static_cast<float*>(dP->storage()->data());
+            float* pdq = static_cast<float*>(dQ->storage()->data());
+            float* pdk = static_cast<float*>(dK->storage()->data());
+            float* pdv = static_cast<float*>(dV->storage()->data());
+            const int s_ = (int)S, d_ = (int)D, e_ = (int)E, h_ = (int)H;
+            for (int64_t b = 0; b < B; b++) {
+                const int64_t ob = b * S * E, pb = b * H * S * S;
+                // dV = P^T dO;  dP = dO V^T
+                cuda::sgemm_batched(true, false, s_, d_, s_, 1.0f, pp + pb, s_, S * S, pg + ob, e_, D,
+                                    0.0f, pdv + ob, e_, D, h_);
+                cuda::sgemm_batched(false, true, s_, s_, d_, 1.0f, pg + ob, e_, D, pv + ob, e_, D,
+                                    0.0f, pdp + pb, s_, S * S, h_);
+            }
+            long long cols = S;
+            float sc = scale;
+            void* a2[] = {&pp, &pdp, &cols, &sc};
+            if (B * H * S) cuda::launch(K("a_softmax_back", ATTN_SRC()), (unsigned)(B * H * S), 1, 1, 256, 1, 1, 0, a2);
+            for (int64_t b = 0; b < B; b++) {
+                const int64_t ob = b * S * E, pb = b * H * S * S;
+                // dQ = dS K;  dK = dS^T Q
+                cuda::sgemm_batched(false, false, s_, d_, s_, 1.0f, pdp + pb, s_, S * S, pk + ob, e_, D,
+                                    0.0f, pdq + ob, e_, D, h_);
+                cuda::sgemm_batched(true, false, s_, d_, s_, 1.0f, pdp + pb, s_, S * S, pq + ob, e_, D,
+                                    0.0f, pdk + ob, e_, D, h_);
+            }
+            return {q->requires_grad() ? dQ : nullptr, k->requires_grad() ? dK : nullptr,
+                    v->requires_grad() ? dV : nullptr};
+        };
+    }
+    return O;
 }
 
 } // namespace cuda_ops

@@ -266,6 +266,23 @@ int main() {
         layer_check("Linear", [] { return std::make_shared<Linear>(16, 8); }, x3, 1e-5f);
         layer_check("MultiHeadAttention", [] { return std::make_shared<MultiHeadAttention>(16, 4); }, x3, 1e-5f);
         layer_check("causal attention with RoPE", [] { return std::make_shared<MultiHeadAttention>(16, 4, true, true); }, x3, 1e-5f);
+        layer_check("causal attention (fused kernel)", [] { return std::make_shared<MultiHeadAttention>(16, 4, true, false); }, x3, 1e-5f);
+        {
+            // second derivative through the fused attention: the op form with create_graph
+            auto second = [](const TensorPtr& x, MultiHeadAttention& m) {
+                auto g = autograd::grad(sum(tanh_op(m.forward(x)), -1), {x}, true)[0];
+                return autograd::grad(sum(multiply(g, g), -1), {x})[0];
+            };
+            Tensor::manual_seed(31);
+            MultiHeadAttention mc(16, 4, true, false);
+            Tensor::manual_seed(31);
+            MultiHeadAttention mg(16, 4, true, false);
+            mg.to(Device::CUDA);
+            auto xa = x3->detach(), xb = G(x3);
+            xa->set_requires_grad(true);
+            xb->set_requires_grad(true);
+            CHECK_NEAR("second derivative through the fused attention", rel(second(xb, mg), second(xa, mc)), 0.0f, 1e-4f);
+        }
         {
             // Dropout on the GPU: Philox masks. Not the CPU's mask, so check
             // what a mask must be: the drop rate, the scale, the gradient,
