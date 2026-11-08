@@ -52,6 +52,21 @@ void  synchronize();
 std::size_t cached_bytes();
 void  empty_cache();
 
+/// Where device memory is: held by live tensors (in_use, and its high-water
+/// mark since the last reset), idle in the cache, and free on the device.
+struct MemoryStats {
+    std::size_t in_use = 0, peak = 0, cached = 0, device_free = 0, device_total = 0;
+};
+MemoryStats memory_stats();
+void reset_peak_memory();
+
+/// GPUs the driver can see.
+int  device_count();
+/// Use GPU `index` (default 0, or $PROMETHEUS_CUDA_DEVICE). Must be called
+/// before the first GPU tensor: one device per process.
+void set_device(int index);
+int  current_device();
+
 // ── kernels ──────────────────────────────────────────────────────────────────
 /// A compiled kernel. Compiled from `source` on first use for this GPU's
 /// architecture and kept; `name` is the __global__ function to launch, and

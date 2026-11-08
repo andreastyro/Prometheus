@@ -59,6 +59,7 @@ struct Driver {
     CUresult (*cuLaunchKernel)(CUfunction, unsigned, unsigned, unsigned, unsigned, unsigned,
                                unsigned, unsigned, CUstream, void**, void**);
     CUresult (*cuGetErrorString)(CUresult, const char**);
+    CUresult (*cuMemGetInfo)(size_t*, size_t*);
 };
 
 // NVRTC: the runtime compiler
@@ -110,6 +111,8 @@ unordered_map<KernelKey, CUfunction, KernelKeyHash> g_kernels;
 mutex                         g_kernel_mu;
 map<size_t, vector<CUdeviceptr>> g_pool;   // idle blocks by size
 size_t                        g_pool_bytes = 0;
+size_t                        g_in_use = 0, g_peak = 0;   // bytes handed to tensors
+int                           g_device_index = -1;        // -1: not chosen yet
 mutex                         g_pool_mu;
 
 void* open_library(const string& file) {
@@ -180,14 +183,23 @@ void init_locked() {
         bind(lib, d.cuMemcpyDtoH, "cuMemcpyDtoH_v2") && bind(lib, d.cuMemcpyDtoD, "cuMemcpyDtoD_v2") &&
         bind(lib, d.cuModuleLoadData, "cuModuleLoadData") &&
         bind(lib, d.cuModuleGetFunction, "cuModuleGetFunction") &&
-        bind(lib, d.cuLaunchKernel, "cuLaunchKernel") && bind(lib, d.cuGetErrorString, "cuGetErrorString");
+        bind(lib, d.cuLaunchKernel, "cuLaunchKernel") && bind(lib, d.cuGetErrorString, "cuGetErrorString") &&
+        bind(lib, d.cuMemGetInfo, "cuMemGetInfo_v2");
     if (!all) { g.why = "the NVIDIA driver is too old (a driver API entry point is missing)"; return; }
     CUresult r = d.cuInit(0);
     if (r != 0) { g.why = "cuInit failed: " + err(r); return; }
     int count = 0;
     d.cuDeviceGetCount(&count);
     if (count < 1) { g.why = "the NVIDIA driver found no GPU"; return; }
-    if ((r = d.cuDeviceGet(&g.dev, 0)) != 0) { g.why = "cuDeviceGet failed: " + err(r); return; }
+    if (g_device_index < 0) {
+        const char* env = getenv("PROMETHEUS_CUDA_DEVICE");
+        g_device_index = env ? atoi(env) : 0;
+    }
+    if (g_device_index >= count) {
+        g.why = "GPU " + to_string(g_device_index) + " asked for, but only " + to_string(count) + " present";
+        return;
+    }
+    if ((r = d.cuDeviceGet(&g.dev, g_device_index)) != 0) { g.why = "cuDeviceGet failed: " + err(r); return; }
     char name[256] = {0};
     d.cuDeviceGetName(name, sizeof name, g.dev);
     g.name = name;
@@ -359,16 +371,36 @@ void* alloc(size_t nbytes) {
             CUdeviceptr p = it->second.back();
             it->second.pop_back();
             g_pool_bytes -= b;
+            g_in_use += b;
+            g_peak = max(g_peak, g_in_use);
             return (void*)p;
         }
     }
     CUdeviceptr p = 0;
     CUresult r = g.d.cuMemAlloc(&p, b);
+    size_t released = 0;
     if (r != 0) {            // out of memory: give the cache back and retry once
+        released = cached_bytes();
         empty_cache();
         r = g.d.cuMemAlloc(&p, b);
     }
-    check(r, "cuMemAlloc");
+    if (r != 0) {
+        size_t free_b = 0, total_b = 0;
+        g.d.cuMemGetInfo(&free_b, &total_b);
+        auto mb = [](size_t n) { return to_string((n + (1 << 19)) >> 20) + " MB"; };
+        size_t used;
+        {
+            lock_guard<mutex> lock(g_pool_mu);
+            used = g_in_use;
+        }
+        throw runtime_error("cuda: out of GPU memory allocating " + mb(b) + " on " + g.name + ": " +
+                            mb(used) + " held by tensors, " + mb(free_b) + " free of " + mb(total_b) +
+                            (released ? " (after releasing " + mb(released) + " of cached blocks)" : "") +
+                            ". Reduce the batch size or sequence length, or free tensors you no longer need.");
+    }
+    lock_guard<mutex> lock(g_pool_mu);
+    g_in_use += b;
+    g_peak = max(g_peak, g_in_use);
     return (void*)p;
 }
 
@@ -378,6 +410,46 @@ void free(void* ptr, size_t nbytes) noexcept {
     const size_t b = bucket(nbytes);
     g_pool[b].push_back((CUdeviceptr)ptr);
     g_pool_bytes += b;
+    g_in_use -= min(g_in_use, b);
+}
+
+MemoryStats memory_stats() {
+    MemoryStats s;
+    if (!available()) return s;
+    {
+        lock_guard<mutex> lock(g_pool_mu);
+        s.in_use = g_in_use;
+        s.peak = g_peak;
+        s.cached = g_pool_bytes;
+    }
+    bind_context();
+    g.d.cuMemGetInfo(&s.device_free, &s.device_total);
+    return s;
+}
+
+void reset_peak_memory() {
+    lock_guard<mutex> lock(g_pool_mu);
+    g_peak = g_in_use;
+}
+
+int device_count() {
+    if (!available()) return 0;
+    int n = 0;
+    g.d.cuDeviceGetCount(&n);
+    return n;
+}
+
+void set_device(int index) {
+    lock_guard<mutex> lock(g_mu);
+    if (index < 0) throw runtime_error("cuda: device index must be 0 or more");
+    if (g.tried && g.ok && index != g_device_index)
+        throw runtime_error("cuda: set_device(" + to_string(index) + ") after GPU " + to_string(g_device_index) +
+                            " is in use; choose the device before the first GPU tensor");
+    g_device_index = index;
+}
+
+int current_device() {
+    return available() ? g_device_index : -1;
 }
 
 size_t cached_bytes() {

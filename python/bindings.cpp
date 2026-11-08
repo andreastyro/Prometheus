@@ -359,6 +359,23 @@ PYBIND11_MODULE(_C, m) {
           "Tensor cores (compute 7.0+): float16 matmuls run on them.");
     m.def("cuda_has_bf16", &cuda::has_bf16,
           "bfloat16 matmuls in hardware (compute 8.0+); older GPUs compute them in float32.");
+    m.def("cuda_memory_stats", []() {
+              auto s = cuda::memory_stats();
+              py::dict d;
+              d["in_use"] = s.in_use;
+              d["peak"] = s.peak;
+              d["cached"] = s.cached;
+              d["device_free"] = s.device_free;
+              d["device_total"] = s.device_total;
+              return d;
+          }, "GPU memory in bytes: held by tensors (in_use, peak since reset), idle in the cache, "
+             "and free / total on the device.");
+    m.def("cuda_reset_peak_memory", &cuda::reset_peak_memory);
+    m.def("cuda_empty_cache", &cuda::empty_cache, "Return idle cached GPU memory to the driver.");
+    m.def("cuda_device_count", &cuda::device_count);
+    m.def("cuda_set_device", &cuda::set_device, py::arg("index"),
+          "Use GPU `index`; before the first GPU tensor. $PROMETHEUS_CUDA_DEVICE does the same.");
+    m.def("cuda_current_device", &cuda::current_device);
     m.def("cuda_synchronize", &cuda::synchronize,
           "Wait for queued GPU work; for timing.");
 

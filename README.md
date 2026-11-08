@@ -228,6 +228,44 @@ from prometheus.gpt import GPT         # a GPT written in Python on the C++ ops
 Prebuilt wheels for Windows, Linux, and macOS are produced by
 [.github/workflows/build_wheels.yml](.github/workflows/build_wheels.yml).
 
+### GPU
+
+Nothing CUDA is needed to build. With an NVIDIA driver installed, two pip
+packages switch the GPU on -- the runtime compiler and cuBLAS -- and the same
+build finds them:
+
+```bash
+pip install nvidia-cuda-nvrtc-cu12 nvidia-cublas-cu12
+```
+
+```python
+import prometheus as p
+print(p.cuda_status())                 # "NVIDIA GeForce GTX 970, compute 5.2, 4095 MB"
+model = p.GPT(2048, 128, 256, 4, 4)
+model.cuda()                           # parameters move in place
+opt = p.AdamW(model.parameters(), 3e-4)
+ids = p.Tensor([8, 128], ids_list, p.int64).cuda()
+loss = p.cross_entropy_sparse_seq(model.forward(ids), targets)
+loss.backward()
+opt.step()
+```
+
+Kernels are compiled for the GPU actually present the first time each is used,
+so one build serves every generation; CUDA 12 covers Maxwell (GTX 900) onward,
+CUDA 13 Turing onward. Mixed precision uses tensor cores where the card has
+them (`cuda_has_tensor_cores`, `cuda_has_bf16`). `cuda_memory_stats()` reports
+memory held by tensors, its peak and the allocator's cache; running out names
+the sizes involved. `cuda_set_device(i)` or `PROMETHEUS_CUDA_DEVICE` picks a
+GPU. `PROMETHEUS_PROFILE_BACKWARD=1` prints the backward pass's time by op.
+
+GPT training step on a GTX 970 (4 layers x 256, batch 8 x 128,
+[tests/bench_gpu_gpt.py](tests/bench_gpu_gpt.py)): Prometheus 29.4 ms
+(34.8k tokens/s), PyTorch 2.14 19.3 ms (53.0k tokens/s), the same step on a
+Ryzen AI 7 350 CPU 208 ms. The GPU suite is
+[tests/test_cuda.cpp](tests/test_cuda.cpp) and
+[tests/test_cuda.py](tests/test_cuda.py): every op and layer against the CPU,
+forward and gradient; CI has no GPU, so there they build and skip.
+
 ### C++
 
 Requires CMake and a C++17 compiler.

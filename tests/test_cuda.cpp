@@ -512,6 +512,28 @@ int main() {
                    og2.m[0] == og.m[0] && og2.v[3] == og.v[3]);
     }
 
+    // ── memory accounting, out of memory, device selection ──
+    {
+        const auto before = cuda::memory_stats();
+        TensorPtr blob = std::make_shared<Tensor>(Shape{1 << 20}, DType::Float32, Device::CUDA);   // 4 MB
+        const auto during = cuda::memory_stats();
+        blob.reset();
+        const auto after = cuda::memory_stats();
+        CHECK_TRUE("memory_stats: in_use rises by the tensor and falls back", during.in_use >= before.in_use + (4u << 20) &&
+                   after.in_use == before.in_use && after.cached >= (4u << 20));
+        CHECK_TRUE("memory_stats: peak and device totals", during.peak >= during.in_use && during.device_total > 0);
+        std::string msg;
+        try { std::make_shared<Tensor>(Shape{100000, 100000}, DType::Float32, Device::CUDA); }   // 40 GB
+        catch (const std::exception& e) { msg = e.what(); }
+        std::printf("  out-of-memory message: %s\n", msg.c_str());
+        CHECK_TRUE("out of memory says how much and where", msg.find("out of GPU memory") != std::string::npos &&
+                   msg.find("MB") != std::string::npos && msg.find("free of") != std::string::npos);
+        CHECK_TRUE("device_count and current_device", cuda::device_count() >= 1 && cuda::current_device() == 0);
+        bool refused = false;
+        try { cuda::set_device(cuda::device_count()); } catch (const std::exception&) { refused = true; }
+        CHECK_TRUE("set_device cannot switch GPUs once one is in use", refused);
+    }
+
     // ── phase 4: fused backward kernels, and the op form when it is recorded ──
     {
         // second derivative through LayerNorm (and GELU) on the GPU equals the CPU's:
