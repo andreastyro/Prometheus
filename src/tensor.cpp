@@ -2,6 +2,7 @@
 #include "ml/autograd.hpp"
 #include "ml/ops.hpp"
 #include "ml/strided.hpp"
+#include "ml/cuda.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -227,15 +228,39 @@ void FloatBuffer::reset() {
 
 Storage::Storage(size_t nbytes, DType dtype, Device device, bool zero)
     : dtype_(dtype), device_(device) {
-    if (device != Device::CPU)
-        throw runtime_error(string("device '") + device_name(device) +
-                            "' is not available in this build; only cpu is");
     nbytes_ = nbytes;
+    if (device == Device::CUDA) {
+        if (!cuda::available())
+            throw runtime_error("cuda: " + cuda::status());
+        ptr_ = static_cast<unsigned char*>(cuda::alloc(nbytes));
+        if (nbytes && zero) cuda::memset_zero(ptr_, nbytes);
+        return;
+    }
     ptr_ = static_cast<unsigned char*>(mem::alloc(nbytes));
     if (nbytes && zero) std::memset(ptr_, 0, nbytes);
 }
 
-Storage::~Storage() { mem::free(ptr_, nbytes_); }
+Storage::~Storage() {
+    if (device_ == Device::CUDA) cuda::free(ptr_, nbytes_);
+    else mem::free(ptr_, nbytes_);
+}
+
+// ── GPU tensors read and written element by element ──────────────────────────
+//
+// The element accessors below dereference storage directly, which on a GPU
+// tensor is a device address the CPU cannot read. They go through a host copy
+// of the whole storage instead: slow, and meant for printing, item() and
+// tests -- ops on GPU tensors run as kernels.
+namespace {
+struct HostStorage {
+    std::vector<unsigned char> bytes;
+    explicit HostStorage(const Storage& s) : bytes(s.nbytes()) {
+        cuda::copy_to_host(bytes.data(), s.data(), s.nbytes());
+    }
+    void upload(Storage& s) const { cuda::copy_to_device(s.data(), bytes.data(), bytes.size()); }
+    void* data() { return bytes.data(); }
+};
+}
 
 // ── Tensor: construction and layout ──────────────────────────────────────────
 
@@ -263,10 +288,10 @@ Tensor::Tensor(ShapeArg shape, DType dtype, Device device)
     init_layout();
 }
 
-Tensor::Tensor(ShapeArg shape, Uninitialized, DType dtype)
+Tensor::Tensor(ShapeArg shape, Uninitialized, DType dtype, Device device)
     : shape_(shape.get()) {
     numel_   = product(shape_);
-    storage_ = make_shared<Storage>((size_t)numel_ * dtype_size(dtype), dtype, Device::CPU, false);
+    storage_ = make_shared<Storage>((size_t)numel_ * dtype_size(dtype), dtype, device, false);
     strides_ = contiguous_strides(shape_);
     init_layout();
 }
@@ -324,12 +349,15 @@ int64_t Tensor::size(int d) const {
 // ── elements ─────────────────────────────────────────────────────────────────
 
 FloatSpan Tensor::values() {
+    if (device() != Device::CPU)
+        throw runtime_error("values(): the tensor is on the GPU; use to(cpu) first");
     if (dtype() != DType::Float32 || !contiguous_)
         throw runtime_error("values(): needs a contiguous float32 tensor; use to_vector()");
     return {data(), data() + numel_};
 }
 
 vector<float> Tensor::to_vector() const {
+    if (device() != Device::CPU) return const_cast<Tensor*>(this)->to(Device::CPU)->to_vector();
     vector<float> out((size_t)numel_);
     if (contiguous_ && dtype() == DType::Float32) {
         if (numel_) memcpy(out.data(), ptr_, (size_t)numel_ * sizeof(float));
@@ -347,6 +375,15 @@ void Tensor::set_data(const vector<float>& v) {
     if ((int64_t)v.size() != numel_)
         throw runtime_error("set_data: " + to_string(v.size()) + " values for " +
                             to_string(numel_) + " elements");
+    if (device() != Device::CPU) {
+        HostStorage h(*storage_);
+        const DType d = dtype();
+        strided::for_each(shape_, strides_, offset_, [&](int64_t i, int64_t off) {
+            strided::store(h.data(), d, off, v[i]);
+        });
+        h.upload(*storage_);
+        return;
+    }
     if (contiguous_ && dtype() == DType::Float32) {
         if (numel_) memcpy(ptr_, v.data(), (size_t)numel_ * sizeof(float));
         return;
@@ -358,31 +395,49 @@ void Tensor::set_data(const vector<float>& v) {
     });
 }
 
-float Tensor::item() const {
-    if (numel_ != 1)
-        throw runtime_error("item(): tensor has " + to_string(numel_) + " elements, not 1");
-    return (float)strided::load(storage_->data(), dtype(), offset_);
-}
+float Tensor::item() const { return (float)item_double(); }
 
 double Tensor::item_double() const {
     if (numel_ != 1)
         throw runtime_error("item(): tensor has " + to_string(numel_) + " elements, not 1");
+    if (device() != Device::CPU) {
+        unsigned char buf[8] = {0};
+        const size_t es = dtype_size(dtype());
+        cuda::copy_to_host(buf, static_cast<const unsigned char*>(storage_->data()) + offset_ * es, es);
+        return strided::load(buf, dtype(), 0);
+    }
     return strided::load(storage_->data(), dtype(), offset_);
 }
 
 float Tensor::get(int64_t row, int64_t col) const {
     if (dim() != 2) throw runtime_error("get: needs a 2-D tensor");
+    if (device() != Device::CPU) return const_cast<Tensor*>(this)->to(Device::CPU)->get(row, col);
     return (float)strided::load(storage_->data(), dtype(),
                                 offset_ + row * strides_[0] + col * strides_[1]);
 }
 
 void Tensor::set(int64_t row, int64_t col, float value) {
     if (dim() != 2) throw runtime_error("set: needs a 2-D tensor");
+    if (device() != Device::CPU) {
+        HostStorage h(*storage_);
+        strided::store(h.data(), dtype(), offset_ + row * strides_[0] + col * strides_[1], value);
+        h.upload(*storage_);
+        return;
+    }
     strided::store(storage_->data(), dtype(),
                    offset_ + row * strides_[0] + col * strides_[1], value);
 }
 
 void Tensor::fill(float value) {
+    if (device() != Device::CPU) {
+        HostStorage h(*storage_);
+        const DType d = dtype();
+        strided::for_each(shape_, strides_, offset_, [&](int64_t, int64_t off) {
+            strided::store(h.data(), d, off, value);
+        });
+        h.upload(*storage_);
+        return;
+    }
     if (contiguous_ && dtype() == DType::Float32) {
         std::fill(data(), data() + numel_, value);
         return;
@@ -524,6 +579,8 @@ TensorPtr Tensor::randn(ShapeArg shape) {
 TensorPtr Tensor::to(DType target) {
     if (target == dtype())
         return shared_from_this();
+    if (device() != Device::CPU)      // converted on the host for now
+        return to(Device::CPU)->to(target)->to(device());
     if (is_floating(target) && is_floating(dtype()) && requires_grad_)
         return cast_op(shared_from_this(), target);     // differentiable
     auto out = make_shared<Tensor>(shape_, target);
@@ -539,8 +596,30 @@ TensorPtr Tensor::to(DType target) {
 TensorPtr Tensor::to(Device target) {
     if (target == device())
         return shared_from_this();
-    throw runtime_error(string("device '") + device_name(target) +
-                        "' is not available in this build; only cpu is");
+    const size_t es = dtype_size(dtype());
+    if (target == Device::CUDA) {
+        const TensorPtr host = contiguous_ ? shared_from_this() : detach();   // row-major on the CPU
+        auto out = make_shared<Tensor>(shape_, Uninitialized{}, dtype(), Device::CUDA);
+        cuda::copy_to_device(out->storage()->data(),
+                             static_cast<const unsigned char*>(host->storage()->data()) + host->offset() * es,
+                             (size_t)numel_ * es);
+        return out;
+    }
+    // to the CPU
+    auto out = make_shared<Tensor>(shape_, Uninitialized{}, dtype(), Device::CPU);
+    if (contiguous_) {
+        cuda::copy_to_host(out->storage()->data(),
+                           static_cast<const unsigned char*>(storage_->data()) + offset_ * es,
+                           (size_t)numel_ * es);
+        return out;
+    }
+    HostStorage h(*storage_);           // a strided view: gather on the host
+    unsigned char* dst = static_cast<unsigned char*>(out->storage()->data());
+    const unsigned char* src = static_cast<const unsigned char*>(h.data());
+    strided::for_each(shape_, strides_, offset_, [&](int64_t i, int64_t off) {
+        memcpy(dst + i * es, src + off * es, es);
+    });
+    return out;
 }
 
 TensorPtr Tensor::transpose(int dim0, int dim1) { return ::transpose(shared_from_this(), dim0, dim1); }
@@ -609,6 +688,17 @@ void Tensor::backward() {
 }
 
 TensorPtr Tensor::detach() const {
+    if (device() != Device::CPU) {
+        if (contiguous_) {
+            const size_t es = dtype_size(dtype());
+            auto t = make_shared<Tensor>(shape_, Uninitialized{}, dtype(), Device::CUDA);
+            cuda::copy_device(t->storage()->data(),
+                              static_cast<const unsigned char*>(storage_->data()) + offset_ * es,
+                              (size_t)numel_ * es);
+            return t;
+        }
+        return const_cast<Tensor*>(this)->to(Device::CPU)->to(Device::CUDA);
+    }
     auto t = make_shared<Tensor>(shape_, dtype());
     const void* src = storage_->data();
     void* dst = t->storage()->data();

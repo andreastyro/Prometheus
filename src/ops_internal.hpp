@@ -89,3 +89,8 @@ TensorPtr scatter_add(const TensorPtr& g, std::shared_ptr<const std::vector<int6
                       const Shape& out_shape);
 
 } // namespace dispatch
+
+// GPU kernels (src/cuda/cuda_ops.cpp). op: 0 add, 1 subtract, 2 multiply, 3 divide.
+namespace cuda_ops {
+TensorPtr binary(int op, const char* name, const TensorPtr& a, const TensorPtr& b);
+}

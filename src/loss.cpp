@@ -254,9 +254,9 @@ TensorPtr cross_entropy_sparse(TensorPtr logits, int target_idx) {
 
     float sum_exp = 0.0f;
     for (float v : logits->values())
-        sum_exp += std::expf(v - max_v);
+        sum_exp += std::exp(v - max_v);
 
-    float loss_val = std::logf(sum_exp) + max_v - logits->data()[target_idx];
+    float loss_val = std::log(sum_exp) + max_v - logits->data()[target_idx];
 
     auto result = make_shared<Tensor>(Shape{1});
     result->data()[0] = loss_val;
@@ -273,7 +273,7 @@ TensorPtr cross_entropy_sparse(TensorPtr logits, int target_idx) {
         node->backward_fn = [logits, target_idx, n, max_v, sum_exp](const TensorPtr& result) {
             float scale = result->grad()[0];
             for (int j = 0; j < n; j++) {
-                float p = std::expf(logits->data()[j] - max_v) / sum_exp;
+                float p = std::exp(logits->data()[j] - max_v) / sum_exp;
                 logits->grad()[j] += scale * (p - (j == target_idx ? 1.0f : 0.0f));
             }
         };
@@ -321,7 +321,7 @@ TensorPtr cross_entropy_sparse_seq(TensorPtr logits, const std::vector<int>& tar
 
     float total = 0.0f;
     for (int t = 0; t < seq_len; t++)
-        total += std::logf(sum_exp[t]) + max_v[t] - logits->data()[t * vocab + targets[t]];
+        total += std::log(sum_exp[t]) + max_v[t] - logits->data()[t * vocab + targets[t]];
 
     auto result = make_shared<Tensor>(Shape{1});
     result->data()[0] = total / (float)seq_len;

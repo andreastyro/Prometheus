@@ -21,8 +21,8 @@ using namespace std;
 TensorPtr checked_input(const char* op, TensorPtr t) {
     if (!t) return t;
     if (t->device() != Device::CPU)
-        throw runtime_error(string(op) + ": tensor is on " + device_name(t->device()) +
-                            "; this build computes on cpu only");
+        throw runtime_error(string(op) + ": not available on the GPU yet; move the tensor "
+                            "with .to(cpu)");
     if (t->dtype() == DType::Float64)
         throw runtime_error(string(op) + ": float64 is supported by the tensor ops (add, matmul, "
                             "softmax, ...), not by this layer; convert with .to(float32)");
@@ -96,6 +96,8 @@ template <BinOp OP> static inline float bin_dy(float g, float x, float y) {
 
 template <BinOp OP>
 static TensorPtr binary_op(const char* name, TensorPtr a, TensorPtr b) {
+    if (a->device() == Device::CUDA || b->device() == Device::CUDA)
+        return cuda_ops::binary((int)OP, name, a, b);
     if (auto r = dispatch::binary(name, a, b, static_cast<dispatch::Bin>((int)OP),
                                   [name](TensorPtr x, TensorPtr y) { return binary_op<OP>(name, x, y); }))
         return r;
@@ -1380,6 +1382,11 @@ TensorPtr reshape(TensorPtr a, ShapeArg new_shape_arg) {
 TensorPtr contiguous(TensorPtr a) {
     if (a->is_contiguous())
         return a;
+    if (a->device() != Device::CPU) {
+        if (a->requires_grad())
+            throw runtime_error("contiguous: gradients on the GPU are not supported yet");
+        return a->detach();
+    }
 
     auto out = make_shared<Tensor>(a->shape(), a->dtype());
     const size_t es = dtype_size(a->dtype());

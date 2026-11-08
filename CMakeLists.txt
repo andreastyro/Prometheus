@@ -14,6 +14,8 @@ set(SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tensor.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/ops.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/dtype_ops.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/cuda_runtime.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/cuda_ops.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/loss.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/matmul_backend.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/blas_loader.cpp
@@ -163,6 +165,9 @@ target_link_libraries(test_gradcheck prometheus)
 
 add_executable(test_matmul_backend ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_matmul_backend.cpp)
 target_link_libraries(test_matmul_backend prometheus)
+add_executable(test_cuda ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cuda.cpp)
+target_link_libraries(test_cuda prometheus)
+add_test(NAME test_cuda COMMAND test_cuda WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 add_executable(test_fastmath ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_fastmath.cpp)
 target_link_libraries(test_fastmath prometheus)
 

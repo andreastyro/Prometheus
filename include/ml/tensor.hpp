@@ -147,7 +147,8 @@ public:
 
     /// Tag for a tensor whose elements are left uninitialised.
     struct Uninitialized {};
-    Tensor(ShapeArg shape, Uninitialized, DType dtype = DType::Float32);
+    Tensor(ShapeArg shape, Uninitialized, DType dtype = DType::Float32,
+           Device device = Device::CPU);
 
     /// float32 tensor holding `values` in row-major order.
     Tensor(ShapeArg shape, const std::vector<float>& values);
@@ -252,7 +253,8 @@ public:
     /// gradient is cast back. To or from an integer or bool dtype it leaves
     /// the graph.
     TensorPtr to(DType dtype);
-    /// Only Device::CPU is available in this build; asking for CUDA raises.
+    /// A copy on `device`. CUDA needs a GPU and its driver (see ml/cuda.hpp);
+    /// without them this raises with the reason. Not differentiable yet.
     TensorPtr to(Device device);
 
     /// Differentiable views. Equivalent to the free functions of the same name.

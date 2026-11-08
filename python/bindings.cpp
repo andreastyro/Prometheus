@@ -5,6 +5,8 @@
 
 #include "ml/tensor.hpp"
 #include "ml/strided.hpp"
+#include "ml/cuda.hpp"
+#include <cstdlib>
 #include "ml/ops.hpp"
 #include "ml/matmul_backend.hpp"
 #include "ml/blas.hpp"
@@ -156,6 +158,8 @@ PYBIND11_MODULE(_C, m) {
         .def("contiguous",    &Tensor::contiguous)
         .def("to",            py::overload_cast<DType>(&Tensor::to))
         .def("to",            py::overload_cast<Device>(&Tensor::to))
+        .def("cuda",          [](Tensor& t) { return t.to(Device::CUDA); }, "A copy on the GPU.")
+        .def("cpu",           [](Tensor& t) { return t.to(Device::CPU); }, "A copy on the CPU.")
         .def("backward",      &Tensor::backward)
         .def("reset_grad",    &Tensor::reset_grad)
         .def("zero_grad",     &Tensor::zero_grad)
@@ -318,7 +322,30 @@ PYBIND11_MODULE(_C, m) {
 #endif
         }
         blas::set_search_dirs(dirs);
+
+        // NVRTC and cuBLAS from pip (nvidia-cuda-nvrtc-cu12, nvidia-cublas-cu12)
+        // land in site-packages/nvidia/<package>/bin on Windows, /lib elsewhere
+        std::vector<std::string> cuda_dirs;
+        std::vector<std::string> sites;
+        try { for (auto p : site.attr("getsitepackages")()) sites.push_back(py::str(p)); } catch (...) {}
+        try { sites.push_back(py::str(site.attr("getusersitepackages")())); } catch (...) {}
+        for (const auto& s : sites)
+            for (const char* pkg : {"cuda_nvrtc", "cublas", "cuda_runtime"}) {
+#ifdef _WIN32
+                cuda_dirs.push_back(s + "/nvidia/" + pkg + "/bin");
+#else
+                cuda_dirs.push_back(s + "/nvidia/" + pkg + "/lib");
+#endif
+            }
+        if (const char* extra = std::getenv("PROMETHEUS_CUDA_PATH")) cuda_dirs.insert(cuda_dirs.begin(), extra);
+        cuda::set_search_dirs(cuda_dirs);
     }
+    m.def("cuda_available", &cuda::available,
+          "True when an NVIDIA GPU and its driver are present. Never raises.");
+    m.def("cuda_status", &cuda::status,
+          "The GPU in use, or why there is none.");
+    m.def("cuda_synchronize", &cuda::synchronize,
+          "Wait for queued GPU work; for timing.");
 
     auto backend_info = []() {
         py::dict d;

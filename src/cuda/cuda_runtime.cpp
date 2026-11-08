@@ -1,0 +1,429 @@
+// The CUDA driver and NVRTC, loaded at runtime. See ml/cuda.hpp.
+//
+// Only the handful of driver API entry points used are declared, by hand, with
+// the ABI types they have in cuda.h; nothing here includes a CUDA header.
+#include "ml/cuda.hpp"
+#include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <mutex>
+#include <stdexcept>
+#include <unordered_map>
+
+#ifdef _WIN32
+    #ifndef WIN32_LEAN_AND_MEAN
+        #define WIN32_LEAN_AND_MEAN
+    #endif
+    #ifndef NOMINMAX
+        #define NOMINMAX
+    #endif
+    #include <windows.h>
+#else
+    #include <dlfcn.h>
+#endif
+
+using namespace std;
+
+namespace cuda {
+namespace {
+
+// ── driver API types and entry points ────────────────────────────────────────
+using CUresult    = int;
+using CUdevice    = int;
+using CUdeviceptr = unsigned long long;
+using CUcontext   = void*;
+using CUmodule    = void*;
+using CUfunction  = void*;
+using CUstream    = void*;
+constexpr int ATTR_CC_MAJOR = 75, ATTR_CC_MINOR = 76;
+
+struct Driver {
+    CUresult (*cuInit)(unsigned);
+    CUresult (*cuDeviceGetCount)(int*);
+    CUresult (*cuDeviceGet)(CUdevice*, int);
+    CUresult (*cuDeviceGetName)(char*, int, CUdevice);
+    CUresult (*cuDeviceGetAttribute)(int*, int, CUdevice);
+    CUresult (*cuDeviceTotalMem)(size_t*, CUdevice);
+    CUresult (*cuDevicePrimaryCtxRetain)(CUcontext*, CUdevice);
+    CUresult (*cuCtxSetCurrent)(CUcontext);
+    CUresult (*cuCtxSynchronize)();
+    CUresult (*cuMemAlloc)(CUdeviceptr*, size_t);
+    CUresult (*cuMemFree)(CUdeviceptr);
+    CUresult (*cuMemsetD8)(CUdeviceptr, unsigned char, size_t);
+    CUresult (*cuMemcpyHtoD)(CUdeviceptr, const void*, size_t);
+    CUresult (*cuMemcpyDtoH)(void*, CUdeviceptr, size_t);
+    CUresult (*cuMemcpyDtoD)(CUdeviceptr, CUdeviceptr, size_t);
+    CUresult (*cuModuleLoadData)(CUmodule*, const void*);
+    CUresult (*cuModuleGetFunction)(CUfunction*, CUmodule, const char*);
+    CUresult (*cuLaunchKernel)(CUfunction, unsigned, unsigned, unsigned, unsigned, unsigned,
+                               unsigned, unsigned, CUstream, void**, void**);
+    CUresult (*cuGetErrorString)(CUresult, const char**);
+};
+
+// NVRTC: the runtime compiler
+using nvrtcProgram = void*;
+struct Nvrtc {
+    int (*nvrtcCreateProgram)(nvrtcProgram*, const char*, const char*, int, const char* const*, const char* const*);
+    int (*nvrtcCompileProgram)(nvrtcProgram, int, const char* const*);
+    int (*nvrtcGetPTXSize)(nvrtcProgram, size_t*);
+    int (*nvrtcGetPTX)(nvrtcProgram, char*);
+    int (*nvrtcGetProgramLogSize)(nvrtcProgram, size_t*);
+    int (*nvrtcGetProgramLog)(nvrtcProgram, char*);
+    int (*nvrtcDestroyProgram)(nvrtcProgram*);
+    const char* (*nvrtcGetErrorString)(int);
+    int (*nvrtcGetNumSupportedArchs)(int*);          // optional (CUDA 11.2+)
+    int (*nvrtcGetSupportedArchs)(int*);             // optional
+};
+
+struct State {
+    bool        tried = false, ok = false;
+    string      why = "not initialised";
+    Driver      d{};
+    CUdevice    dev = 0;
+    CUcontext   ctx = nullptr;
+    string      name;
+    int         cc = 0;
+    size_t      mem = 0;
+    bool        nvrtc_tried = false, nvrtc_ok = false;
+    string      nvrtc_why;
+    Nvrtc       r{};
+    int         arch = 0;       // the compute_XY NVRTC compiles for
+};
+
+State                         g;
+mutex                         g_mu;
+vector<string>                g_dirs;
+unordered_map<string, CUfunction> g_kernels;
+mutex                         g_kernel_mu;
+map<size_t, vector<CUdeviceptr>> g_pool;   // idle blocks by size
+size_t                        g_pool_bytes = 0;
+mutex                         g_pool_mu;
+
+void* open_library(const string& file) {
+#ifdef _WIN32
+    if (file.find_first_of("\\/") != string::npos) {
+        // LOAD_WITH_ALTERED_SEARCH_PATH needs an absolute path with backslashes
+        string p = file;
+        replace(p.begin(), p.end(), '/', '\\');
+        return (void*)LoadLibraryExA(p.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    }
+    return (void*)LoadLibraryA(file.c_str());
+#else
+    return dlopen(file.c_str(), RTLD_NOW | RTLD_LOCAL);
+#endif
+}
+
+void* symbol(void* lib, const char* name) {
+#ifdef _WIN32
+    return (void*)GetProcAddress((HMODULE)lib, name);
+#else
+    return dlsym(lib, name);
+#endif
+}
+
+void* open_first(const vector<string>& names) {
+    for (const auto& dir : g_dirs)
+        for (const auto& n : names)
+            if (void* h = open_library(dir + "/" + n)) return h;
+    for (const auto& n : names)
+        if (void* h = open_library(n)) return h;
+    return nullptr;
+}
+
+template <class F> bool bind(void* lib, F& fn, const char* name) {
+    fn = reinterpret_cast<F>(symbol(lib, name));
+    return fn != nullptr;
+}
+
+string err(CUresult r) {
+    const char* s = nullptr;
+    if (g.d.cuGetErrorString) g.d.cuGetErrorString(r, &s);
+    return s ? s : ("CUDA error " + to_string(r));
+}
+
+void check(CUresult r, const char* what) {
+    if (r != 0) throw runtime_error(string("cuda: ") + what + " failed: " + err(r));
+}
+
+void init_locked() {
+    if (g.tried) return;
+    g.tried = true;
+#ifdef _WIN32
+    void* lib = open_first({"nvcuda.dll"});
+#else
+    void* lib = open_first({"libcuda.so.1", "libcuda.so"});
+#endif
+    if (!lib) { g.why = "no NVIDIA driver found (nvcuda.dll / libcuda.so.1)"; return; }
+    Driver& d = g.d;
+    const bool all =
+        bind(lib, d.cuInit, "cuInit") && bind(lib, d.cuDeviceGetCount, "cuDeviceGetCount") &&
+        bind(lib, d.cuDeviceGet, "cuDeviceGet") && bind(lib, d.cuDeviceGetName, "cuDeviceGetName") &&
+        bind(lib, d.cuDeviceGetAttribute, "cuDeviceGetAttribute") &&
+        bind(lib, d.cuDeviceTotalMem, "cuDeviceTotalMem_v2") &&
+        bind(lib, d.cuDevicePrimaryCtxRetain, "cuDevicePrimaryCtxRetain") &&
+        bind(lib, d.cuCtxSetCurrent, "cuCtxSetCurrent") && bind(lib, d.cuCtxSynchronize, "cuCtxSynchronize") &&
+        bind(lib, d.cuMemAlloc, "cuMemAlloc_v2") && bind(lib, d.cuMemFree, "cuMemFree_v2") &&
+        bind(lib, d.cuMemsetD8, "cuMemsetD8_v2") && bind(lib, d.cuMemcpyHtoD, "cuMemcpyHtoD_v2") &&
+        bind(lib, d.cuMemcpyDtoH, "cuMemcpyDtoH_v2") && bind(lib, d.cuMemcpyDtoD, "cuMemcpyDtoD_v2") &&
+        bind(lib, d.cuModuleLoadData, "cuModuleLoadData") &&
+        bind(lib, d.cuModuleGetFunction, "cuModuleGetFunction") &&
+        bind(lib, d.cuLaunchKernel, "cuLaunchKernel") && bind(lib, d.cuGetErrorString, "cuGetErrorString");
+    if (!all) { g.why = "the NVIDIA driver is too old (a driver API entry point is missing)"; return; }
+    CUresult r = d.cuInit(0);
+    if (r != 0) { g.why = "cuInit failed: " + err(r); return; }
+    int count = 0;
+    d.cuDeviceGetCount(&count);
+    if (count < 1) { g.why = "the NVIDIA driver found no GPU"; return; }
+    if ((r = d.cuDeviceGet(&g.dev, 0)) != 0) { g.why = "cuDeviceGet failed: " + err(r); return; }
+    char name[256] = {0};
+    d.cuDeviceGetName(name, sizeof name, g.dev);
+    g.name = name;
+    int major = 0, minor = 0;
+    d.cuDeviceGetAttribute(&major, ATTR_CC_MAJOR, g.dev);
+    d.cuDeviceGetAttribute(&minor, ATTR_CC_MINOR, g.dev);
+    g.cc = major * 10 + minor;
+    d.cuDeviceTotalMem(&g.mem, g.dev);
+    if ((r = d.cuDevicePrimaryCtxRetain(&g.ctx, g.dev)) != 0) { g.why = "no CUDA context: " + err(r); return; }
+    g.ok = true;
+    g.why.clear();
+}
+
+State& state() {
+    lock_guard<mutex> lock(g_mu);
+    init_locked();
+    return g;
+}
+
+// every thread that touches the GPU makes the context current once
+void bind_context() {
+    State& s = state();
+    if (!s.ok) throw runtime_error("cuda: not available: " + s.why);
+    thread_local bool bound = false;
+    if (!bound) { check(s.d.cuCtxSetCurrent(s.ctx), "cuCtxSetCurrent"); bound = true; }
+}
+
+void init_nvrtc_locked() {
+    if (g.nvrtc_tried) return;
+    g.nvrtc_tried = true;
+#ifdef _WIN32
+    void* lib = open_first({"nvrtc64_120_0.dll", "nvrtc64_130_0.dll", "nvrtc64_112_0.dll"});
+#else
+    void* lib = open_first({"libnvrtc.so.12", "libnvrtc.so.13", "libnvrtc.so.11.2", "libnvrtc.so"});
+#endif
+    if (!lib) {
+        g.nvrtc_why = "NVRTC not found; pip install nvidia-cuda-nvrtc-cu12";
+        return;
+    }
+    Nvrtc& r = g.r;
+    const bool all =
+        bind(lib, r.nvrtcCreateProgram, "nvrtcCreateProgram") &&
+        bind(lib, r.nvrtcCompileProgram, "nvrtcCompileProgram") &&
+        bind(lib, r.nvrtcGetPTXSize, "nvrtcGetPTXSize") && bind(lib, r.nvrtcGetPTX, "nvrtcGetPTX") &&
+        bind(lib, r.nvrtcGetProgramLogSize, "nvrtcGetProgramLogSize") &&
+        bind(lib, r.nvrtcGetProgramLog, "nvrtcGetProgramLog") &&
+        bind(lib, r.nvrtcDestroyProgram, "nvrtcDestroyProgram") &&
+        bind(lib, r.nvrtcGetErrorString, "nvrtcGetErrorString");
+    if (!all) { g.nvrtc_why = "NVRTC is missing an entry point"; return; }
+    bind(lib, r.nvrtcGetNumSupportedArchs, "nvrtcGetNumSupportedArchs");
+    bind(lib, r.nvrtcGetSupportedArchs, "nvrtcGetSupportedArchs");
+
+    // the newest architecture NVRTC can target that this GPU can run
+    g.arch = g.cc;
+    if (r.nvrtcGetNumSupportedArchs && r.nvrtcGetSupportedArchs) {
+        int n = 0;
+        r.nvrtcGetNumSupportedArchs(&n);
+        vector<int> archs((size_t)max(n, 0));
+        if (n > 0) r.nvrtcGetSupportedArchs(archs.data());
+        int best = 0;
+        for (int a : archs) if (a <= g.cc) best = max(best, a);
+        if (!best) {
+            g.nvrtc_why = "this NVRTC cannot compile for compute " + to_string(g.cc) +
+                          " (CUDA 13 dropped Maxwell and Pascal; use nvidia-cuda-nvrtc-cu12)";
+            return;
+        }
+        g.arch = best;
+    }
+    g.nvrtc_ok = true;
+}
+
+CUfunction compile(const Kernel& k) {
+    {
+        lock_guard<mutex> lock(g_mu);
+        init_nvrtc_locked();
+        if (!g.nvrtc_ok) throw runtime_error("cuda: cannot compile kernels: " + g.nvrtc_why);
+    }
+    const Nvrtc& r = g.r;
+    nvrtcProgram prog = nullptr;
+    int rc = r.nvrtcCreateProgram(&prog, k.source, k.name, 0, nullptr, nullptr);
+    if (rc != 0) throw runtime_error(string("cuda: nvrtcCreateProgram: ") + r.nvrtcGetErrorString(rc));
+    const string arch = "--gpu-architecture=compute_" + to_string(g.arch);
+    const char* opts[] = {arch.c_str(), "--std=c++14", "-default-device"};
+    rc = r.nvrtcCompileProgram(prog, 3, opts);
+    if (rc != 0) {
+        size_t n = 0;
+        r.nvrtcGetProgramLogSize(prog, &n);
+        string log(n, '\0');
+        if (n) r.nvrtcGetProgramLog(prog, &log[0]);
+        r.nvrtcDestroyProgram(&prog);
+        throw runtime_error(string("cuda: compiling kernel '") + k.name + "' failed:\n" + log);
+    }
+    size_t n = 0;
+    r.nvrtcGetPTXSize(prog, &n);
+    string ptx(n, '\0');
+    r.nvrtcGetPTX(prog, &ptx[0]);
+    r.nvrtcDestroyProgram(&prog);
+
+    CUmodule mod = nullptr;
+    check(g.d.cuModuleLoadData(&mod, ptx.c_str()), "cuModuleLoadData");
+    CUfunction fn = nullptr;
+    check(g.d.cuModuleGetFunction(&fn, mod, k.name), "cuModuleGetFunction");
+    return fn;
+}
+
+CUfunction function(const Kernel& k) {
+    bind_context();
+    const string key = string(k.name) + '\x1f' + to_string((uintptr_t)k.source);
+    {
+        lock_guard<mutex> lock(g_kernel_mu);
+        auto it = g_kernels.find(key);
+        if (it != g_kernels.end()) return it->second;
+    }
+    CUfunction fn = compile(k);
+    lock_guard<mutex> lock(g_kernel_mu);
+    g_kernels[key] = fn;
+    return fn;
+}
+
+// requests round up to 512 bytes so near-equal sizes share blocks
+size_t bucket(size_t n) { return (n + 511) & ~size_t(511); }
+
+} // namespace
+
+// ── public ───────────────────────────────────────────────────────────────────
+
+bool available() {
+    try { return state().ok; } catch (...) { return false; }
+}
+
+string status() {
+    State& s = state();
+    if (!s.ok) return "unavailable: " + s.why;
+    return s.name + ", compute " + to_string(s.cc / 10) + "." + to_string(s.cc % 10) + ", " +
+           to_string(s.mem >> 20) + " MB";
+}
+
+string device_name()     { return state().name; }
+int compute_capability() { return state().cc; }
+size_t total_memory()    { return state().mem; }
+
+void set_search_dirs(const vector<string>& dirs) {
+    lock_guard<mutex> lock(g_mu);
+    g_dirs.clear();
+    for (string d : dirs) {      // `set X=dir && ...` in cmd leaves a trailing space
+        while (!d.empty() && (d.back() == ' ' || d.back() == '\t')) d.pop_back();
+        while (!d.empty() && (d.front() == ' ' || d.front() == '\t')) d.erase(d.begin());
+        if (!d.empty()) g_dirs.push_back(d);
+    }
+#ifdef _WIN32
+    // NVRTC loads its builtins library by name, from beside itself or PATH
+    vector<char> buf(32768);
+    DWORD n = GetEnvironmentVariableA("PATH", buf.data(), (DWORD)buf.size());
+    string path(buf.data(), n < buf.size() ? n : 0);
+    for (const auto& d : g_dirs)
+        if (path.find(d) == string::npos) path = d + ";" + path;
+    SetEnvironmentVariableA("PATH", path.c_str());
+#endif
+}
+
+void* alloc(size_t nbytes) {
+    if (nbytes == 0) return nullptr;
+    bind_context();
+    const size_t b = bucket(nbytes);
+    {
+        lock_guard<mutex> lock(g_pool_mu);
+        auto it = g_pool.find(b);
+        if (it != g_pool.end() && !it->second.empty()) {
+            CUdeviceptr p = it->second.back();
+            it->second.pop_back();
+            g_pool_bytes -= b;
+            return (void*)p;
+        }
+    }
+    CUdeviceptr p = 0;
+    CUresult r = g.d.cuMemAlloc(&p, b);
+    if (r != 0) {            // out of memory: give the cache back and retry once
+        empty_cache();
+        r = g.d.cuMemAlloc(&p, b);
+    }
+    check(r, "cuMemAlloc");
+    return (void*)p;
+}
+
+void free(void* ptr, size_t nbytes) noexcept {
+    if (!ptr) return;
+    lock_guard<mutex> lock(g_pool_mu);
+    const size_t b = bucket(nbytes);
+    g_pool[b].push_back((CUdeviceptr)ptr);
+    g_pool_bytes += b;
+}
+
+size_t cached_bytes() {
+    lock_guard<mutex> lock(g_pool_mu);
+    return g_pool_bytes;
+}
+
+void empty_cache() {
+    if (!available()) return;
+    bind_context();
+    lock_guard<mutex> lock(g_pool_mu);
+    g.d.cuCtxSynchronize();
+    for (auto& [size, blocks] : g_pool)
+        for (CUdeviceptr p : blocks) g.d.cuMemFree(p);
+    g_pool.clear();
+    g_pool_bytes = 0;
+}
+
+void memset_zero(void* dst, size_t nbytes) {
+    if (!nbytes) return;
+    bind_context();
+    check(g.d.cuMemsetD8((CUdeviceptr)dst, 0, nbytes), "cuMemsetD8");
+}
+
+void copy_to_device(void* dst, const void* src, size_t nbytes) {
+    if (!nbytes) return;
+    bind_context();
+    check(g.d.cuMemcpyHtoD((CUdeviceptr)dst, src, nbytes), "cuMemcpyHtoD");
+}
+
+void copy_to_host(void* dst, const void* src, size_t nbytes) {
+    if (!nbytes) return;
+    bind_context();
+    check(g.d.cuMemcpyDtoH(dst, (CUdeviceptr)src, nbytes), "cuMemcpyDtoH");
+}
+
+void copy_device(void* dst, const void* src, size_t nbytes) {
+    if (!nbytes) return;
+    bind_context();
+    check(g.d.cuMemcpyDtoD((CUdeviceptr)dst, (CUdeviceptr)src, nbytes), "cuMemcpyDtoD");
+}
+
+void synchronize() {
+    bind_context();
+    check(g.d.cuCtxSynchronize(), "cuCtxSynchronize");
+}
+
+void launch(const Kernel& k, int64_t n, void** args, unsigned block) {
+    if (n <= 0) return;
+    const int64_t grid = (n + block - 1) / block;
+    launch(k, (unsigned)min<int64_t>(grid, 0x7fffffff), 1, 1, block, 1, 1, 0, args);
+}
+
+void launch(const Kernel& k, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by,
+            unsigned bz, unsigned shared, void** args) {
+    CUfunction fn = function(k);
+    check(g.d.cuLaunchKernel(fn, gx, gy, gz, bx, by, bz, shared, nullptr, args, nullptr),
+          (string("launching ") + k.name).c_str());
+}
+
+} // namespace cuda
