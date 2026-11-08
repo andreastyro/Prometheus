@@ -15,6 +15,7 @@ marked "(C++)", which list API that exists only on the C++ side.
 
 Run from the repository root: python tests/check_readme_api.py
 """
+import importlib
 import os
 import re
 import sys
@@ -50,7 +51,20 @@ for token in re.findall(r"`([^`]+)`", impl_text):
     if re.fullmatch(r"[A-Za-z_]\w*", token):
         wanted.setdefault(token, "Implemented section")
 
-missing = sorted((n, where) for n, where in wanted.items() if n not in known)
+def exists(name):
+    """An export, a class member, or a submodule (prometheus.models): a
+    submodule is not in dir() until imported, so import it -- which also
+    proves it imports."""
+    if name in known:
+        return True
+    try:
+        importlib.import_module("prometheus." + name)
+        return True
+    except ImportError:
+        return False
+
+
+missing = sorted((n, where) for n, where in wanted.items() if not exists(n))
 
 print("README API check: %d names referenced, %d missing" % (len(wanted), len(missing)))
 for name, where in missing:
