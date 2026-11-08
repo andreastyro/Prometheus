@@ -31,8 +31,11 @@ void pgemm(bool ta, bool tb, int M, int N, int K, const float* A, int lda,
         gemm_serial(ta, tb, M, N, K, A, lda, Bm, ldb, beta, C, ldc);
         return;
     }
-    // split the larger output dimension; rows are cheaper to split
-    const bool rows = M >= 4 * T || M >= N;
+    // split the larger output dimension, so each thread's tile stays close to
+    // square. Splitting rows whenever M >= 4T gave the LSTM weight gradient
+    // [128, 1024] tiles of 8 x 1024 with K = 2048: 7.6 ms where 128 x 64
+    // tiles take a third of that.
+    const bool rows = M >= N;
     const int D = rows ? M : N;
     const int parts = std::min(T, std::max(1, D / 8));
     SerialBlasScope serial;
@@ -354,9 +357,25 @@ Result run(Cell cell, TensorPtr input, TensorPtr h0, TensorPtr c0, int H,
                 unpack_add(d.data(), Wx, I, H, 0, G);
             }
             if (wb) {
+                // column sums of dA [SB, GH]: each thread a band of columns,
+                // rows summed in float blocks of 64 then folded into double.
+                // It was one serial pass: 3.3 ms of a 24 ms LSTM step.
                 vector<double> d((size_t)GH, 0.0);
-                for (int64_t r = 0; r < SB; r++)
-                    for (int j = 0; j < GH; j++) d[j] += dA[(size_t)r * GH + j];
+                constexpr int CB = 64;
+                #pragma omp parallel for schedule(static) if(SB * GH >= 65536)
+                for (int j0 = 0; j0 < GH; j0 += CB) {
+                    const int j1 = std::min(GH, j0 + CB);
+                    float acc[CB];
+                    for (int64_t r0 = 0; r0 < SB; r0 += 64) {
+                        const int64_t r1 = std::min<int64_t>(SB, r0 + 64);
+                        for (int j = j0; j < j1; j++) acc[j - j0] = 0.0f;
+                        for (int64_t r = r0; r < r1; r++) {
+                            const float* row = dA.data() + (size_t)r * GH;
+                            for (int j = j0; j < j1; j++) acc[j - j0] += row[j];
+                        }
+                        for (int j = j0; j < j1; j++) d[j] += acc[j - j0];
+                    }
+                }
                 for (int k = 0; k < G; k++)
                     if (b[k]->requires_grad())
                         for (int j = 0; j < H; j++) b[k]->grad()[j] += (float)d[(size_t)k * H + j];

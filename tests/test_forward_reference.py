@@ -666,7 +666,7 @@ def test_batchnorm_modes():
           out, g * (X - mu) / np.sqrt(var + 1e-5) + b, atol=1e-4)
 
     rm = 0.9 * 0.0 + 0.1 * mu          # running_mean starts at 0
-    rv = 0.9 * 1.0 + 0.1 * var         # running_var starts at 1
+    rv = 0.9 * 1.0 + 0.1 * X.var(axis=0, ddof=1)   # starts at 1; unbiased, as PyTorch
     check("running_mean after one batch", np.array(bn.running_mean), rm, atol=1e-6)
     check("running_var after one batch",  np.array(bn.running_var),  rv, atol=1e-6)
 

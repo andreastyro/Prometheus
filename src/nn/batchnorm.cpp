@@ -89,9 +89,11 @@ TensorPtr BatchNorm::forward(TensorPtr input) {
             const float var = count ? (float)(m2 / (double)count) : 0.0f;
             mean_c[c]    = (float)m;
             inv_std_c[c] = 1.0f / std::sqrt(var + eps);
-            // exponential moving average, as PyTorch does
+            // exponential moving average, as PyTorch does: the running variance
+            // takes the unbiased estimate (n / (n-1)), the normalisation the biased
+            const float unbiased = count > 1 ? (float)(m2 / (double)(count - 1)) : var;
             running_mean[c] = (1.0f - momentum) * running_mean[c] + momentum * (float)m;
-            running_var[c]  = (1.0f - momentum) * running_var[c]  + momentum * var;
+            running_var[c]  = (1.0f - momentum) * running_var[c]  + momentum * unbiased;
         }
     } else {
         for (int64_t c = 0; c < C; c++) {
