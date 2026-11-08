@@ -1,4 +1,5 @@
 #include "ml/tensor.hpp"
+#include <cmath>
 #include "ml/autograd.hpp"
 #include "ml/optim/sgd.hpp"
 #include <stdio.h>
@@ -20,21 +21,26 @@ SGD::SGD(vector<TensorPtr> params, float lr, float momentum){
 
 }
 
+// Parallel over elements, with each buffer's pointer and size hoisted: the
+// loop used to call num_el() in its condition and index the velocity through
+// a vector of vectors on every element.
 void SGD::step(){
-
-    for (int i = 0; i < parameters.size(); i++){
-        auto &p = parameters[i];
-        for(int j = 0; j < p->num_el(); j++){
-
-            if (momentum == 0.0f){
-                p->data()[j] -= lr * p->grad()[j];
-                
-            } else {
-                velocity[i][j] = momentum * velocity[i][j] + p->grad()[j];
-                p->data()[j] -= lr * velocity[i][j];
+    for (int i = 0; i < (int)parameters.size(); i++){
+        auto& p = parameters[i];
+        const int n = (int)p->numel();
+        float* w = p->data();
+        const float* g = p->grad();
+        const float lr_ = lr, mu = momentum;
+        if (mu == 0.0f) {
+            #pragma omp parallel for schedule(static) if(n >= 32768)
+            for (int j = 0; j < n; j++) w[j] -= lr_ * g[j];
+        } else {
+            float* v = velocity[i].data();
+            #pragma omp parallel for schedule(static) if(n >= 32768)
+            for (int j = 0; j < n; j++) {
+                v[j] = mu * v[j] + g[j];
+                w[j] -= lr_ * v[j];
             }
-
         }
     }
-
 }

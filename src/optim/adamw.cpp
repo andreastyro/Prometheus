@@ -18,24 +18,30 @@ AdamW::AdamW(vector<TensorPtr> params, float lr, float beta1, float beta2,
 
 void AdamW::step() {
     t += 1;
-    float bc1 = 1.0f - std::pow(beta1, t);
-    float bc2 = 1.0f - std::pow(beta2, t);
+    const float bc1 = 1.0f - std::pow(beta1, t);
+    const float bc2 = 1.0f - std::pow(beta2, t);
+    const float b1 = beta1, b2 = beta2, lr_ = lr, eps_ = eps;
+    // decoupled weight decay as one multiplier, applied before the adaptive
+    // step: w <- w - lr*wd*w - lr*m_hat/(sqrt(v_hat)+eps). The old loop applied
+    // the decay to the already-updated weight, an extra lr^2 term PyTorch's
+    // AdamW does not have.
+    const float decay = 1.0f - lr * weight_decay;
 
     for (int i = 0; i < (int)parameters.size(); i++) {
         auto& p = parameters[i];
-        for (int j = 0; j < p->num_el(); j++) {
-            float g = p->grad()[j];
-
-            m[i][j] = beta1 * m[i][j] + (1.0f - beta1) * g;
-            v[i][j] = beta2 * v[i][j] + (1.0f - beta2) * g * g;
-
-            float m_hat = m[i][j] / bc1;
-            float v_hat = v[i][j] / bc2;
-
-            // adaptive update (same as Adam)
-            p->data()[j] -= lr * m_hat / (std::sqrt(v_hat) + eps);
-            // decoupled weight decay (NOT folded into gradient)
-            p->data()[j] -= lr * weight_decay * p->data()[j];
+        const int n = (int)p->numel();
+        float* w = p->data();
+        const float* g = p->grad();
+        float* M = m[i].data();
+        float* V = v[i].data();
+        #pragma omp parallel for schedule(static) if(n >= 32768)
+        for (int j = 0; j < n; j++) {
+            const float gj = g[j];
+            M[j] = b1 * M[j] + (1.0f - b1) * gj;
+            V[j] = b2 * V[j] + (1.0f - b2) * gj * gj;
+            const float m_hat = M[j] / bc1;
+            const float v_hat = V[j] / bc2;
+            w[j] = w[j] * decay - lr_ * m_hat / (std::sqrt(v_hat) + eps_);
         }
     }
 }
