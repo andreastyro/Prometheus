@@ -1,5 +1,6 @@
 #include "ml/nn/rnn/lstm.hpp"
 #include "ml/ops.hpp"
+#include "ml/nn/rnn/fused_rnn.hpp"
 #include "ml/nn/rnn/sequence_ops.hpp"
 
 using namespace std;
@@ -23,42 +24,11 @@ LSTM::LSTM(int input_size, int hidden_size)
     b_g = Tensor::zeros({hidden_size}); b_g->set_requires_grad(true);
 }
 
+// The whole sequence in one fused kernel; see fused_rnn.hpp.
 tuple<TensorPtr, TensorPtr, TensorPtr> LSTM::forward(TensorPtr input, TensorPtr h0, TensorPtr c0) {
-    int seq_len  = input->shape()[0];
-    int batch    = input->shape()[1];
-    int input_sz = input->shape()[2];
-
-    TensorPtr h = h0 ? h0 : Tensor::zeros({batch, hidden_size});
-    TensorPtr c = c0 ? c0 : Tensor::zeros({batch, hidden_size});
-
-    // collected per timestep, then stacked differentiably at the end
-    vector<TensorPtr> steps;
-    steps.reserve(seq_len);
-
-    for (int t = 0; t < seq_len; t++) {
-        // slice x_t: [batch, input_size]
-        auto x_t = rnn_slice_step(input, t);
-
-        // i_t = sigmoid(x_t @ W_xi + h @ W_hi + b_i)
-        auto i_t = sigmoid(add(add(matmul(x_t, W_xi), matmul(h, W_hi)), b_i));
-        // f_t = sigmoid(x_t @ W_xf + h @ W_hf + b_f)
-        auto f_t = sigmoid(add(add(matmul(x_t, W_xf), matmul(h, W_hf)), b_f));
-        // o_t = sigmoid(x_t @ W_xo + h @ W_ho + b_o)
-        auto o_t = sigmoid(add(add(matmul(x_t, W_xo), matmul(h, W_ho)), b_o));
-        // g_t = tanh(x_t @ W_xg + h @ W_hg + b_g)
-        auto g_t = tanh_op(add(add(matmul(x_t, W_xg), matmul(h, W_hg)), b_g));
-
-        // c_t = f_t * c + i_t * g_t
-        c = add(multiply(f_t, c), multiply(i_t, g_t));
-        // h_t = o_t * tanh(c_t)
-        h = multiply(o_t, tanh_op(c));
-
-        steps.push_back(h);
-    }
-
-    auto output = rnn_stack_steps(steps);
-
-    return {output, h, c};
+    auto r = rnn_kernel::run(rnn_kernel::Cell::LSTM, input, h0, c0, hidden_size,
+                             {W_xi, W_xf, W_xo, W_xg}, {W_hi, W_hf, W_ho, W_hg}, {b_i, b_f, b_o, b_g});
+    return {r.output, r.h_n, r.c_n};
 }
 
 TensorPtr LSTM::forward(TensorPtr input) {

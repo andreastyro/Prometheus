@@ -41,6 +41,7 @@ set(SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/rnn/sequence_ops.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/rnn/lstm.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/rnn/gru.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/rnn/fused_rnn.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/optim/grad_scaler.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/nlp/embedding.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/nlp/layernorm.cpp
