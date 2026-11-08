@@ -149,7 +149,7 @@ static TensorPtr binary_op(const char* name, TensorPtr a, TensorPtr b) {
 
     if (a->requires_grad() || b->requires_grad()) {
         auto node = make_node(result, {a, b});
-        node->backward_fn = [a, b, result, same, out_shape]() {
+        node->backward_fn = [a, b, same, out_shape](const TensorPtr& result) {
             const float* G  = result->grad();
             const float* A  = a->data();
             const float* Bv = b->data();
@@ -219,7 +219,7 @@ TensorPtr add(float scalar, TensorPtr a) {
 
     if (a->requires_grad()) {
         auto node = make_node(result, {a});
-        node->backward_fn = [a, result]() {
+        node->backward_fn = [a](const TensorPtr& result) {
             const int n_4 = result->num_el();
             #pragma omp parallel for schedule(static) if(n_4 >= 32768)
             for (int i = 0; i < n_4; i++)
@@ -243,7 +243,7 @@ TensorPtr multiply(float scalar, TensorPtr a) {
 
     if (a->requires_grad()) {
         auto node = make_node(result, {a});
-        node->backward_fn = [a, result, scalar]() {
+        node->backward_fn = [a, scalar](const TensorPtr& result) {
             const int n_8 = result->num_el();
             #pragma omp parallel for schedule(static) if(n_8 >= 32768)
             for (int i = 0; i < n_8; i++)
@@ -290,7 +290,7 @@ TensorPtr matmul(TensorPtr a, TensorPtr b) {
 
         if (a->requires_grad() || b->requires_grad()) {
             auto node = make_node(result, {a, b});
-            node->backward_fn = [a, b, result, rows, n, k, b_is_wt]() {
+            node->backward_fn = [a, b, rows, n, k, b_is_wt](const TensorPtr& result) {
                 const float* g = result->grad();
                 if (a->requires_grad()) {
                     if (b_is_wt) matmul_accumulate(rows, (int)k, (int)n, g, b->data(), a->grad());
@@ -331,7 +331,7 @@ TensorPtr matmul(TensorPtr a, TensorPtr b) {
 
     if (a->requires_grad() || b->requires_grad()) {
         auto node = make_node(result, {a, b});
-        node->backward_fn = [a, b, result, ia, ib, nb, m, n, k, sz_a, sz_b, sz_c]() {
+        node->backward_fn = [a, b, ia, ib, nb, m, n, k, sz_a, sz_b, sz_c](const TensorPtr& result) {
             const float* g = result->grad();
             // serial over the batch: a broadcast operand accumulates from
             // several output matrices into the same gradient
@@ -361,7 +361,7 @@ TensorPtr relu(TensorPtr a) {
 
     if (a->requires_grad()) {
         auto node = make_node(result, {a});
-        node->backward_fn = [a, result]() {
+        node->backward_fn = [a](const TensorPtr& result) {
             const int n_10 = result->num_el();
             #pragma omp parallel for schedule(static) if(n_10 >= 32768)
             for (int i = 0; i < n_10; i++)
@@ -386,7 +386,7 @@ TensorPtr sigmoid(TensorPtr a) {
     if (a->requires_grad()){
         auto node = make_node(result, {a});
 
-        node->backward_fn = [a, result](){
+        node->backward_fn = [a](const TensorPtr& result){
             const int n_12 = result->num_el();
             #pragma omp parallel for schedule(static) if(n_12 >= 32768)
             for (int i = 0; i < n_12; i++){
@@ -411,7 +411,7 @@ TensorPtr subtract(float scalar, TensorPtr a) {
 
     if (a->requires_grad()) {
         auto node = make_node(result, {a});
-        node->backward_fn = [a, result]() {
+        node->backward_fn = [a](const TensorPtr& result) {
             const int n_16 = result->num_el();
             #pragma omp parallel for schedule(static) if(n_16 >= 32768)
             for (int i = 0; i < n_16; i++)
@@ -433,7 +433,7 @@ TensorPtr subtract(TensorPtr a, float scalar) {
 
     if (a->requires_grad()) {
         auto node = make_node(result, {a});
-        node->backward_fn = [a, result]() {
+        node->backward_fn = [a](const TensorPtr& result) {
             const int n_18 = result->num_el();
             #pragma omp parallel for schedule(static) if(n_18 >= 32768)
             for (int i = 0; i < n_18; i++)
@@ -460,7 +460,7 @@ TensorPtr divide(float scalar, TensorPtr a) {
 
     if (a->requires_grad()) {
         auto node = make_node(result, {a});
-        node->backward_fn = [a, result, scalar]() {
+        node->backward_fn = [a, scalar](const TensorPtr& result) {
             const int n_22 = result->num_el();
             #pragma omp parallel for schedule(static) if(n_22 >= 32768)
             for (int i = 0; i < n_22; i++)
@@ -484,7 +484,7 @@ TensorPtr divide(TensorPtr a, float scalar) {
 
     if (a->requires_grad()) {
         auto node = make_node(result, {a});
-        node->backward_fn = [a, result, scalar]() {
+        node->backward_fn = [a, scalar](const TensorPtr& result) {
             const int n_24 = result->num_el();
             #pragma omp parallel for schedule(static) if(n_24 >= 32768)
             for (int i = 0; i < n_24; i++)
@@ -508,7 +508,7 @@ TensorPtr tanh_op(TensorPtr a) {
     if (a->requires_grad()){
         auto node = make_node(result, {a});
 
-        node->backward_fn = [a, result](){
+        node->backward_fn = [a](const TensorPtr& result){
             const int n_26 = result->num_el();
             #pragma omp parallel for schedule(static) if(n_26 >= 32768)
             for (int i = 0; i < n_26; i++){
@@ -549,7 +549,7 @@ TensorPtr softmax(TensorPtr a) {
 
     if (a->requires_grad()) {
         auto node = make_node(result, {a});
-        node->backward_fn = [a, result, rows, cols]() {
+        node->backward_fn = [a, rows, cols](const TensorPtr& result) {
             // dL/dx_j = y_j * (g_j - sum_k g_k y_k), per row
             const float* Y = result->data();
             const float* G = result->grad();
@@ -582,7 +582,7 @@ TensorPtr log_op(TensorPtr a) {
 
     if (a->requires_grad()) {
         auto node = make_node(result, {a});
-        node->backward_fn = [a, result]() {
+        node->backward_fn = [a](const TensorPtr& result) {
             const int n_28 = result->num_el();
             #pragma omp parallel for schedule(static) if(n_28 >= 32768)
             for (int i = 0; i < n_28; i++)
@@ -605,7 +605,7 @@ TensorPtr exp_op(TensorPtr a) {
 
     if (a->requires_grad()) {
         auto node = make_node(result, {a});
-        node->backward_fn = [a, result]() {
+        node->backward_fn = [a](const TensorPtr& result) {
             const int n_30 = result->num_el();
             #pragma omp parallel for schedule(static) if(n_30 >= 32768)
             for (int i = 0; i < n_30; i++)
@@ -628,7 +628,7 @@ TensorPtr pow_op(TensorPtr a, float p) {
 
     if (a->requires_grad()) {
         auto node = make_node(result, {a});
-        node->backward_fn = [a, result, p]() {
+        node->backward_fn = [a, p](const TensorPtr& result) {
             const int n_32 = result->num_el();
             #pragma omp parallel for schedule(static) if(n_32 >= 32768)
             for (int i = 0; i < n_32; i++)
@@ -654,7 +654,7 @@ TensorPtr sqrt_op(TensorPtr a) {
 
     if (a->requires_grad()) {
         auto node = make_node(result, {a});
-        node->backward_fn = [a, result]() {
+        node->backward_fn = [a](const TensorPtr& result) {
             const int n_34 = result->num_el();
             #pragma omp parallel for schedule(static) if(n_34 >= 32768)
             for (int i = 0; i < n_34; i++)
@@ -678,7 +678,7 @@ TensorPtr abs_op(TensorPtr a) {
     if (a->requires_grad()){
         auto node = make_node(result, {a});
 
-        node->backward_fn = [a, result](){
+        node->backward_fn = [a](const TensorPtr& result){
             const int n_36 = result->num_el();
             #pragma omp parallel for schedule(static) if(n_36 >= 32768)
             for (int i = 0; i < n_36; i++){
@@ -711,7 +711,7 @@ static TensorPtr reduce_sum(const char* name, TensorPtr a, int dim, bool keepdim
         result->data()[0] = (float)(mean ? acc / (double)n : acc);
         if (a->requires_grad()) {
             auto node = make_node(result, {a});
-            node->backward_fn = [a, result, n, mean]() {
+            node->backward_fn = [a, n, mean](const TensorPtr& result) {
                 const float g = result->grad()[0] / (mean ? (float)n : 1.0f);
                 float* GA = a->grad();
                 for (int64_t i = 0; i < n; i++) GA[i] += g;
@@ -750,7 +750,7 @@ static TensorPtr reduce_sum(const char* name, TensorPtr a, int dim, bool keepdim
 
     if (a->requires_grad()) {
         auto node = make_node(result, {a});
-        node->backward_fn = [a, result, outer, len, inner, scale]() {
+        node->backward_fn = [a, outer, len, inner, scale](const TensorPtr& result) {
             const float* G = result->grad();
             float* GA = a->grad();
             for (int64_t o = 0; o < outer; o++)
@@ -783,7 +783,7 @@ TensorPtr max_op(TensorPtr a) {
 
     if (a->requires_grad()) {
         auto node = make_node(result, {a});
-        node->backward_fn = [a, result, arg]() {
+        node->backward_fn = [a, arg](const TensorPtr& result) {
             a->grad()[arg] += result->grad()[0];
         };
     }
@@ -806,7 +806,7 @@ TensorPtr min_op(TensorPtr a) {
 
     if (a->requires_grad()) {
         auto node = make_node(result, {a});
-        node->backward_fn = [a, result, arg]() {
+        node->backward_fn = [a, arg](const TensorPtr& result) {
             a->grad()[arg] += result->grad()[0];
         };
     }
@@ -832,7 +832,7 @@ TensorPtr clip(TensorPtr a, float min_val, float max_val) {
 
     if (a->requires_grad()) {
         auto node = make_node(result, {a});
-        node->backward_fn = [a, result, min_val, max_val]() {
+        node->backward_fn = [a, min_val, max_val](const TensorPtr& result) {
             const int n_42 = result->num_el();
             #pragma omp parallel for schedule(static) if(n_42 >= 32768)
             for (int i = 0; i < n_42; i++) {
@@ -889,7 +889,7 @@ TensorPtr gelu(TensorPtr a) {
 
     if (a->requires_grad()) {
         auto node = make_node(result, {a});
-        node->backward_fn = [a, result]() {
+        node->backward_fn = [a](const TensorPtr& result) {
             constexpr float k = 0.7978845608f;
             int m = a->num_el();
             #pragma omp parallel for schedule(static) if(m >= 32768)
@@ -956,7 +956,7 @@ TensorPtr concat_op(vector<TensorPtr> inputs, int axis) {
 
     if (any_grad) {
         auto node = make_node(result, inputs);
-        node->backward_fn = [inputs, result, outer, inner, concat_total, axis]() {
+        node->backward_fn = [inputs, outer, inner, concat_total, axis](const TensorPtr& result) {
             for (int o = 0; o < outer; o++) {
                 int read = 0;
                 for (auto& t : inputs) {
@@ -994,7 +994,7 @@ TensorPtr matmul_bt(TensorPtr a, TensorPtr b) {
     if (a->requires_grad() || b->requires_grad()) {
         auto node = make_node(result, {a, b});
 
-        node->backward_fn = [a, b, result, m, n, k]() {
+        node->backward_fn = [a, b, m, n, k](const TensorPtr& result) {
             const float* g = result->grad();
 
             // C = A @ B^T  =>  dA = dC @ B,  dB = dC^T @ A
@@ -1046,7 +1046,7 @@ TensorPtr permute(TensorPtr a, vector<int> dims) {
 
     if (a->requires_grad()) {
         auto node = make_node(v, {a});
-        node->backward_fn = [a, v, dims]() {
+        node->backward_fn = [a, dims](const TensorPtr& v) {
             // Walking the view in row-major order with these strides lands on
             // each element's row-major position in `a`.
             const Shape a_rm = Tensor::contiguous_strides(a->shape());
@@ -1101,7 +1101,7 @@ TensorPtr reshape(TensorPtr a, ShapeArg new_shape_arg) {
 
     if (src->requires_grad()) {
         auto node = make_node(v, {src});
-        node->backward_fn = [src, v]() {
+        node->backward_fn = [src](const TensorPtr& v) {
             // element order is unchanged, so the gradient maps one to one
             const int64_t n = src->numel();
             const float* gv = v->grad();
@@ -1126,7 +1126,7 @@ TensorPtr contiguous(TensorPtr a) {
 
     if (a->requires_grad()) {
         auto node = make_node(out, {a});
-        node->backward_fn = [a, out]() {
+        node->backward_fn = [a](const TensorPtr& out) {
             // both gradients are row-major over the same shape
             const int64_t n = a->numel();
             const float* go = out->grad();
@@ -1184,7 +1184,7 @@ TensorPtr linear_op(TensorPtr x, TensorPtr W, TensorPtr bias, TensorPtr residual
 
     if (need) {
         auto node = make_node(result, inputs);
-        node->backward_fn = [x, W, bias, residual, result, rows, in, out]() {
+        node->backward_fn = [x, W, bias, residual, rows, in, out](const TensorPtr& result) {
             const float* g = result->grad();
 
             if (x->requires_grad())

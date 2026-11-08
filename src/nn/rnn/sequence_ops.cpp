@@ -23,7 +23,7 @@ TensorPtr rnn_slice_step(TensorPtr input, int t) {
 
     if (input->requires_grad()) {
         auto node = make_node(out, {input});
-        node->backward_fn = [input, out, base, batch, features]() {
+        node->backward_fn = [input, base, batch, features](const TensorPtr& out) {
             for (int i = 0; i < batch * features; i++)
                 input->grad()[base + i] += out->grad()[i];
         };
@@ -54,7 +54,7 @@ TensorPtr rnn_stack_steps(const vector<TensorPtr>& steps) {
 
     if (any_grad) {
         auto node = make_node(out, steps);
-        node->backward_fn = [steps, out, seq_len, stride]() {
+        node->backward_fn = [steps, seq_len, stride](const TensorPtr& out) {
             for (int t = 0; t < seq_len; t++) {
                 if (!steps[t]->requires_grad()) continue;
                 for (int i = 0; i < stride; i++)

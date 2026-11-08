@@ -84,7 +84,7 @@ TensorPtr Conv2D::forward(TensorPtr input){
         
         auto node = make_node(output, {input, weights, bias});
 
-        node->backward_fn = [=]() {
+        node->backward_fn = [=](const TensorPtr& output) {
             for (int b = 0; b < batch_size; b++){
                 for (int f = 0; f < out_channels; f++){
                     for (int i = 0; i < h_out; i++){

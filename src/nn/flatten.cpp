@@ -21,7 +21,7 @@ TensorPtr Flatten::forward(TensorPtr input){
     if (input->requires_grad()) {
         auto node = make_node(result, {input});
 
-        node->backward_fn = [input, result]() {
+        node->backward_fn = [input](const TensorPtr& result) {
             for (int i = 0; i < result->num_el(); i++)
                 input->grad()[i] += result->grad()[i];
         };

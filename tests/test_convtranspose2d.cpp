@@ -46,7 +46,7 @@ CHECK_NEAR("output dim 3", (double)(out2->shape()[3]), 7, 0.0);
     ConvTranspose2D ct3(1, 1, 2, 2);
     auto out3 = ct3.forward(x3);
     for (int i = 0; i < out3->num_el(); i++) out3->grad()[i] = 1.0f;
-    out3->grad_fn()->backward_fn();
+    out3->grad_fn()->backward_fn(out3);
 
     printf("weights->grad (expected non-zero):\n");
     for (int i = 0; i < ct3.weights->num_el(); i++)

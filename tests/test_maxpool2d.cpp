@@ -64,7 +64,7 @@ CHECK_NEAR("output dim 3", (double)(out2->shape()[3]), 2, 0.0);
 
     // set all output grads to 1
     for (int i = 0; i < out3->num_el(); i++) out3->grad()[i] = 1.0f;
-    out3->grad_fn()->backward_fn();
+    out3->grad_fn()->backward_fn(out3);
 
     printf("input->grad (max positions get 1, rest get 0):\n");
     for (int i = 0; i < 4; i++){
@@ -123,7 +123,7 @@ CHECK_NEAR("output dim 3", (double)(out5->shape()[3]), 2, 0.0);
     AvgPool2D avgpool2(2);
     auto out6 = avgpool2.forward(x6);
     for (int i = 0; i < out6->num_el(); i++) out6->grad()[i] = 1.0f;
-    out6->grad_fn()->backward_fn();
+    out6->grad_fn()->backward_fn(out6);
 
     printf("input->grad (expected all 0.25):\n");
     for (int i = 0; i < 4; i++){

@@ -416,7 +416,7 @@ void Tensor::backward() {
 
     for (TensorPtr& t : order)
         if (t->grad_fn())
-            t->grad_fn()->backward_fn();
+            t->grad_fn()->backward_fn(t);
 }
 
 TensorPtr Tensor::detach() const {

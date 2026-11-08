@@ -102,8 +102,8 @@ TensorPtr BatchNorm::forward(TensorPtr input) {
         auto beta_  = beta;
         const bool was_training = training;
 
-        node->backward_fn = [input, output, gamma_, beta_, x_hat, inv_std_all,
-                             N, C, S, count, was_training]() {
+        node->backward_fn = [input, gamma_, beta_, x_hat, inv_std_all,
+                             N, C, S, count, was_training](const TensorPtr& output) {
             for (int c = 0; c < C; c++) {
                 const float inv_std = inv_std_all[c];
 

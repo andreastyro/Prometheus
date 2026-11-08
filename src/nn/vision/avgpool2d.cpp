@@ -42,7 +42,7 @@ TensorPtr AvgPool2D::forward(TensorPtr input){
 
     if (input->requires_grad()){
         auto node = make_node(output, {input});
-        node->backward_fn = [=]() { // all gradients distributed equally
+        node->backward_fn = [=](const TensorPtr& output) { // all gradients distributed equally
             for (int b = 0; b < n; b++){
                 for (int c = 0; c < channels; c++){
                     for (int i = 0; i < h_out; i++){

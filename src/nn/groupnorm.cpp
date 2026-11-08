@@ -90,8 +90,8 @@ TensorPtr GroupNorm::forward(TensorPtr input) {
         auto beta_  = beta;
         int  groups = num_groups;
 
-        node->backward_fn = [input, output, gamma_, beta_, x_hat, inv_std_all,
-                             batch, channels, spatial, group_size, groups]() {
+        node->backward_fn = [input, gamma_, beta_, x_hat, inv_std_all,
+                             batch, channels, spatial, group_size, groups](const TensorPtr& output) {
             const int N = group_size * spatial;
 
             for (int b = 0; b < batch; b++) {

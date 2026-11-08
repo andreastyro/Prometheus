@@ -52,7 +52,7 @@ TensorPtr MaxPool2D::forward(TensorPtr input){
 
     if (input->requires_grad()){ // simply add grad to max value as its the only one that modifies output
         auto node = make_node(output, {input});
-        node->backward_fn = [input, output, mask]() {
+        node->backward_fn = [input, mask](const TensorPtr& output) {
             for (int i = 0; i < output->num_el(); i++)
                 input->grad()[mask[i]] += output->grad()[i];
         };

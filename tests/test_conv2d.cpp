@@ -88,7 +88,7 @@ CHECK_NEAR("after flatten dim 1", (double)(flat->shape()[1]), 576, 0.0);
     for (int i = 0; i < out5->num_el(); i++) out5->grad()[i] = 1.0f;
 
     // run backward
-    out5->grad_fn()->backward_fn();
+    out5->grad_fn()->backward_fn(out5);
 
     printf("weights->grad (expected non-zero):\n");
     for (int i = 0; i < conv5.weights->num_el(); i++)

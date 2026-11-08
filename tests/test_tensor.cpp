@@ -77,5 +77,28 @@ int main() {
     for (int i = 0; i < 50; i++) if (r1->data()[i] != r2->data()[i]) same = false;
     CHECK_TRUE("same seed gives same randn", same);
 
+    // The graph must be freed once nothing outside it holds the result. Each
+    // backward closure used to capture its own output, a cycle reference
+    // counting cannot break, so every graph ever built leaked -- 6.3 MB per
+    // step on a small model. A weak pointer to an intermediate tells whether
+    // the graph went away.
+    {
+        std::weak_ptr<Tensor> after_backward, never_backpropagated;
+        auto x = Tensor::randn({8, 8});
+        x->set_requires_grad(true);
+        {
+            auto y = relu(matmul(x, x));
+            after_backward = y;
+            mean(multiply(y, y), -1)->backward();
+        }
+        {
+            auto y = relu(matmul(x, x));
+            never_backpropagated = y;
+            mean(multiply(y, y), -1);
+        }
+        CHECK_TRUE("graph is freed after backward", after_backward.expired());
+        CHECK_TRUE("graph is freed without backward", never_backpropagated.expired());
+    }
+
     return test_report();
 }

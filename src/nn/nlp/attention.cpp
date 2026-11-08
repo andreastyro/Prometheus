@@ -188,7 +188,7 @@ TensorPtr MultiHeadAttention::forward_rows(TensorPtr input, int batch) {
         // Capture all intermediates and weight TensorPtrs by value.
         // TensorPtrs keep the weight tensors alive; vectors own their data.
         node->backward_fn = [
-            input, W_q=W_q, W_k=W_k, W_v=W_v, W_o=W_o, result,
+            input, W_q=W_q, W_k=W_k, W_v=W_v, W_o=W_o,
             // moved, not copied: at [1024, 384] with 6 heads these buffers
             // are about 9 MB together, and copying them per layer per forward
             // cost more than some of the matmuls they exist to support
@@ -197,7 +197,7 @@ TensorPtr MultiHeadAttention::forward_rows(TensorPtr input, int batch) {
             A_heads     = std::move(A_heads),
             W_qkv       = std::move(W_qkv),
             rows, B, S, E, E3, H, D, attn_scale, rope
-        ]() {
+        ](const TensorPtr& result) {
             const float* grad_out = result->grad();
 
             // ── Output projection backward ────────────────────────────────

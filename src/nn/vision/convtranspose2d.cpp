@@ -82,7 +82,7 @@ TensorPtr ConvTranspose2D::forward(TensorPtr input){
     if (input->requires_grad() || weights->requires_grad()){
         auto node = make_node(output, {input, weights, bias});
 
-        node->backward_fn = [=]() {
+        node->backward_fn = [=](const TensorPtr& output) {
             for (int b = 0; b < batch_size; b++){
                 for (int ic = 0; ic < in_channels; ic++){
                     for (int i = 0; i < h_in; i++){

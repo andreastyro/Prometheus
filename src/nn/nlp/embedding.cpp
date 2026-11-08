@@ -44,7 +44,7 @@ TensorPtr Embedding::forward(TensorPtr input) {
     if (weight->requires_grad()) {
         auto w = weight;
         auto node = make_node(output, {w});
-        node->backward_fn = [w, output, token_ids, batch, seq_len, embed_dim=embed_dim]() {
+        node->backward_fn = [w, token_ids, batch, seq_len, embed_dim=embed_dim](const TensorPtr& output) {
             for (int b = 0; b < batch; b++) {
                 for (int t = 0; t < seq_len; t++) {
                     int id      = token_ids[b * seq_len + t];

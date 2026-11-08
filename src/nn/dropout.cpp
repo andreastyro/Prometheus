@@ -41,7 +41,7 @@ TensorPtr Dropout::forward(TensorPtr input){
     if (input->requires_grad()) {
         auto node = make_node(result, {input});
 
-        node->backward_fn = [input, result, mask, n]() {
+        node->backward_fn = [input, mask, n](const TensorPtr& result) {
             for (int i = 0; i < n; i++)
                 input->grad()[i] += result->grad()[i] * mask[i];
         };

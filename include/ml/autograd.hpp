@@ -24,5 +24,14 @@ struct GradNode {
     // The gradient function — when called, it reads result->grad (the incoming
     // gradient from the layer above) and accumulates the correct gradient into
     // each input tensor's .grad field
-    std::function<void()> backward_fn;
+    /// Propagate this node's output gradient into its inputs' gradients.
+    ///
+    /// The output tensor is passed in rather than captured. A closure that
+    /// captured its own output made a cycle -- output -> grad_fn -> node ->
+    /// closure -> output -- that reference counting can never free, so every
+    /// graph ever built leaked: measured at 6.3 MB per training step on a
+    /// small model, growing without bound. With the output as an argument,
+    /// nothing in the graph points back towards the loss, and the whole graph
+    /// goes when the last reference to the output does.
+    std::function<void(const TensorPtr& output)> backward_fn;
 };

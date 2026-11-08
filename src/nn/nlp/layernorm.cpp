@@ -55,10 +55,10 @@ TensorPtr LayerNorm::forward(TensorPtr input) {
         auto g = gamma;
         auto b = beta;
         auto node = make_node(output, {input, g, b});
-        node->backward_fn = [input, g, b, output,
+        node->backward_fn = [input, g, b,
                             x_hat_all = std::move(x_hat_all),
                             inv_std_all = std::move(inv_std_all),
-                            num_rows, N]() {
+                            num_rows, N](const TensorPtr& output) {
             #pragma omp parallel for schedule(static) if(num_rows >= 64)
             for (int r = 0; r < num_rows; r++) {
                 int off = r * N;

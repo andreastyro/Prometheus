@@ -32,7 +32,7 @@ TensorPtr PositionalEncoding::forward(TensorPtr input) {
     if (input->requires_grad()) {
         auto node = make_node(output, {input});
 
-        node->backward_fn = [input, output]() {
+        node->backward_fn = [input](const TensorPtr& output) {
             for (int i = 0; i < output->num_el(); i++)
                 input->grad()[i] += output->grad()[i];
         };
