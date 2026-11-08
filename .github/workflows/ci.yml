@@ -109,6 +109,11 @@ jobs:
       - name: Dtypes
         run: bash .github/annotate.sh python tests/test_dtypes.py
 
+      # The GPU suite. CI has no GPU, so this checks that it loads and skips
+      # cleanly; it runs for real on a machine with an NVIDIA GPU.
+      - name: GPU (skips without one)
+        run: bash .github/annotate.sh python tests/test_cuda.py
+
       - name: README matches the API
         run: bash .github/annotate.sh python tests/check_readme_api.py
 

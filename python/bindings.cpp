@@ -98,7 +98,8 @@ PYBIND11_MODULE(_C, m) {
     py::enum_<Device>(m, "device")
         .value("cpu",  Device::CPU)
         .value("cuda", Device::CUDA);
-    m.attr("cpu") = m.attr("device").attr("cpu");
+    m.attr("cpu")  = m.attr("device").attr("cpu");
+    m.attr("cuda") = m.attr("device").attr("cuda");
 
     py::class_<Tensor, std::shared_ptr<Tensor>>(m, "Tensor")
         .def(py::init([](std::vector<int64_t> shape, DType dtype) {
