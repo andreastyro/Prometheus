@@ -28,5 +28,11 @@ public:
     /// The optimizer calls this after backward() to know what to update.
     virtual std::vector<TensorPtr> parameters() = 0;
 
+    /// Move every parameter to `device` in place (model.to(cuda)). Optimizers
+    /// built before or after see the same tensors.
+    void to(Device device) {
+        for (auto& p : parameters()) p->move_to_(device);
+    }
+
     virtual ~Module() {}
 };

@@ -19,7 +19,21 @@ LayerNorm::LayerNorm(int normalized_shape, float eps)
 //
 //   Let g[i] = dy/dx_hat[i] * d_loss/dy[i] = gamma[i] * output.grad[i]
 //   d_loss/d_x[j] = (1/std) * (1/N) * (N*g[j] - Σg - x_hat[j]*Σ(g*x_hat))
+// The forward written with ops: the GPU path, and the reference the
+// higher-order gradients differentiate.
+static TensorPtr layernorm_ops(const TensorPtr& x, const TensorPtr& g, const TensorPtr& b, float eps) {
+    const int last = x->dim() - 1;
+    auto m   = mean(x, last, true);
+    auto d   = subtract(x, m);
+    auto var = mean(multiply(d, d), last, true);
+    auto xh  = divide(d, sqrt_op(add(eps, var)));
+    return add(multiply(xh, g), b);
+}
+
 TensorPtr LayerNorm::forward(TensorPtr input) {
+    if (input->device() == Device::CUDA || gamma->device() == Device::CUDA)
+        return layernorm_ops(input, gamma, beta, eps);
+    input = checked_input("LayerNorm", input);
     int N       = normalized_shape;
     int num_rows = input->num_el() / N;
     auto output  = make_shared<Tensor>(input->shape());
@@ -58,13 +72,7 @@ TensorPtr LayerNorm::forward(TensorPtr input) {
         auto node = make_node(output, {input, g, b});
         node->name = "LayerNorm::forward";
         autograd::attach_reference(*node, [eps = eps](const std::vector<TensorPtr>& in) -> TensorPtr {
-            auto x = in[0];
-            const int last = x->dim() - 1;
-            auto m   = mean(x, last, true);
-            auto d   = subtract(x, m);
-            auto var = mean(multiply(d, d), last, true);
-            auto xh  = divide(d, sqrt_op(add(eps, var)));
-            return add(multiply(xh, in[1]), in[2]);
+            return layernorm_ops(in[0], in[1], in[2], eps);
         });
         node->backward_fn = [input, g, b,
                             x_hat_all = std::move(x_hat_all),

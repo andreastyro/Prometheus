@@ -254,6 +254,11 @@ public:
     /// gradient is cast back. To or from an integer or bool dtype it leaves
     /// the graph.
     TensorPtr to(DType dtype);
+    /// Move this tensor's data to `device` in place, keeping its identity, so
+    /// everything holding it -- a layer, an optimizer -- sees the move. Only
+    /// for a leaf (a parameter); its gradient restarts at zero on the device.
+    void move_to_(Device device);
+
     /// A copy on `device`. CUDA needs a GPU and its driver (see ml/cuda.hpp);
     /// without them this raises with the reason. Not differentiable yet.
     TensorPtr to(Device device);

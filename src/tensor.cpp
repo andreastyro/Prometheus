@@ -667,6 +667,26 @@ TensorPtr Tensor::to(Device target) {
     return out;
 }
 
+void Tensor::move_to_(Device target) {
+    if (target == device()) return;
+    if (grad_fn_)
+        throw runtime_error("move_to_: only a leaf tensor (a parameter) can be moved in place");
+    TensorPtr moved;
+    {
+        NoGrad off;
+        moved = to(target);
+    }
+    storage_  = moved->storage_;
+    strides_  = moved->strides_;
+    offset_   = 0;
+    is_view_  = false;
+    init_layout();
+    grad_.reset();
+    grad64_.clear();
+    grad_dev_.reset();
+    if (requires_grad_) ensure_grad();
+}
+
 TensorPtr Tensor::transpose(int dim0, int dim1) { return ::transpose(shared_from_this(), dim0, dim1); }
 TensorPtr Tensor::reshape(ShapeArg shape)       { return ::reshape(shared_from_this(), shape); }
 TensorPtr Tensor::contiguous()                  { return ::contiguous(shared_from_this()); }

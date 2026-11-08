@@ -28,6 +28,14 @@ TensorPtr Dropout::forward(TensorPtr input){
     const float scale = 1.0f / (1.0f - rate);
     const int   n     = input->num_el();
 
+    if (input->device() == Device::CUDA) {
+        // the mask comes from the same host RNG as on the CPU, so a seeded
+        // run drops the same units on either device
+        vector<float> mask(n);
+        for (int i = 0; i < n; i++) mask[i] = dist(prometheus_rng()) < rate ? 0.0f : scale;
+        return multiply(input, make_shared<Tensor>(input->shape(), mask)->to(Device::CUDA));
+    }
+
     auto result = make_shared<Tensor>(input->shape());
 
     // mask[i] is the factor actually applied, so the backward pass can reuse it

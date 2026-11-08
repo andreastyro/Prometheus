@@ -1,3 +1,4 @@
+#include "ops_internal.hpp"
 #include "ml/loss.hpp"
 #include "ml/ops.hpp"
 #include "ml/autograd.hpp"
@@ -247,6 +248,8 @@ TensorPtr l2_regularization(std::vector<TensorPtr> params, float lambda_) {
 TensorPtr cross_entropy_sparse(TensorPtr logits, int target_idx) {
     // max_element over ONE buffer: this read begin() and end() from two
     // separate temporary copies, which is undefined behaviour
+    if (logits->device() == Device::CUDA)
+        return cuda_ops::cross_entropy(reshape(logits, {1, logits->numel()}), {target_idx});
     logits = checked_input("cross_entropy_sparse", logits);
     int n = logits->num_el();
     auto vals = logits->values();
@@ -287,6 +290,7 @@ TensorPtr cross_entropy_sparse(TensorPtr logits, int target_idx) {
 // Returns mean loss (scalar) with proper backward to all logit positions.
 TensorPtr cross_entropy_sparse_seq(TensorPtr logits, const std::vector<int>& targets) {
     // logits are [..., vocab]: every leading dimension is a position
+    if (logits->device() == Device::CUDA) return cuda_ops::cross_entropy(logits, targets);
     logits = checked_input("cross_entropy_sparse_seq", logits);
     int vocab    = (int)logits->shape().back();
     int seq_len  = (int)(logits->numel() / vocab);

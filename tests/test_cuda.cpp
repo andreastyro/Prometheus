@@ -6,6 +6,14 @@
 #include "ml/ops.hpp"
 #include "ml/tensor.hpp"
 #include "ml/utils/testing.hpp"
+#include "ml/loss.hpp"
+#include "ml/nn/linear.hpp"
+#include "ml/nn/dropout.hpp"
+#include "ml/nn/nlp/attention.hpp"
+#include "ml/nn/nlp/embedding.hpp"
+#include "ml/nn/nlp/gpt.hpp"
+#include "ml/nn/nlp/layernorm.hpp"
+#include "ml/nn/nlp/positional_encoding.hpp"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -205,6 +213,92 @@ int main() {
             for (size_t i = 0; i < g2.size(); i++) m = std::max(m, std::fabs(g1[i] - g2[i]) / std::max(1.0, std::fabs(g2[i])));
         }
         CHECK_NEAR("gradients through linear, matmul, concat, gather", (float)m, 0.0f, 1e-5f);
+    }
+
+    // ── layers: the same module, once on each device ──
+    {
+        // compare a layer's output and parameter gradients across devices
+        auto layer_check = [&](const char* what, auto make, const TensorPtr& input, float tol) {
+            Tensor::manual_seed(5);
+            auto cpu = make();
+            Tensor::manual_seed(5);
+            auto gpu = make();
+            gpu->to(Device::CUDA);
+            auto xc = input->detach(), xg = input->to(Device::CUDA);
+            if (is_floating(input->dtype())) { xc->set_requires_grad(true); xg->set_requires_grad(true); }
+            Tensor::manual_seed(9);
+            auto yc = cpu->forward(xc);
+            Tensor::manual_seed(9);
+            auto yg = gpu->forward(xg);
+            CHECK_TRUE((std::string(what) + ": output on the GPU").c_str(), yg->device() == Device::CUDA);
+            CHECK_NEAR((std::string(what) + ": output").c_str(), rel(yg, yc), 0.0f, tol);
+            auto wts = random_tensor(yc->shape(), 77);
+            sum(multiply(yc, wts), -1)->backward();
+            sum(multiply(yg, G(wts)), -1)->backward();
+            double m = 0, s = 0;
+            auto pc = cpu->parameters(), pg = gpu->parameters();
+            if (is_floating(input->dtype())) { pc.push_back(xc); pg.push_back(xg); }
+            for (size_t i = 0; i < pc.size(); i++) {
+                const auto a = pg[i]->grad_doubles(), b = pc[i]->grad_doubles();
+                for (size_t j = 0; j < b.size(); j++) { m = std::max(m, std::fabs(a[j] - b[j])); s = std::max(s, std::fabs(b[j])); }
+            }
+            CHECK_NEAR((std::string(what) + ": gradients").c_str(), (float)(m / std::max(s, 1e-12)), 0.0f, tol);
+        };
+        auto x3 = random_tensor({2, 7, 16}, 50);
+        layer_check("LayerNorm", [] { return std::make_shared<LayerNorm>(16); }, x3, 1e-5f);
+        layer_check("Linear", [] { return std::make_shared<Linear>(16, 8); }, x3, 1e-5f);
+        layer_check("MultiHeadAttention", [] { return std::make_shared<MultiHeadAttention>(16, 4); }, x3, 1e-5f);
+        layer_check("causal attention with RoPE", [] { return std::make_shared<MultiHeadAttention>(16, 4, true, true); }, x3, 1e-5f);
+        layer_check("Dropout (seeded, same mask)", [] { return std::make_shared<Dropout>(0.3f); }, x3, 1e-6f);
+        auto ids = std::make_shared<Tensor>(Shape{2, 5}, DType::Int64);
+        ids->set_data({1, 4, 4, 0, 9, 3, 3, 7, 2, 1});
+        layer_check("Embedding", [] { return std::make_shared<Embedding>(10, 6); }, ids, 1e-6f);
+        auto pe_in = random_tensor({5, 6}, 51);
+        PositionalEncoding pe(16, 6);
+        CHECK_NEAR("PositionalEncoding", rel(pe.forward(G(pe_in)), pe.forward(pe_in)), 0.0f, 1e-6f);
+
+        // cross-entropy: value and gradient
+        auto logits = random_tensor({6, 11}, 52), lg = G(logits);
+        logits->set_requires_grad(true);
+        lg->set_requires_grad(true);
+        const std::vector<int> tg = {0, 3, 10, 5, 5, 7};
+        auto lc = cross_entropy_sparse_seq(logits, tg), lgg = cross_entropy_sparse_seq(lg, tg);
+        CHECK_NEAR("cross-entropy value", (float)std::fabs(lgg->item_double() - lc->item_double()), 0.0f, 1e-6f);
+        lc->backward();
+        lgg->backward();
+        double m = 0;
+        const auto a = lg->grad_doubles(), b = logits->grad_doubles();
+        for (size_t j = 0; j < b.size(); j++) m = std::max(m, std::fabs(a[j] - b[j]));
+        CHECK_NEAR("cross-entropy gradient", (float)m, 0.0f, 1e-6f);
+    }
+
+    // ── the milestone: a GPT's training step on the GPU matches the CPU ──
+    {
+        Tensor::manual_seed(3);
+        GPT cpu(50, 16, 32, 4, 2);
+        Tensor::manual_seed(3);
+        GPT gpu(50, 16, 32, 4, 2);
+        gpu.to(Device::CUDA);
+        auto ids = std::make_shared<Tensor>(Shape{2, 12}, DType::Int64);
+        std::vector<float> v(24);
+        std::vector<int> targets(24);
+        for (int i = 0; i < 24; i++) { v[i] = (float)((i * 7 + 3) % 50); targets[i] = (i * 11 + 5) % 50; }
+        ids->set_data(v);
+        auto lc = cross_entropy_sparse_seq(cpu.forward(ids), targets);
+        auto lgpu = cross_entropy_sparse_seq(gpu.forward(ids->to(Device::CUDA)), targets);
+        CHECK_NEAR("GPT loss on the GPU", (float)std::fabs(lgpu->item_double() - lc->item_double()), 0.0f, 1e-5f);
+        lc->backward();
+        lgpu->backward();
+        double m = 0, s = 0;
+        auto pc = cpu.parameters(), pg = gpu.parameters();
+        bool all_on_gpu = true;
+        for (size_t i = 0; i < pc.size(); i++) {
+            all_on_gpu = all_on_gpu && pg[i]->device() == Device::CUDA;
+            const auto a = pg[i]->grad_doubles(), b = pc[i]->grad_doubles();
+            for (size_t j = 0; j < b.size(); j++) { m = std::max(m, std::fabs(a[j] - b[j])); s = std::max(s, std::fabs(b[j])); }
+        }
+        CHECK_TRUE("GPT: every parameter lives on the GPU", all_on_gpu);
+        CHECK_NEAR("GPT: every parameter's gradient matches the CPU", (float)(m / std::max(s, 1e-12)), 0.0f, 1e-4f);
     }
 
     // a CPU leaf that goes to the GPU and back gets its gradient on the CPU

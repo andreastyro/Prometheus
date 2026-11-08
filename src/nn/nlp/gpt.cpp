@@ -104,6 +104,26 @@ TensorPtr GPT::forward(TensorPtr token_ids) {
         throw runtime_error("GPT::forward: sequence length " + to_string(S)
                             + " exceeds max_seq_len " + to_string(max_seq_len_));
 
+    if (tok_emb.weight->device() == Device::CUDA) {
+        // on the GPU: the same model written with ops, every one a GPU kernel
+        auto ti = make_shared<vector<int64_t>>((size_t)B * S * E);
+        auto pi = make_shared<vector<int64_t>>((size_t)B * S * E);
+        for (int r = 0; r < B * S; r++) {
+            if (ids[r] < 0 || ids[r] >= V)
+                throw runtime_error("GPT: token id " + to_string(ids[r]) + " out of range");
+            for (int d = 0; d < E; d++) {
+                (*ti)[(size_t)r * E + d] = ids[r] * E + d;
+                (*pi)[(size_t)r * E + d] = (int64_t)(r % S) * E + d;
+            }
+        }
+        const Shape xshape = batched ? Shape{B, S, E} : Shape{S, E};
+        auto pw = pos_emb.weight->device() == Device::CUDA ? pos_emb.weight : pos_emb.weight->to(Device::CUDA);
+        auto h = add(gather_flat(tok_emb.weight, ti, xshape), gather_flat(pw, pi, xshape));
+        for (auto& blk : blocks) h = blk.forward(h);
+        h = ln_f.forward(h);
+        return matmul(h, transpose(tok_emb.weight));       // weight-tied output projection
+    }
+
     // ── Input embedding (fused tok + pos, with gradient tracking) ────────────
     // Out[b, t, d] = tok_emb.weight[tok_id, d] + pos_emb.weight[t, d]
     // Position restarts at every sequence, so pos_emb is indexed by t, not by

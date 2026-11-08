@@ -184,7 +184,7 @@ static TensorPtr binary_op(const char* name, TensorPtr a, TensorPtr b) {
 }
 
 vector<int64_t> index_values(TensorPtr t, const char* op) {
-    auto c = contiguous(t);
+    auto c = contiguous(t->device() == Device::CPU ? t : t->to(Device::CPU));
     vector<int64_t> out((size_t)c->numel());
     const void* base = c->storage()->data();
     for (int64_t i = 0; i < c->numel(); i++) {

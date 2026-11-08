@@ -469,7 +469,11 @@ PYBIND11_MODULE(_C, m) {
     // -------------------------------------------------------------------------
     py::class_<Module, std::shared_ptr<Module>>(m, "Module")
         .def("forward",    &Module::forward)
-        .def("parameters", &Module::parameters);
+        .def("parameters", &Module::parameters)
+        .def("to", [](std::shared_ptr<Module> self, Device d) { self->to(d); return self; },
+             py::arg("device"), "Move every parameter to `device` in place; returns the module.")
+        .def("cuda", [](std::shared_ptr<Module> self) { self->to(Device::CUDA); return self; })
+        .def("cpu",  [](std::shared_ptr<Module> self) { self->to(Device::CPU); return self; });
 
     // -------------------------------------------------------------------------
     // Layers

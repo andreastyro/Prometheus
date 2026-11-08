@@ -70,11 +70,12 @@ MultiHeadAttention::MultiHeadAttention(int embed_dim, int num_heads, bool causal
 TensorPtr MultiHeadAttention::forward(TensorPtr input) {
     if (input->dim() == 3) {
         const int64_t B = input->size(0), S = input->size(1);
-        auto rows = reshape(checked_input("MultiHeadAttention", input), {B * S, input->size(2)});
+        auto x = input->device() == Device::CUDA ? input : checked_input("MultiHeadAttention", input);
+        auto rows = reshape(x, {B * S, input->size(2)});
         return reshape(forward_rows(rows, (int)B), {B, S, (int64_t)embed_dim});
     }
     if (input->dim() == 2)
-        return forward_rows(checked_input("MultiHeadAttention", input), 1);
+        return forward_rows(input->device() == Device::CUDA ? input : checked_input("MultiHeadAttention", input), 1);
     throw runtime_error("MultiHeadAttention: input must be [batch, seq, embed] or [seq, embed]");
 }
 
@@ -89,6 +90,43 @@ TensorPtr MultiHeadAttention::forward_rows(TensorPtr input, int batch) {
     int H = num_heads;
     int D = head_dim;
     float attn_scale = 1.0f / sqrtf((float)D);
+
+    // The forward written with ops: the GPU path, and the reference the
+    // higher-order gradients differentiate.
+    auto reference = [B, S, E, H, D, attn_scale, use_rope = rope_, causal = causal_](const std::vector<TensorPtr>& in) -> TensorPtr {
+            const int64_t b = B, s = S, e = E, h = H, d = D;
+            auto x3 = reshape(in[0], {b, s, e});
+            auto heads = [&](const TensorPtr& W) {                  // [B, H, S, D]
+                return permute(reshape(matmul(x3, W), {b, s, h, d}), {0, 2, 1, 3});
+            };
+            auto Q = heads(in[1]), K = heads(in[2]), V = heads(in[3]);
+            if (use_rope) {
+                // RoPE as a constant per-position rotation: v' = v @ R_t
+                vector<float> R((size_t)S * D * D, 0.0f);
+                for (int t = 0; t < S; t++)
+                    for (int i = 0; i < D / 2; i++) {
+                        const float theta = powf(10000.0f, -2.0f * i / D), angle = t * theta;
+                        const float c = cosf(angle), sn = sinf(angle);
+                        float* r = R.data() + (size_t)t * D * D;
+                        r[(2 * i) * D + 2 * i] = c;      r[(2 * i) * D + 2 * i + 1] = sn;
+                        r[(2 * i + 1) * D + 2 * i] = -sn; r[(2 * i + 1) * D + 2 * i + 1] = c;
+                    }
+                auto Rt = make_shared<Tensor>(Shape{s, d, d}, R)->to(in[0]->device());
+                Q = reshape(matmul(reshape(Q, {b, h, s, 1, d}), Rt), {b, h, s, d});
+                K = reshape(matmul(reshape(K, {b, h, s, 1, d}), Rt), {b, h, s, d});
+            }
+            auto scores = multiply(attn_scale, matmul(Q, transpose(K)));    // [B, H, S, S]
+            if (causal) {
+                vector<float> m((size_t)S * S, 0.0f);
+                for (int i = 0; i < S; i++) for (int j = i + 1; j < S; j++) m[(size_t)i * S + j] = -1e9f;
+                scores = add(scores, make_shared<Tensor>(Shape{s, s}, m)->to(in[0]->device()));
+            }
+            auto O = matmul(softmax(scores), V);                            // [B, H, S, D]
+            O = reshape(permute(O, {0, 2, 1, 3}), {b * s, e});
+            return matmul(O, in[4]);
+        };
+    if (input->device() == Device::CUDA || W_q->device() == Device::CUDA)
+        return reference({input, W_q, W_k, W_v, W_o});
 
     // ── Forward ──────────────────────────────────────────────────────────────
     // Q = input @ W_q,  K = input @ W_k,  V = input @ W_v   each [S, E]
@@ -183,38 +221,7 @@ TensorPtr MultiHeadAttention::forward_rows(TensorPtr input, int batch) {
     if (need_grad) {
         auto node = make_node(result, {input, W_q, W_k, W_v, W_o});
         node->name = "MultiHeadAttention::forward_rows";
-        autograd::attach_reference(*node, [B, S, E, H, D, attn_scale, use_rope = rope_, causal = causal_](const std::vector<TensorPtr>& in) -> TensorPtr {
-            const int64_t b = B, s = S, e = E, h = H, d = D;
-            auto x3 = reshape(in[0], {b, s, e});
-            auto heads = [&](const TensorPtr& W) {                  // [B, H, S, D]
-                return permute(reshape(matmul(x3, W), {b, s, h, d}), {0, 2, 1, 3});
-            };
-            auto Q = heads(in[1]), K = heads(in[2]), V = heads(in[3]);
-            if (use_rope) {
-                // RoPE as a constant per-position rotation: v' = v @ R_t
-                vector<float> R((size_t)S * D * D, 0.0f);
-                for (int t = 0; t < S; t++)
-                    for (int i = 0; i < D / 2; i++) {
-                        const float theta = powf(10000.0f, -2.0f * i / D), angle = t * theta;
-                        const float c = cosf(angle), sn = sinf(angle);
-                        float* r = R.data() + (size_t)t * D * D;
-                        r[(2 * i) * D + 2 * i] = c;      r[(2 * i) * D + 2 * i + 1] = sn;
-                        r[(2 * i + 1) * D + 2 * i] = -sn; r[(2 * i + 1) * D + 2 * i + 1] = c;
-                    }
-                auto Rt = make_shared<Tensor>(Shape{s, d, d}, R);
-                Q = reshape(matmul(reshape(Q, {b, h, s, 1, d}), Rt), {b, h, s, d});
-                K = reshape(matmul(reshape(K, {b, h, s, 1, d}), Rt), {b, h, s, d});
-            }
-            auto scores = multiply(attn_scale, matmul(Q, transpose(K)));    // [B, H, S, S]
-            if (causal) {
-                vector<float> m((size_t)S * S, 0.0f);
-                for (int i = 0; i < S; i++) for (int j = i + 1; j < S; j++) m[(size_t)i * S + j] = -1e9f;
-                scores = add(scores, make_shared<Tensor>(Shape{s, s}, m));
-            }
-            auto O = matmul(softmax(scores), V);                            // [B, H, S, D]
-            O = reshape(permute(O, {0, 2, 1, 3}), {b * s, e});
-            return matmul(O, in[4]);
-        });
+        autograd::attach_reference(*node, reference);
 
         bool rope = rope_;
 

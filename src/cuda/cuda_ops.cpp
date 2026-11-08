@@ -732,6 +732,77 @@ TensorPtr concat(const vector<TensorPtr>& inputs0, int axis) {
     return out;
 }
 
+// ── cross-entropy over rows of logits ────────────────────────────────────────
+
+static const string& LOSS_SRC() {
+    static const string s = src(R"(
+// loss[r] = log(sum_j exp(x[r, j])) - x[r, target[r]], stable; one block per row
+extern "C" __global__ void l_cross_entropy(const float* x, const long long* target, float* loss, long long cols) {
+    __shared__ float s[256];
+    const float* row = x + (long long)blockIdx.x * cols;
+    float m = -3.402823466e38f;
+    for (long long j = threadIdx.x; j < cols; j += blockDim.x) m = fmaxf(m, row[j]);
+    s[threadIdx.x] = m;
+    __syncthreads();
+    for (int w = blockDim.x / 2; w > 0; w >>= 1) {
+        if (threadIdx.x < w) s[threadIdx.x] = fmaxf(s[threadIdx.x], s[threadIdx.x + w]);
+        __syncthreads();
+    }
+    m = s[0];
+    __syncthreads();
+    float t = 0.0f;
+    for (long long j = threadIdx.x; j < cols; j += blockDim.x) t += expf(row[j] - m);
+    s[threadIdx.x] = t;
+    __syncthreads();
+    for (int w = blockDim.x / 2; w > 0; w >>= 1) {
+        if (threadIdx.x < w) s[threadIdx.x] += s[threadIdx.x + w];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) loss[blockIdx.x] = logf(s[0]) + m - row[target[blockIdx.x]];
+}
+)");
+    return s;
+}
+
+TensorPtr cross_entropy(const TensorPtr& logits0, const vector<int>& targets) {
+    auto x = contiguous_on_device(f32(logits0, "cross_entropy"));
+    long long cols = x->shape().back();
+    const int64_t rows = cols ? x->numel() / cols : 0;
+    if ((int64_t)targets.size() != rows)
+        throw runtime_error("cross_entropy: " + to_string(targets.size()) + " targets for " +
+                            to_string(rows) + " positions");
+    auto t = make_shared<Tensor>(Shape{rows}, DType::Int64);
+    auto pick = make_shared<vector<int64_t>>((size_t)rows);   // flat index of each target logit
+    for (int64_t r = 0; r < rows; r++) {
+        if (targets[r] < 0 || targets[r] >= cols)
+            throw runtime_error("cross_entropy: target " + to_string(targets[r]) + " out of range");
+        static_cast<int64_t*>(t->storage()->data())[r] = targets[r];
+        (*pick)[(size_t)r] = r * cols + targets[r];
+    }
+    auto td = t->to(Device::CUDA);
+    auto per_row = empty_cuda({rows});
+    const void* px = base(x);
+    const void* pt = td->storage()->data();
+    void* pl = per_row->storage()->data();
+    void* args[] = {&px, &pt, &pl, &cols};
+    if (rows) cuda::launch(K("l_cross_entropy", LOSS_SRC()), (unsigned)rows, 1, 1, 256, 1, 1, 0, args);
+    TensorPtr out;
+    {
+        NoGrad off;
+        out = ::mean(per_row, -1);
+    }
+    // d/dx = (softmax(x) - onehot(target)) / rows, written with ops so the
+    // gradient is itself differentiable
+    attach(out, {x}, "cross_entropy", [x, pick, rows](const TensorPtr&, const TensorPtr& G) -> vector<TensorPtr> {
+        auto ones = make_shared<Tensor>(Shape{rows}, F32, Device::CUDA);
+        fill(ones->storage()->data(), rows, 1.0f);
+        auto onehot = scatter_add_flat(ones, pick, x->shape());
+        auto g = divide(subtract(::softmax(x), onehot), (float)rows);
+        return {multiply(reshape(G, {1}), g)};
+    });
+    return out;
+}
+
 // ── matmul on cuBLAS ─────────────────────────────────────────────────────────
 
 TensorPtr matmul(const TensorPtr& a0, const TensorPtr& b0) {

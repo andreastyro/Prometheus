@@ -119,4 +119,6 @@ TensorPtr scatter_add(const TensorPtr& g, const std::shared_ptr<const std::vecto
 TensorPtr concat(const std::vector<TensorPtr>& inputs, int axis);
 /// cuBLAS; batch dims broadcast as on the CPU
 TensorPtr matmul(const TensorPtr& a, const TensorPtr& b);
+/// mean over rows of -log softmax(logits)[target]
+TensorPtr cross_entropy(const TensorPtr& logits, const std::vector<int>& targets);
 }

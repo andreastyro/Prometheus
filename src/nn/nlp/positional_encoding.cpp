@@ -9,6 +9,10 @@ PositionalEncoding::PositionalEncoding(int max_len, int embed_dim)
     : max_len(max_len), embed_dim(embed_dim) {}
 
 TensorPtr PositionalEncoding::forward(TensorPtr input) {
+    if (input->device() == Device::CUDA) {             // the encoding is a constant: add it
+        auto zero = make_shared<Tensor>(input->shape());
+        return add(input, forward(zero)->to(Device::CUDA));
+    }
     int seq_len = input->shape()[0];
     auto output = make_shared<Tensor>(input->shape());
     output->set_data(input->to_vector());
