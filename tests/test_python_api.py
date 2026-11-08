@@ -207,6 +207,20 @@ def test_lazy_grad_and_no_grad():
           all(any(v != 0.0 for v in t.grad) for t in m.parameters()))
 
 
+def test_gather_scatter():
+    print("
+=== gather_flat / scatter_add_flat ===
+")
+    x = tensor([2, 3], [1, 2, 3, 4, 5, 6])
+    x.requires_grad = True
+    y = p.gather_flat(x, [5, 0, -1, 5], [4])
+    check("gather_flat picks, a negative index reads 0", list(y.data) == [6, 1, 0, 6])
+    p.sum(y, -1).backward()
+    check("gather_flat's gradient adds up repeats", list(x.grad) == [1, 0, 0, 0, 0, 2])
+    s = p.scatter_add_flat(tensor([3], [1, 2, 3]), [0, 0, 2], [4])
+    check("scatter_add_flat adds repeated indices", list(s.data) == [3, 0, 3, 0])
+
+
 def main():
     print("Python API checks")
     test_bindings_present()
@@ -215,6 +229,7 @@ def main():
     test_python_gpt_matches_cpp()
     test_lazy_grad_and_no_grad()
     test_save_load()
+    test_gather_scatter()
 
     print("\n%d checks, %d failed" % (CHECKS[0], len(FAILURES)))
     if FAILURES:

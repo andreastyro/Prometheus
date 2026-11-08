@@ -301,6 +301,16 @@ PYBIND11_MODULE(_C, m) {
           "cond ? a : b element-wise, broadcasting; differentiable in a and b.");
     m.def("masked_fill",  &masked_fill, py::arg("a"), py::arg("mask"), py::arg("value"),
           "a with value wherever mask is true; differentiable in a.");
+    m.def("gather_flat", [](TensorPtr x, std::vector<int64_t> idx, std::vector<int64_t> shape) {
+              return gather_flat(x, std::make_shared<const std::vector<int64_t>>(std::move(idx)), shape);
+          }, py::arg("x"), py::arg("indices"), py::arg("shape"),
+          "out (of `shape`) = x.flat[indices]; a negative index reads as 0. Differentiable to any "
+          "order -- its gradient is scatter_add_flat.");
+    m.def("scatter_add_flat", [](TensorPtr g, std::vector<int64_t> idx, std::vector<int64_t> shape) {
+              return scatter_add_flat(g, std::make_shared<const std::vector<int64_t>>(std::move(idx)), shape);
+          }, py::arg("g"), py::arg("indices"), py::arg("shape"),
+          "zeros(shape) with g's elements added at indices (repeats add up); a negative index is "
+          "skipped. The adjoint of gather_flat.");
     m.def("floor_divide", &floor_divide);
     m.def("remainder",    static_cast<TensorPtr (*)(TensorPtr, TensorPtr)>(&remainder));
     m.def("autocast_dtype",     &autocast_dtype);
