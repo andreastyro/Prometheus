@@ -69,7 +69,8 @@ using Self2  = std::function<TensorPtr(TensorPtr, TensorPtr)>;
 /// (relu, abs, x - 1) rather than float32 (exp, sigmoid). `range_op`: under
 /// autocast a half input returns float32 (exp, log, pow, softmax).
 TensorPtr unary(const char* name, const TensorPtr& a, std::function<double(double)> f,
-                Graph1 graph, const Self1& self, bool keeps_int = false, bool range_op = false);
+                Graph1 graph, const Self1& self, bool keeps_int = false, bool range_op = false,
+                const char* cuda_kernel = nullptr, float p0 = 0.0f, float p1 = 0.0f);
 
 /// a OP b with broadcasting.
 TensorPtr binary(const char* name, const TensorPtr& a, const TensorPtr& b, Bin op, const Self2& self);
@@ -90,7 +91,25 @@ TensorPtr scatter_add(const TensorPtr& g, std::shared_ptr<const std::vector<int6
 
 } // namespace dispatch
 
-// GPU kernels (src/cuda/cuda_ops.cpp). op: 0 add, 1 subtract, 2 multiply, 3 divide.
+// GPU kernels (src/cuda/cuda_ops.cpp). Each attaches a backward_graph.
 namespace cuda_ops {
+/// binary op: 0 add, 1 subtract, 2 multiply, 3 divide
 TensorPtr binary(int op, const char* name, const TensorPtr& a, const TensorPtr& b);
+/// element-wise `kernel` (u_exp, u_smul, ...) with two scalar parameters
+TensorPtr unary(const char* kernel, const char* name, const TensorPtr& a, float p0, float p1,
+                dispatch::Graph1 graph);
+/// op: 0 eq 1 ne 2 lt 3 le 4 gt 5 ge 6 and 7 or 8 xor; bool out
+TensorPtr compare(int op, const TensorPtr& a, const TensorPtr& b);
+TensorPtr where(const TensorPtr& cond, const TensorPtr& a, const TensorPtr& b);
+TensorPtr reduce(const char* name, const TensorPtr& a, int dim, bool keepdim, bool mean);
+TensorPtr softmax(const TensorPtr& a);
+/// a in dtype d, contiguous (no graph)
+TensorPtr cast(const TensorPtr& a, DType d);
+/// a contiguous copy (no graph)
+TensorPtr copy(const TensorPtr& a);
+/// a CPU scalar moved to the device; a GPU tensor as is
+TensorPtr on_device(const TensorPtr& t, const char* op);
+/// float32 grad[0..n) += g (any float dtype, any layout, on either device)
+void accumulate(void* grad, int64_t n, const TensorPtr& g);
+void fill(void* dst, int64_t n, float value);
 }

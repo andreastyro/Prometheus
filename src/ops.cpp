@@ -220,7 +220,7 @@ TensorPtr sum_to(TensorPtr g, const Shape& shape) {
 // Broadcast a gradient up to `shape`: the backward of a reduction.
 TensorPtr expand_to(TensorPtr g, const Shape& shape) {
     if (g->shape() == shape) return g;
-    return add(Tensor::zeros(shape), g);
+    return add(make_shared<Tensor>(shape, DType::Float32, g->device()), g);
 }
 
 
@@ -231,7 +231,7 @@ TensorPtr add(TensorPtr a, TensorPtr b) { return binary_op<BinOp::Add>("add", a,
 TensorPtr add(float scalar, TensorPtr a) {
     if (auto r = dispatch::unary("add", a, [scalar](double x) { return (double)scalar + x; },
             [=](const TensorPtr& a, const TensorPtr& out, const TensorPtr& G) -> TensorPtr { (void)a; (void)out; return G; },
-            [=](TensorPtr x) { return add(scalar, x); }, false, false))
+            [=](TensorPtr x) { return add(scalar, x); }, false, false, "u_sadd", scalar, 0.0f))
         return r;
     a = checked_input("add", a);
     auto result = make_shared<Tensor>(a->shape());
@@ -261,7 +261,7 @@ TensorPtr multiply(TensorPtr a, TensorPtr b) { return binary_op<BinOp::Mul>("mul
 TensorPtr multiply(float scalar, TensorPtr a) {
     if (auto r = dispatch::unary("multiply", a, [scalar](double x) { return (double)scalar * x; },
             [=](const TensorPtr& a, const TensorPtr& out, const TensorPtr& G) -> TensorPtr { (void)a; (void)out; return multiply(scalar, G); },
-            [=](TensorPtr x) { return multiply(scalar, x); }, false, false))
+            [=](TensorPtr x) { return multiply(scalar, x); }, false, false, "u_smul", scalar, 0.0f))
         return r;
     a = checked_input("multiply", a);
     auto result = make_shared<Tensor>(a->shape());
@@ -401,7 +401,7 @@ TensorPtr matmul(TensorPtr a, TensorPtr b) {
 TensorPtr relu(TensorPtr a) {
     if (auto r = dispatch::unary("relu", a, [](double x) { return x > 0.0 ? x : 0.0; },
             [=](const TensorPtr& a, const TensorPtr& out, const TensorPtr& G) -> TensorPtr { (void)a; (void)out; return multiply(G, gt(a, 0.0)); },
-            [=](TensorPtr x) { return relu(x); }, true, false))
+            [=](TensorPtr x) { return relu(x); }, true, false, "u_relu", 0.0f, 0.0f))
         return r;
     a = checked_input("relu", a);
 
@@ -439,7 +439,7 @@ TensorPtr relu(TensorPtr a) {
 TensorPtr sigmoid(TensorPtr a) {
     if (auto r = dispatch::unary("sigmoid", a, [](double x) { return 1.0 / (1.0 + std::exp(-x)); },
             [=](const TensorPtr& a, const TensorPtr& out, const TensorPtr& G) -> TensorPtr { (void)a; (void)out; return multiply(G, multiply(out, subtract(1.0f, out))); },
-            [=](TensorPtr x) { return sigmoid(x); }, false, false))
+            [=](TensorPtr x) { return sigmoid(x); }, false, false, "u_sigmoid", 0.0f, 0.0f))
         return r;
     a = checked_input("sigmoid", a);
 
@@ -473,7 +473,7 @@ TensorPtr subtract(TensorPtr a, TensorPtr b) { return binary_op<BinOp::Sub>("sub
 TensorPtr subtract(float scalar, TensorPtr a) {
     if (auto r = dispatch::unary("subtract", a, [scalar](double x) { return (double)scalar - x; },
             [=](const TensorPtr& a, const TensorPtr& out, const TensorPtr& G) -> TensorPtr { (void)a; (void)out; return multiply(-1.0f, G); },
-            [=](TensorPtr x) { return subtract(scalar, x); }, false, false))
+            [=](TensorPtr x) { return subtract(scalar, x); }, false, false, "u_rsub", scalar, 0.0f))
         return r;
     a = checked_input("subtract", a);
     auto result = make_shared<Tensor>(a->shape());
@@ -501,7 +501,7 @@ TensorPtr subtract(float scalar, TensorPtr a) {
 TensorPtr subtract(TensorPtr a, float scalar) {
     if (auto r = dispatch::unary("subtract", a, [scalar](double x) { return x - (double)scalar; },
             [=](const TensorPtr& a, const TensorPtr& out, const TensorPtr& G) -> TensorPtr { (void)a; (void)out; return G; },
-            [=](TensorPtr x) { return subtract(x, scalar); }, false, false))
+            [=](TensorPtr x) { return subtract(x, scalar); }, false, false, "u_ssub", scalar, 0.0f))
         return r;
     a = checked_input("subtract", a);
     auto result = make_shared<Tensor>(a->shape());
@@ -531,7 +531,7 @@ TensorPtr divide(TensorPtr a, TensorPtr b) { return binary_op<BinOp::Div>("divid
 TensorPtr divide(float scalar, TensorPtr a) {
     if (auto r = dispatch::unary("divide", a, [scalar](double x) { return (double)scalar / x; },
             [=](const TensorPtr& a, const TensorPtr& out, const TensorPtr& G) -> TensorPtr { (void)a; (void)out; return multiply(-scalar, divide(G, multiply(a, a))); },
-            [=](TensorPtr x) { return divide(scalar, x); }, false, false))
+            [=](TensorPtr x) { return divide(scalar, x); }, false, false, "u_rdiv", scalar, 0.0f))
         return r;
     a = checked_input("divide", a);
     auto result = make_shared<Tensor>(a->shape());
@@ -562,7 +562,7 @@ TensorPtr divide(float scalar, TensorPtr a) {
 TensorPtr divide(TensorPtr a, float scalar) {
     if (auto r = dispatch::unary("divide", a, [scalar](double x) { return x / (double)scalar; },
             [=](const TensorPtr& a, const TensorPtr& out, const TensorPtr& G) -> TensorPtr { (void)a; (void)out; return divide(G, scalar); },
-            [=](TensorPtr x) { return divide(x, scalar); }, false, false))
+            [=](TensorPtr x) { return divide(x, scalar); }, false, false, "u_sdiv", scalar, 0.0f))
         return r;
     a = checked_input("divide", a);
     if (scalar == 0)
@@ -592,7 +592,7 @@ TensorPtr divide(TensorPtr a, float scalar) {
 TensorPtr tanh_op(TensorPtr a) {
     if (auto r = dispatch::unary("tanh_op", a, [](double x) { return std::tanh(x); },
             [=](const TensorPtr& a, const TensorPtr& out, const TensorPtr& G) -> TensorPtr { (void)a; (void)out; return multiply(G, subtract(1.0f, multiply(out, out))); },
-            [=](TensorPtr x) { return tanh_op(x); }, false, false))
+            [=](TensorPtr x) { return tanh_op(x); }, false, false, "u_tanh", 0.0f, 0.0f))
         return r;
     a = checked_input("tanh_op", a);
     auto result = make_shared<Tensor>(a->shape());
@@ -626,6 +626,7 @@ TensorPtr tanh_op(TensorPtr a) {
 // or below zero. Without it a logit of 90 already overflows to inf and the
 // result is NaN, which attention scores and an untrained output layer reach.
 TensorPtr softmax(TensorPtr a) {
+    if (a->device() == Device::CUDA) return cuda_ops::softmax(a);
     if (auto r = dispatch::softmax(a, [](TensorPtr x) { return softmax(x); })) return r;
     a = checked_input("softmax", a);
     if (a->dim() < 1) throw runtime_error("softmax: needs at least one dimension");
@@ -678,7 +679,7 @@ TensorPtr softmax(TensorPtr a) {
 TensorPtr log_op(TensorPtr a) {
     if (auto r = dispatch::unary("log_op", a, [](double x) { return std::log(x); },
             [=](const TensorPtr& a, const TensorPtr& out, const TensorPtr& G) -> TensorPtr { (void)a; (void)out; return divide(G, a); },
-            [=](TensorPtr x) { return log_op(x); }, false, true))
+            [=](TensorPtr x) { return log_op(x); }, false, true, "u_log", 0.0f, 0.0f))
         return r;
     a = checked_input("log_op", a);
     auto result = make_shared<Tensor>(a->shape());
@@ -709,7 +710,7 @@ TensorPtr log_op(TensorPtr a) {
 TensorPtr exp_op(TensorPtr a) {
     if (auto r = dispatch::unary("exp_op", a, [](double x) { return std::exp(x); },
             [=](const TensorPtr& a, const TensorPtr& out, const TensorPtr& G) -> TensorPtr { (void)a; (void)out; return multiply(G, out); },
-            [=](TensorPtr x) { return exp_op(x); }, false, true))
+            [=](TensorPtr x) { return exp_op(x); }, false, true, "u_exp", 0.0f, 0.0f))
         return r;
     a = checked_input("exp_op", a);
     auto result = make_shared<Tensor>(a->shape());
@@ -738,7 +739,7 @@ TensorPtr exp_op(TensorPtr a) {
 TensorPtr pow_op(TensorPtr a, float p) {
     if (auto r = dispatch::unary("pow_op", a, [p](double x) { return std::pow(x, (double)p); },
             [=](const TensorPtr& a, const TensorPtr& out, const TensorPtr& G) -> TensorPtr { (void)a; (void)out; return multiply(G, multiply(p, pow_op(a, p - 1.0f))); },
-            [=](TensorPtr x) { return pow_op(x, p); }, false, true))
+            [=](TensorPtr x) { return pow_op(x, p); }, false, true, "u_pow", p, 0.0f))
         return r;
     a = checked_input("pow_op", a);
     auto result = make_shared<Tensor>(a->shape());
@@ -767,7 +768,7 @@ TensorPtr pow_op(TensorPtr a, float p) {
 TensorPtr sqrt_op(TensorPtr a) {
     if (auto r = dispatch::unary("sqrt_op", a, [](double x) { return std::sqrt(x); },
             [=](const TensorPtr& a, const TensorPtr& out, const TensorPtr& G) -> TensorPtr { (void)a; (void)out; return divide(G, multiply(2.0f, out)); },
-            [=](TensorPtr x) { return sqrt_op(x); }, false, false))
+            [=](TensorPtr x) { return sqrt_op(x); }, false, false, "u_sqrt", 0.0f, 0.0f))
         return r;
     a = checked_input("sqrt_op", a);
     auto result = make_shared<Tensor>(a->shape());
@@ -799,7 +800,7 @@ TensorPtr sqrt_op(TensorPtr a) {
 TensorPtr abs_op(TensorPtr a) {
     if (auto r = dispatch::unary("abs_op", a, [](double x) { return std::fabs(x); },
             [=](const TensorPtr& a, const TensorPtr& out, const TensorPtr& G) -> TensorPtr { (void)a; (void)out; return multiply(G, subtract(cast_op(gt(a, 0.0), a->dtype()), cast_op(lt(a, 0.0), a->dtype()))); },
-            [=](TensorPtr x) { return abs_op(x); }, true, false))
+            [=](TensorPtr x) { return abs_op(x); }, true, false, "u_abs", 0.0f, 0.0f))
         return r;
     a = checked_input("abs_op", a);
     auto result = make_shared<Tensor>(a->shape());
@@ -841,6 +842,7 @@ TensorPtr abs_op(TensorPtr a) {
 // relies on -1 meaning "all", and quietly changing it would change numbers
 // without raising. Any other negative dim is refused rather than guessed at.
 static TensorPtr reduce_sum(const char* name, TensorPtr a, int dim, bool keepdim, bool mean) {
+    if (a->device() == Device::CUDA) return cuda_ops::reduce(name, a, dim, keepdim, mean);
     if (auto r = dispatch::reduce(name, a, dim, keepdim, mean,
                                   [=](TensorPtr x) { return reduce_sum(name, x, dim, keepdim, mean); }))
         return r;
@@ -1004,7 +1006,7 @@ TensorPtr min_op(TensorPtr a) {
 TensorPtr clip(TensorPtr a, float min_val, float max_val) {
     if (auto r = dispatch::unary("clip", a, [min_val, max_val](double x) { return std::min((double)max_val, std::max((double)min_val, x)); },
             [=](const TensorPtr& a, const TensorPtr& out, const TensorPtr& G) -> TensorPtr { (void)a; (void)out; return multiply(G, ::logical_and(gt(a, (double)min_val), lt(a, (double)max_val))); },
-            [=](TensorPtr x) { return clip(x, min_val, max_val); }, false, false))
+            [=](TensorPtr x) { return clip(x, min_val, max_val); }, false, false, "u_clip", min_val, max_val))
         return r;
     a = checked_input("clip", a);
     auto result = make_shared<Tensor>(a->shape());
@@ -1083,7 +1085,7 @@ TensorPtr gelu(TensorPtr a) {
                 auto inner = c(k, cp(1.0, c(3.0 * cc, a2)));
                 auto right = c(0.5, multiply(a, multiply(sech2, inner)));
                 return multiply(G, add(left, right)); },
-            [=](TensorPtr x) { return gelu(x); }, false, false))
+            [=](TensorPtr x) { return gelu(x); }, false, false, "u_gelu", 0.0f, 0.0f))
         return r;
     a = checked_input("gelu", a);
     auto result = make_shared<Tensor>(a->shape());
@@ -1382,10 +1384,14 @@ TensorPtr reshape(TensorPtr a, ShapeArg new_shape_arg) {
 TensorPtr contiguous(TensorPtr a) {
     if (a->is_contiguous())
         return a;
-    if (a->device() != Device::CPU) {
-        if (a->requires_grad())
-            throw runtime_error("contiguous: gradients on the GPU are not supported yet");
-        return a->detach();
+    if (a->device() == Device::CUDA) {
+        auto out = cuda_ops::copy(a);
+        if (a->requires_grad()) {
+            auto node = make_node(out, {a});
+            node->name = "contiguous";
+            node->backward_graph = [](const TensorPtr&, const TensorPtr& G) -> std::vector<TensorPtr> { return {G}; };
+        }
+        return out;
     }
 
     auto out = make_shared<Tensor>(a->shape(), a->dtype());
@@ -1526,7 +1532,7 @@ std::vector<TensorPtr> grad(TensorPtr output, std::vector<TensorPtr> inputs,
         if (output->numel() != 1)
             throw runtime_error("grad(): the output has " + to_string(output->numel()) +
                                 " elements; pass grad_output to say how to weight them");
-        grad_output = Tensor::ones(output->shape(), output->dtype());
+        grad_output = Tensor::ones(output->shape(), output->dtype())->to(output->device());
     }
 
     // order: every tensor after the tensors it was computed from
@@ -1586,7 +1592,8 @@ std::vector<TensorPtr> grad(TensorPtr output, std::vector<TensorPtr> inputs,
     vector<TensorPtr> result;
     for (auto& in : inputs) {
         auto found = g.find(in.get());
-        result.push_back(found != g.end() ? found->second : Tensor::zeros(in->shape(), in->dtype()));
+        result.push_back(found != g.end() ? found->second
+                                          : Tensor::zeros(in->shape(), in->dtype())->to(in->device()));
     }
     return result;
 }

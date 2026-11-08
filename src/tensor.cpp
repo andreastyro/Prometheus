@@ -3,6 +3,7 @@
 #include "ml/ops.hpp"
 #include "ml/strided.hpp"
 #include "ml/cuda.hpp"
+#include "ops_internal.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -478,12 +479,22 @@ void Tensor::set_grad(const vector<float>& g) {
     if ((int64_t)g.size() != numel_)
         throw runtime_error("set_grad: " + to_string(g.size()) + " values for " +
                             to_string(numel_) + " elements");
+    if (device() == Device::CUDA) {
+        ensure_grad();
+        cuda::copy_to_device(grad_dev_->data(), g.data(), g.size() * sizeof(float));
+        return;
+    }
     if (dtype() == DType::Float64) { grad64_.assign(g.begin(), g.end()); return; }
     grad_.assign(g.size(), 0.0f);
     if (!g.empty()) std::memcpy(grad_.data(), g.data(), g.size() * sizeof(float));
 }
 
 void Tensor::ensure_grad() {
+    if (device() == Device::CUDA) {
+        if (!grad_dev_)
+            grad_dev_ = make_shared<Storage>((size_t)numel_ * sizeof(float), DType::Float32, Device::CUDA, true);
+        return;
+    }
     if (dtype() == DType::Float64) {
         if ((int64_t)grad64_.size() != numel_) grad64_.assign((size_t)numel_, 0.0);
         return;
@@ -493,17 +504,30 @@ void Tensor::ensure_grad() {
 }
 
 void Tensor::zero_grad() {
+    if (device() == Device::CUDA) {
+        if (!grad_dev_) ensure_grad();
+        else cuda::memset_zero(grad_dev_->data(), grad_dev_->nbytes());
+        return;
+    }
     if (dtype() == DType::Float64) { grad64_.assign((size_t)numel_, 0.0); return; }
     grad_.assign((size_t)numel_, 0.0f);
 }
 
 vector<double> Tensor::grad_doubles() const {
+    if (device() == Device::CUDA) {
+        if (!grad_dev_) return {};
+        vector<float> h((size_t)numel_);
+        cuda::copy_to_host(h.data(), grad_dev_->data(), h.size() * sizeof(float));
+        return vector<double>(h.begin(), h.end());
+    }
     if (dtype() == DType::Float64) return grad64_;
     return vector<double>(grad_.data(), grad_.data() + grad_.size());
 }
 
 TensorPtr Tensor::grad_tensor() const {
     if (!has_grad()) return nullptr;
+    if (device() == Device::CUDA)      // a view of the device buffer, no copy
+        return make_shared<Tensor>(grad_dev_, shape_, contiguous_strides(shape_), 0);
     if (dtype() == DType::Float64) {
         auto t = make_shared<Tensor>(shape_, DType::Float64);
         if (numel_) memcpy(t->storage()->data(), grad64_.data(), (size_t)numel_ * sizeof(double));
@@ -519,6 +543,11 @@ void Tensor::accumulate_grad(const TensorPtr& g) {
         throw runtime_error("accumulate_grad: " + to_string(g->numel()) + " values for " +
                             to_string(numel_) + " elements");
     ensure_grad();
+    if (device() == Device::CUDA) {
+        cuda_ops::accumulate(grad_dev_->data(), numel_, g->device() == Device::CUDA ? g : g->to(Device::CUDA));
+        return;
+    }
+    if (g->device() == Device::CUDA) { accumulate_grad(g->to(Device::CPU)); return; }
     const void* src = g->storage()->data();
     const DType gd = g->dtype();
     if (dtype() == DType::Float64) {
@@ -596,6 +625,22 @@ TensorPtr Tensor::to(DType target) {
 TensorPtr Tensor::to(Device target) {
     if (target == device())
         return shared_from_this();
+    if (requires_grad_ && is_floating(dtype()) && grad_enabled()) {
+        // the copy joins the graph: its gradient is copied back
+        TensorPtr out;
+        {
+            NoGrad off;
+            out = to(target);
+        }
+        auto self = shared_from_this();
+        auto node = make_node(out, {self});
+        node->name = "to(device)";
+        const Device back = device();
+        node->backward_graph = [back](const TensorPtr&, const TensorPtr& G) -> vector<TensorPtr> {
+            return {G->to(back)};
+        };
+        return out;
+    }
     const size_t es = dtype_size(dtype());
     if (target == Device::CUDA) {
         const TensorPtr host = contiguous_ ? shared_from_this() : detach();   // row-major on the CPU
@@ -651,8 +696,9 @@ void Tensor::backward() {
             "either a leaf, or it was produced while gradients were disabled "
             "(NoGrad / no_grad()).");
 
-    if (dtype() == DType::Float64) grad64_.assign((size_t)numel_, 1.0);
-    else                           grad_.assign((size_t)numel_, 1.0f);
+    if (device() == Device::CUDA) { ensure_grad(); cuda_ops::fill(grad_dev_->data(), numel_, 1.0f); }
+    else if (dtype() == DType::Float64) grad64_.assign((size_t)numel_, 1.0);
+    else grad_.assign((size_t)numel_, 1.0f);
 
     vector<TensorPtr> order;
     unordered_set<TensorPtr> visited;
@@ -667,8 +713,13 @@ void Tensor::backward() {
     for (TensorPtr& t : order) {
         const auto& node = t->grad_fn();
         if (!node) continue;
-        bool wide = t->dtype() == DType::Float64;
-        for (auto& in : node->inputs) wide = wide || (in && in->dtype() == DType::Float64);
+        // float64 and GPU tensors keep their gradients outside the float32
+        // host buffers the raw kernels write
+        auto special = [](const TensorPtr& x) {
+            return x->dtype() == DType::Float64 || x->device() == Device::CUDA;
+        };
+        bool wide = special(t);
+        for (auto& in : node->inputs) wide = wide || (in && special(in));
         if (node->backward_fn && !wide) { node->backward_fn(t); continue; }
         if (!node->backward_graph)
             throw runtime_error(string("backward(): '") + node->name +

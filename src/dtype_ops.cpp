@@ -172,11 +172,11 @@ TensorPtr scalar_tensor(double value, DType dtype) {
 
 TensorPtr cast_op(TensorPtr a, DType d) {
     if (!a || a->dtype() == d) return a;
-    auto out = convert(a, d);
+    auto out = a->device() == Device::CUDA ? cuda_ops::cast(a, d) : convert(a, d);
     if (is_floating(d) && is_floating(a->dtype()) && a->requires_grad()) {
         auto node = make_node(out, {a});
         node->name = "cast";
-        if (d != F64 && a->dtype() != F64)
+        if (d != F64 && a->dtype() != F64 && a->device() == Device::CPU)
             node->backward_fn = [a](const TensorPtr& out) {
                 const float* g = out->grad();
                 float* ga = a->grad();
@@ -216,7 +216,11 @@ TensorPtr autocast_input(TensorPtr t) {
 namespace dispatch {
 
 TensorPtr unary(const char* name, const TensorPtr& a, function<double(double)> f, Graph1 graph,
-                const Self1& self, bool keeps_int, bool range_op) {
+                const Self1& self, bool keeps_int, bool range_op, const char* cuda_kernel, float p0, float p1) {
+    if (a->device() == Device::CUDA) {
+        if (!cuda_kernel) throw runtime_error(string(name) + ": not available on the GPU yet");
+        return cuda_ops::unary(cuda_kernel, name, a, p0, p1, graph);
+    }
     const DType d = a->dtype();
     if (d == F32) return nullptr;
     if (is_half(d)) {
@@ -595,6 +599,8 @@ template <class T> bool cmp(Cmp c, T x, T y) {
 }
 
 TensorPtr compare(const TensorPtr& a, const TensorPtr& b, Cmp c) {
+    if (a->device() == Device::CUDA || b->device() == Device::CUDA)
+        return cuda_ops::compare((int)c, a, b);
     const bool integral = !is_floating(a->dtype()) && !is_floating(b->dtype());
     if (integral)
         return map_binary_int(a, b, BOOL, [c](int64_t x, int64_t y) -> int64_t { return cmp(c, x, y); });
@@ -602,6 +608,8 @@ TensorPtr compare(const TensorPtr& a, const TensorPtr& b, Cmp c) {
 }
 
 TensorPtr logic(const TensorPtr& a, const TensorPtr& b, int op) {
+    if (a->device() == Device::CUDA || b->device() == Device::CUDA)
+        return cuda_ops::compare(6 + op, a, b);
     return map_binary(a, b, BOOL, [op](double x, double y) -> double {
         const bool p = x != 0.0, q = y != 0.0;
         return op == 0 ? (p && q) : op == 1 ? (p || q) : (p != q);
@@ -627,6 +635,7 @@ TensorPtr logical_and(TensorPtr a, TensorPtr b) { return logic(a, b, 0); }
 TensorPtr logical_or(TensorPtr a, TensorPtr b)  { return logic(a, b, 1); }
 TensorPtr logical_xor(TensorPtr a, TensorPtr b) { return logic(a, b, 2); }
 TensorPtr logical_not(TensorPtr a) {
+    if (a->device() == Device::CUDA) return cuda_ops::compare(0, a, scalar_tensor(0.0, F32));
     return map_values(a, BOOL, [](double x) -> double { return x == 0.0; });
 }
 
@@ -650,6 +659,8 @@ TensorPtr isinf_op(TensorPtr a)    { return map_values(a, BOOL, [](double x) -> 
 TensorPtr isfinite_op(TensorPtr a) { return map_values(a, BOOL, [](double x) -> double { return std::isfinite(x); }); }
 
 TensorPtr where(TensorPtr cond, TensorPtr a, TensorPtr b) {
+    if (cond->device() == Device::CUDA || a->device() == Device::CUDA || b->device() == Device::CUDA)
+        return cuda_ops::where(cond, a, b);
     const DType d = result_type(a, b);
     auto A = cast_op(a, d), B = cast_op(b, d);
     const auto C = plain(cond), Ap = plain(A), Bp = plain(B);

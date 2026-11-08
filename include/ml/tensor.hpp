@@ -224,6 +224,7 @@ public:
     }
     void set_grad(const std::vector<float>& g);
     bool has_grad() const {
+        if (device() == Device::CUDA) return grad_dev_ != nullptr;
         return (std::int64_t)(dtype() == DType::Float64 ? grad64_.size() : grad_.size()) == numel_;
     }
     /// Allocate a zeroed gradient buffer if there is not one already.
@@ -284,6 +285,7 @@ private:
     bool         requires_grad_ = false;
     FloatBuffer               grad_;
     std::vector<double>       grad64_;     // float64 tensors only
+    std::shared_ptr<Storage>  grad_dev_;   // GPU tensors: float32 gradient on the device
     std::shared_ptr<GradNode> grad_fn_;
 };
 
