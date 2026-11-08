@@ -42,6 +42,7 @@
 #include "ml/optim/grad_scaler.hpp"
 #include "ml/utils/grad_clip.hpp"
 #include "ml/utils/model_io.hpp"
+#include <map>
 
 namespace py = pybind11;
 
@@ -617,7 +618,31 @@ PYBIND11_MODULE(_C, m) {
     // -------------------------------------------------------------------------
     // Model I/O
     // -------------------------------------------------------------------------
-    m.def("save_model", &save, py::arg("path"), py::arg("params"));
+    m.def("save_model", &save, py::arg("path"), py::arg("params"),
+          "Save parameters, in order, as a safetensors file.");
+    m.def("save_safetensors", [](const std::string& path, py::object tensors,
+                                 std::map<std::string, std::string> metadata) {
+              // a dict keeps its insertion order; a list of (name, tensor) pairs works too
+              NamedTensors named;
+              py::iterable items = py::isinstance<py::dict>(tensors)
+                  ? py::iterable(tensors.attr("items")()) : py::iterable(tensors);
+              for (auto item : items) {
+                  auto pair = item.cast<py::tuple>();
+                  named.emplace_back(pair[0].cast<std::string>(), pair[1].cast<TensorPtr>());
+              }
+              save_safetensors(path, named, metadata);
+          }, py::arg("path"), py::arg("tensors"), py::arg("metadata") = std::map<std::string, std::string>{},
+          "Write named tensors (a dict) as safetensors, readable by PyTorch, numpy and the "
+          "safetensors package.");
+    m.def("load_safetensors", [](const std::string& path) {
+              std::map<std::string, std::string> meta;
+              auto named = load_safetensors(path, &meta);
+              py::dict d;
+              for (auto& kv : named) d[py::str(kv.first)] = kv.second;
+              return py::make_tuple(d, meta);
+          }, py::arg("path"),
+          "Read a safetensors file -- this library's, or any other, such as Hugging Face weights. "
+          "Returns (dict of name -> Tensor, metadata dict).");
     m.def("load_model", &load, py::arg("path"));
 
     py::class_<Checkpoint>(m, "Checkpoint")

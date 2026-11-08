@@ -67,7 +67,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install build and test dependencies
-        run: python -m pip install --upgrade pip pybind11 numpy setuptools wheel
+        run: python -m pip install --upgrade pip pybind11 numpy setuptools wheel safetensors
 
       # Install rather than build in place: setup.py build_ext --inplace put the
       # .so where the test scripts could not import it, so every Python test
@@ -99,6 +99,11 @@ jobs:
       # catches a data race that the small-shape tests never reach.
       - name: Parallel paths agree with single-threaded
         run: bash .github/annotate.sh python tests/test_parallel_consistency.py
+
+      # Model files round-trip every dtype, and interoperate with the
+      # official safetensors package in both directions.
+      - name: Model files (safetensors)
+        run: bash .github/annotate.sh python tests/test_safetensors.py
 
       - name: README matches the API
         run: bash .github/annotate.sh python tests/check_readme_api.py

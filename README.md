@@ -117,7 +117,8 @@ Adam and AdamW persist their momentum buffers through `save_state()` / `load_sta
 ### Data, metrics, utilities
 
 - `accuracy`, `precision`, `recall`, `f1_score`, `confusion_matrix`, `r2_score`
-- `save_model` / `load_model`, `save_checkpoint` / `load_checkpoint` (weights + epoch + best loss)
+- `save_model` / `load_model`, `save_checkpoint` / `load_checkpoint` (weights + epoch + best loss), written as safetensors -- every dtype, readable by PyTorch and numpy; files in the old format still load
+- `save_safetensors` / `load_safetensors` for named tensors, including pretrained weights from the Hugging Face hub
 - `train()` loop helper
 - (C++) `DataLoader` — batching, per-epoch reshuffle; `data_split` for train/val/test
 - (C++) `read_csv`, `load_image` (PNG/JPG → tensor), `EarlyStopping`, `model_summary`
