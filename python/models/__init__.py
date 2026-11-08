@@ -4,7 +4,7 @@ Prometheus Models — pre-built architectures with the Module contract.
 Every model exposes forward() and parameters(), so it drops into the same
 training loop as a hand-wired Sequential:
 
-    from python.models import MLP
+    from prometheus.models import MLP
 
     model = MLP(input_dim=2, output_dim=1, hidden_dims=[16, 16])
     opt   = p.Adam(model.parameters(), lr=0.01)

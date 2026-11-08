@@ -18,9 +18,9 @@ import prometheus as p
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from python.gpt import GPT                                     # noqa: E402
-from python.models import CNN, GAN, MLP, VAE, ResNet, UNet      # noqa: E402
-from python.models.visualiser import (                          # noqa: E402
+from prometheus.gpt import GPT                                     # noqa: E402
+from prometheus.models import CNN, GAN, MLP, VAE, ResNet, UNet      # noqa: E402
+from prometheus.models.visualiser import (                          # noqa: E402
     activation_stats, build_dashboard, diagnose, gradient_norms,
     run_gradcheck, update_ratios)
 

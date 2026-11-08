@@ -14,7 +14,7 @@ import prometheus as p
 
 import os as _os, sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
-from python.models import MLP          # noqa: E402
+from prometheus.models import MLP          # noqa: E402
 
 FAILURES = []
 CHECKS = [0]
@@ -109,7 +109,7 @@ def test_gradcheck_from_python():
 def test_python_gpt_matches_cpp():
     print("\n=== Python GPT vs C++ GPT ===")
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from python.gpt import GPT
+    from prometheus.gpt import GPT
 
     V, L, E, H, N = 32, 16, 8, 2, 2
     p.Tensor.manual_seed(4)
@@ -178,7 +178,7 @@ def test_lazy_grad_and_no_grad():
     check("a training forward records a graph", with_grad.requires_grad)
     check("and allocates a gradient buffer", len(with_grad.grad) == with_grad.num_el())
 
-    import python.models as models
+    import prometheus.models as models
     with models.no_grad():
         inferred = m.forward(x)
     check("no_grad forward records no graph", not inferred.requires_grad)

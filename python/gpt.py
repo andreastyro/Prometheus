@@ -18,7 +18,7 @@ output projection flow back into the same tensor the embedding lookup reads, so
 `tok_emb.weight` appears exactly once in `parameters()`.
 
 Usage:
-    from python.gpt import GPT
+    from prometheus.gpt import GPT
     model = GPT(vocab_size=256, max_seq_len=64, embed_dim=128, num_heads=4, num_layers=4)
     logits = model.forward([1, 2, 3])
     loss   = p.cross_entropy_sparse_seq(logits, [2, 3, 4])

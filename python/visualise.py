@@ -4,7 +4,7 @@ Layers are arranged left-to-right as 3D cuboids. Height and depth of each
 block scale with the layer's output size; colours are assigned by layer type.
 
 Usage:
-    from python.visualise import visualise
+    from prometheus.visualise import visualise
     visualise(model)                        # opens in browser
     visualise(model, filename="arch.html")  # save to path
 """

@@ -186,6 +186,18 @@ pip install mkl                  # optional: fastest matmul, picked up automatic
 
 The BLAS library is not a build option; see [Performance](#performance).
 
+Builds are portable by default. `PROMETHEUS_NATIVE=1` tunes for the building
+machine's CPU (`-march=native`, or `/arch:AVX2` with MSVC) — fine for a local
+build, wrong for a wheel, which would crash on older CPUs.
+
+The package bundles the pure-Python models alongside the compiled core:
+
+```python
+import prometheus as p                 # the C++ core
+from prometheus.models import MLP, CNN, ResNet, UNet, VAE, GAN
+from prometheus.gpt import GPT         # a GPT written in Python on the C++ ops
+```
+
 Prebuilt wheels for Windows, Linux, and macOS are produced by
 [.github/workflows/build_wheels.yml](.github/workflows/build_wheels.yml).
 

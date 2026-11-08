@@ -18,7 +18,7 @@ import prometheus as p
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from python.models import CNN, GAN, MLP, VAE, ResNet, UNet  # noqa: E402
+from prometheus.models import CNN, GAN, MLP, VAE, ResNet, UNet  # noqa: E402
 
 FAILURES = []
 CHECKS = [0]

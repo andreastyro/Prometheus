@@ -4,8 +4,11 @@ Build script for the prometheus Python extension.
 Compiles all C++ source into a Python-importable module (prometheus.pyd on
 Windows, prometheus.so on Linux/macOS).
 
-Build option, set as an environment variable before building:
+Build options, set as environment variables before building:
     PROMETHEUS_USE_OPENMP=1     parallelise across CPU cores
+    PROMETHEUS_NATIVE=1         tune for this machine's CPU (-march=native /
+                                /arch:AVX2). Off by default: a wheel built
+                                that way crashes on older CPUs.
 
 The BLAS library is not a build option: OpenBLAS or Intel MKL is loaded at
 runtime if present (prometheus.set_blas(), or PROMETHEUS_BLAS=...).
@@ -31,11 +34,18 @@ sources = (
 )
 
 # ── Compiler flags ────────────────────────────────────────────────────────────
+# Portable by default. -march=native uses every instruction the build machine
+# has, so a wheel built with it dies with an illegal instruction on an older
+# CPU. The BLAS libraries pick their kernels at runtime anyway; what native
+# tuning buys here is wider vectors in the elementwise loops, which a local
+# build can ask for.
+native = os.environ.get("PROMETHEUS_NATIVE", "0") == "1"
+
 if sys.platform == "win32":
-    compile_args = ["/std:c++17", "/O2", "/EHsc"]
+    compile_args = ["/std:c++17", "/O2", "/EHsc"] + (["/arch:AVX2"] if native else [])
     openmp_flag  = ["/openmp"]
 else:
-    compile_args = ["-std=c++17", "-O2", "-march=native"]
+    compile_args = ["-std=c++17", "-O2"] + (["-march=native"] if native else [])
     openmp_flag  = ["-fopenmp"]
 
 # ── Build options ─────────────────────────────────────────────────────────────
@@ -53,8 +63,10 @@ if use_openmp:
     if sys.platform != "win32":
         extra_link += ["-fopenmp"]
 
+# The compiled core is prometheus._C; python/ is installed as the prometheus
+# package around it, so the pure-Python models ship too.
 ext = Extension(
-    "prometheus",
+    "prometheus._C",
     sources=sources,
     include_dirs=include_dirs,
     library_dirs=library_dirs,
@@ -69,6 +81,8 @@ setup(
     name="prometheus",
     version="0.1.0",
     ext_modules=[ext],
+    packages=["prometheus", "prometheus.models"],
+    package_dir={"prometheus": "python"},
     # prometheus_onnx.py sits beside setup.py and provides save_onnx(). It was
     # not listed here, so pip install gave users the extension but not the
     # exporter, and `import prometheus_onnx` failed anywhere outside the

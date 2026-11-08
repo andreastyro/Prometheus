@@ -61,7 +61,7 @@ struct PySequential {
     std::vector<TensorPtr> parameters() { return impl->parameters(); }
 };
 
-PYBIND11_MODULE(prometheus, m) {
+PYBIND11_MODULE(_C, m) {
     m.doc() = "Prometheus ML library";
 
     // -------------------------------------------------------------------------
