@@ -168,7 +168,8 @@ Absolute numbers on a laptop move with power and thermal state by as much as
 40%, which is why the comparison is interleaved.
 
 Per layer, forward + backward, against PyTorch 2.15 on the same shapes
-(best of three interleaved rounds):
+(best of three to five interleaved rounds; rows measured in different sessions
+differ in absolute time with the laptop's power state, so compare the ratios):
 
 | Layer | Shape | Prometheus | PyTorch | |
 |---|---|---|---|---|
@@ -178,9 +179,9 @@ Per layer, forward + backward, against PyTorch 2.15 on the same shapes
 | AvgPool2D | [16,64,32,32], k2 | 0.24 ms | 0.52 ms | 2.2x faster |
 | BatchNorm | [16,64,32,32] | 0.81 ms | 1.38 ms | 1.7x faster |
 | GroupNorm | [16,64,32,32], 8 groups | 0.44 ms | 0.65 ms | 1.5x faster |
-| RNN | seq 64, batch 32, 128 -> 256 | 6.24 ms | 5.92 ms | 1.1x slower |
-| LSTM | seq 64, batch 32, 128 -> 256 | 24.12 ms | 10.59 ms | 2.3x slower |
-| GRU | seq 64, batch 32, 128 -> 256 | 15.98 ms | 18.82 ms | 1.2x faster |
+| RNN | seq 64, batch 32, 128 -> 256 | 10.92 ms | 9.58 ms | 1.1x slower |
+| LSTM | seq 64, batch 32, 128 -> 256 | 31.28 ms | 17.47 ms | 1.8x slower |
+| GRU | seq 64, batch 32, 128 -> 256 | 20.91 ms | 30.04 ms | 1.4x faster |
 | Embedding | [32,128] ids, 16000 x 384 | 0.89 ms | 2.82 ms | 3.2x faster |
 | SGD (momentum) | 16.8M parameters | 5.60 ms | 8.07 ms | 1.4x faster |
 | AdamW | 16.8M parameters | 8.06 ms | 22.89 ms | 2.8x faster |
