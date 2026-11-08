@@ -87,7 +87,7 @@ python examples/gpt_shakespeare.py path/to/text.txt  # your own corpus
 | **Tensor** | N-dimensional, strided storage with 64-bit shapes; `zeros`, `ones`, `full`, `randn`, `detach`, `half`/`to_float`, NumPy interop via `numpy()` / `from_numpy()` |
 | **dtype / device** | `float32`, `float64`, `float16`, `bfloat16`, `int64`, `int32`, `bool`, converted with `to`; kernels compute in float32 and refuse other dtypes rather than misread them. Device is `cpu` (the field exists so a GPU is an addition, not a redesign) |
 | **Views** | `transpose`, `permute`, `reshape`, `contiguous` — O(1), share storage, differentiable; every op accepts a view |
-| **Autograd** | Reverse-mode AD, graph built dynamically on the forward pass, `backward()` via topological sort, per-tensor `requires_grad`; `grad` with `create_graph` for gradients of gradients (Hessian-vector products, MAML) |
+| **Autograd** | Reverse-mode AD, graph built dynamically on the forward pass, `backward()` via topological sort, per-tensor `requires_grad`; `grad` with create_graph for gradients of gradients (Hessian-vector products, MAML) |
 | **Ops** | `add`, `subtract`, `multiply`, `divide` (numpy broadcasting), `matmul` (batched, broadcast batch dims), `sum`, `mean` (any dim, with keepdim), `pow_op`, `sqrt_op`, `abs_op`, `exp_op`, `log_op`, `clip`, `max_op`, `min_op`, `argmax`, `concat_op`, `linear_op` |
 | **Activations** | `relu`, `gelu`, `sigmoid`, `tanh_op`, `softmax` |
 
