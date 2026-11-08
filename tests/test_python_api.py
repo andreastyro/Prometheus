@@ -208,9 +208,7 @@ def test_lazy_grad_and_no_grad():
 
 
 def test_gather_scatter():
-    print("
-=== gather_flat / scatter_add_flat ===
-")
+    print("\n=== gather_flat / scatter_add_flat ===\n")
     x = tensor([2, 3], [1, 2, 3, 4, 5, 6])
     x.requires_grad = True
     y = p.gather_flat(x, [5, 0, -1, 5], [4])
