@@ -134,4 +134,9 @@ double sum_squares(const float* a, int64_t n);
 void scale_inplace(float* a, int64_t n, float c);
 /// g /= scale in place, zeroing non-finite entries; false if there were any
 bool unscale_inplace(float* g, int64_t n, float inv);
+// fused backward kernels (used when the gradient is not itself recorded)
+std::vector<TensorPtr> layernorm_backward(const TensorPtr& x, const TensorPtr& gamma, const TensorPtr& G, float eps);
+TensorPtr gelu_backward(const TensorPtr& x, const TensorPtr& G);
+/// rows of W picked by ids, as `out_shape`; backward is a scatter-add kernel
+TensorPtr embedding(const TensorPtr& W, const std::vector<int64_t>& ids, const Shape& out_shape);
 }

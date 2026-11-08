@@ -1,3 +1,4 @@
+#include "../../ops_internal.hpp"
 #include "ml/nn/nlp/embedding.hpp"
 #include "ml/ops.hpp"
 #include <utility>
@@ -37,12 +38,8 @@ TensorPtr Embedding::forward(TensorPtr input) {
         token_ids[r] = (int)id;
     }
 
-    if (weight->device() == Device::CUDA) {           // a gather on the device
-        auto idx = make_shared<vector<int64_t>>((size_t)rows * embed_dim);
-        for (int r = 0; r < rows; r++)
-            for (int d = 0; d < embed_dim; d++) (*idx)[(size_t)r * embed_dim + d] = (int64_t)token_ids[r] * embed_dim + d;
-        return gather_flat(weight, idx, output->shape());
-    }
+    if (weight->device() == Device::CUDA)              // one kernel each way
+        return cuda_ops::embedding(weight, vector<int64_t>(token_ids.begin(), token_ids.end()), output->shape());
 
     // gather: every output row is independent
     {

@@ -41,6 +41,16 @@ TensorPtr LayerNorm::forward(TensorPtr input) {
             autograd::attach_reference(*node, [eps = eps](const std::vector<TensorPtr>& in) -> TensorPtr {
                 return layernorm_ops(in[0], in[1], in[2], eps);
             });
+            // a plain backward runs the fused kernel; a recorded one the op form
+            auto reference = node->backward_graph;
+            auto x = input, g = gamma, b = beta;
+            const float e = eps;
+            node->backward_graph = [reference, x, g, b, e](const TensorPtr& out, const TensorPtr& G) -> std::vector<TensorPtr> {
+                if (grad_enabled()) return reference(out, G);
+                auto r = cuda_ops::layernorm_backward(x, g, G, e);
+                return {x->requires_grad() ? r[0] : nullptr, g->requires_grad() ? r[1] : nullptr,
+                        b->requires_grad() ? r[2] : nullptr};
+            };
         }
         return out;
     }

@@ -495,6 +495,28 @@ int main() {
                    og2.m[0] == og.m[0] && og2.v[3] == og.v[3]);
     }
 
+    // ── phase 4: fused backward kernels, and the op form when it is recorded ──
+    {
+        // second derivative through LayerNorm (and GELU) on the GPU equals the CPU's:
+        // with create_graph the op form runs, not the fused kernel
+        auto hvp = [](const TensorPtr& x, const TensorPtr& w, LayerNorm& ln) {
+            auto y = sum(multiply(gelu(ln.forward(x)), w), -1);
+            auto g = autograd::grad(y, {x}, true)[0];
+            return autograd::grad(sum(multiply(g, g), -1), {x})[0];
+        };
+        Tensor::manual_seed(21);
+        LayerNorm lc(8);
+        Tensor::manual_seed(21);
+        LayerNorm lgpu(8);
+        lgpu.to(Device::CUDA);
+        auto x0 = random_tensor({3, 8}, 91), w0 = random_tensor({3, 8}, 92);
+        auto xc = x0->detach(), xg = G(x0);
+        xc->set_requires_grad(true);
+        xg->set_requires_grad(true);
+        CHECK_NEAR("second derivative through LayerNorm + GELU on the GPU",
+                   rel(hvp(xg, G(w0), lgpu), hvp(xc, w0, lc)), 0.0f, 1e-4f);
+    }
+
     // ── phase 3: half precision, GemmEx, autocast, GradScaler ──
     {
         std::printf("  tensor cores: %s, bf16 in hardware: %s\n", cuda::has_tensor_cores() ? "yes" : "no",

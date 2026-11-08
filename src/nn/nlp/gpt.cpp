@@ -1,3 +1,4 @@
+#include "../../ops_internal.hpp"
 #include "ml/nn/nlp/gpt.hpp"
 #include "ml/ops.hpp"
 #include "ml/autograd.hpp"
@@ -106,19 +107,15 @@ TensorPtr GPT::forward(TensorPtr token_ids) {
 
     if (tok_emb.weight->device() == Device::CUDA) {
         // on the GPU: the same model written with ops, every one a GPU kernel
-        auto ti = make_shared<vector<int64_t>>((size_t)B * S * E);
-        auto pi = make_shared<vector<int64_t>>((size_t)B * S * E);
+        vector<int64_t> pos((size_t)B * S);
         for (int r = 0; r < B * S; r++) {
             if (ids[r] < 0 || ids[r] >= V)
                 throw runtime_error("GPT: token id " + to_string(ids[r]) + " out of range");
-            for (int d = 0; d < E; d++) {
-                (*ti)[(size_t)r * E + d] = ids[r] * E + d;
-                (*pi)[(size_t)r * E + d] = (int64_t)(r % S) * E + d;
-            }
+            pos[(size_t)r] = r % S;
         }
         const Shape xshape = batched ? Shape{B, S, E} : Shape{S, E};
         auto pw = pos_emb.weight->device() == Device::CUDA ? pos_emb.weight : pos_emb.weight->to(Device::CUDA);
-        auto h = add(gather_flat(tok_emb.weight, ti, xshape), gather_flat(pw, pi, xshape));
+        auto h = add(cuda_ops::embedding(tok_emb.weight, ids, xshape), cuda_ops::embedding(pw, pos, xshape));
         for (auto& blk : blocks) h = blk.forward(h);
         h = ln_f.forward(h);
         return matmul(h, transpose(tok_emb.weight));       // weight-tied output projection

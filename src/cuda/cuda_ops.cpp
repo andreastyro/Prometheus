@@ -339,7 +339,9 @@ TensorPtr unary(const char* kernel, const char* name, const TensorPtr& a0, float
     long long n = out->numel();
     void* args[] = {&pa, &py, &n, &ix, &p0, &p1};
     cuda::launch(K(kernel, UNARY_SRC()), n, args);
-    attach(out, {a}, name, [a, graph](const TensorPtr& out, const TensorPtr& G) -> vector<TensorPtr> {
+    const bool is_gelu = string(kernel) == "u_gelu";
+    attach(out, {a}, name, [a, graph, is_gelu](const TensorPtr& out, const TensorPtr& G) -> vector<TensorPtr> {
+        if (is_gelu && !grad_enabled()) return {gelu_backward(a, G)};
         return {graph(a, out, G)};
     });
     return out;
@@ -803,6 +805,31 @@ TensorPtr cross_entropy(const TensorPtr& logits0, const vector<int>& targets) {
 
 // ── matmul on cuBLAS ─────────────────────────────────────────────────────────
 
+// A matrix operand as cuBLAS reads it: contiguous, or the transpose view of
+// contiguous memory (the last two dims swapped) read through the transpose
+// flag instead of copied -- x @ W^T and attention's Q @ K^T. Anything else is
+// made contiguous first.
+struct Operand {
+    TensorPtr t;
+    bool trans;
+    int ld;              // row length of the matrix as stored
+};
+
+static Operand operand(const TensorPtr& t) {
+    const int nd = t->dim();
+    const int64_t r = t->size(-2), c = t->size(-1);
+    if (t->is_contiguous()) return {t, false, (int)c};
+    const Shape& st = t->strides();
+    bool tr = st[nd - 2] == 1 && st[nd - 1] == r;
+    int64_t expect = r * c;
+    for (int d = nd - 3; d >= 0 && tr; d--) {
+        if (t->size(d) != 1 && st[d] != expect) tr = false;
+        expect *= t->size(d);
+    }
+    if (tr) return {t, true, (int)r};
+    return {contiguous(t), false, (int)c};
+}
+
 TensorPtr matmul(const TensorPtr& a0, const TensorPtr& b0) {
     // Two float16 (or, on compute 8.0+, bfloat16) operands multiply as they
     // are, through GemmEx: float32 accumulation, tensor cores where present.
@@ -811,34 +838,36 @@ TensorPtr matmul(const TensorPtr& a0, const TensorPtr& b0) {
     const bool half_out = d == DType::Float16 || d == DType::BFloat16;
     const bool half_in = half_out && a0->dtype() == d && b0->dtype() == d &&
                          (d == DType::Float16 || cuda::has_bf16());
-    auto a = contiguous_on_device(half_in ? on_device(a0, "matmul") : f32(a0, "matmul"));
-    auto b = contiguous_on_device(half_in ? on_device(b0, "matmul") : f32(b0, "matmul"));
+    auto a = half_in ? on_device(a0, "matmul") : f32(a0, "matmul");
+    auto b = half_in ? on_device(b0, "matmul") : f32(b0, "matmul");
+    Operand A = operand(a), B = operand(b);
     const size_t es = dtype_size(a->dtype());
     auto gemm = [&](int m_, int n_, int k_, const void* pa, long long sa, const void* pb, long long sb,
                     float* pc, long long sc, int batch) {
         if (half_in)
-            cuda::gemm_half(false, false, m_, n_, k_, d, pa, k_, sa, pb, n_, sb, pc, n_, sc, batch);
+            cuda::gemm_half(A.trans, B.trans, m_, n_, k_, d, pa, A.ld, sa, pb, B.ld, sb, pc, n_, sc, batch);
         else if (batch == 1)
-            cuda::sgemm(false, false, m_, n_, k_, 1.0f, static_cast<const float*>(pa), k_,
-                        static_cast<const float*>(pb), n_, 0.0f, pc, n_);
+            cuda::sgemm(A.trans, B.trans, m_, n_, k_, 1.0f, static_cast<const float*>(pa), A.ld,
+                        static_cast<const float*>(pb), B.ld, 0.0f, pc, n_);
         else
-            cuda::sgemm_batched(false, false, m_, n_, k_, 1.0f, static_cast<const float*>(pa), k_, sa,
-                                static_cast<const float*>(pb), n_, sb, 0.0f, pc, n_, sc, batch);
+            cuda::sgemm_batched(A.trans, B.trans, m_, n_, k_, 1.0f, static_cast<const float*>(pa), A.ld, sa,
+                                static_cast<const float*>(pb), B.ld, sb, 0.0f, pc, n_, sc, batch);
     };
     auto at = [&](const TensorPtr& t, int64_t elems) {
         return static_cast<const void*>(static_cast<const unsigned char*>(base(t)) + elems * es);
     };
     const int64_t m = a->size(-2), k = a->size(-1), n = b->size(-1);
     TensorPtr out;
-    if (b->dim() == 2) {
+    if (b->dim() == 2 && (!A.trans || a->dim() == 2)) {
         // every leading dimension of a folds into the rows: one gemm
         Shape out_shape = a->shape();
         out_shape.back() = n;
         out = make_shared<Tensor>(out_shape, F32, Device::CUDA);
         if (k > 0)
-            gemm((int)(a->numel() / k), (int)n, (int)k, base(a), 0, base(b), 0,
+            gemm((int)(a->numel() / k), (int)n, (int)k, base(A.t), 0, base(B.t), 0,
                  static_cast<float*>(out->storage()->data()), 0, 1);
     } else {
+        if (b->dim() == 2) A = {contiguous(a), false, (int)k};    // a transposed N-D a cannot fold
         const Shape batch_a(a->shape().begin(), a->shape().end() - 2);
         const Shape batch_b(b->shape().begin(), b->shape().end() - 2);
         const Shape batch = broadcast_shapes(batch_a, batch_b);
@@ -850,14 +879,14 @@ TensorPtr matmul(const TensorPtr& a0, const TensorPtr& b0) {
         for (int64_t v : batch) nb *= v;
         float* pc = static_cast<float*>(out->storage()->data());
         if (k > 0 && batch_a == batch && batch_b == batch) {
-            gemm((int)m, (int)n, (int)k, base(a), m * k, base(b), k * n, pc, m * n, (int)nb);
+            gemm((int)m, (int)n, (int)k, base(A.t), m * k, base(B.t), k * n, pc, m * n, (int)nb);
         } else if (k > 0) {
             // broadcast batch dims: one product per output matrix
             vector<int64_t> ia((size_t)nb, 0), ib((size_t)nb, 0);
             broadcast_walk(batch, broadcast_strides(batch_a, batch), broadcast_strides(batch_b, batch), false,
                            [&](int64_t i, int64_t x, int64_t y) { ia[i] = x; ib[i] = y; });
             for (int64_t q = 0; q < nb; q++)
-                gemm((int)m, (int)n, (int)k, at(a, ia[q] * m * k), 0, at(b, ib[q] * k * n), 0, pc + q * m * n, 0, 1);
+                gemm((int)m, (int)n, (int)k, at(A.t, ia[q] * m * k), 0, at(B.t, ib[q] * k * n), 0, pc + q * m * n, 0, 1);
         }
     }
     attach(out, {a, b}, "matmul", [a, b](const TensorPtr&, const TensorPtr& G) -> vector<TensorPtr> {
@@ -1036,6 +1065,166 @@ void scale_inplace(float* a, int64_t n, float c) {
     long long nn = n;
     void* args[] = {&a, &nn, &c};
     cuda::launch(K("o_scale", FUSED_SRC()), nn, args);
+}
+
+// ── fused backward kernels ───────────────────────────────────────────────────
+//
+// A GPU op's backward_graph builds its gradient from ops, so it can be
+// differentiated again -- but for LayerNorm, GELU and the embedding that is a
+// dozen or more small kernels per call, most of the backward's time. When the
+// gradient is not itself being recorded (a plain .backward(), or grad()
+// without create_graph -- grad_enabled() is false), these fused kernels give
+// the same numbers in one or two launches; with create_graph the op form runs.
+
+static const string& BACKWARD_SRC() {
+    static const string s = src(R"(
+// LayerNorm, one block per row: dx, and the row's mean and 1/std for the
+// gamma / beta column sums.  dx = inv * (g*dy - mean(g*dy) - xhat * mean(g*dy*xhat))
+extern "C" __global__ void b_layernorm_rows(const float* x, const float* g, const float* dy, float* dx,
+                                            float* mean_out, float* inv_out, long long cols, float eps) {
+    __shared__ float s[256];
+    __shared__ float s2[256];
+    const float* xr = x + (long long)blockIdx.x * cols;
+    const float* dyr = dy + (long long)blockIdx.x * cols;
+    float* dxr = dx + (long long)blockIdx.x * cols;
+    float t = 0.0f;
+    for (long long j = threadIdx.x; j < cols; j += blockDim.x) t += xr[j];
+    s[threadIdx.x] = t;
+    __syncthreads();
+    for (int w = blockDim.x / 2; w > 0; w >>= 1) { if (threadIdx.x < w) s[threadIdx.x] += s[threadIdx.x + w]; __syncthreads(); }
+    const float mean = s[0] / (float)cols;
+    __syncthreads();
+    t = 0.0f;
+    for (long long j = threadIdx.x; j < cols; j += blockDim.x) { float d = xr[j] - mean; t += d * d; }
+    s[threadIdx.x] = t;
+    __syncthreads();
+    for (int w = blockDim.x / 2; w > 0; w >>= 1) { if (threadIdx.x < w) s[threadIdx.x] += s[threadIdx.x + w]; __syncthreads(); }
+    const float inv = rsqrtf(s[0] / (float)cols + eps);
+    __syncthreads();
+    float a = 0.0f, b = 0.0f;
+    for (long long j = threadIdx.x; j < cols; j += blockDim.x) {
+        const float gd = g[j] * dyr[j];
+        a += gd;
+        b += gd * (xr[j] - mean) * inv;
+    }
+    s[threadIdx.x] = a;
+    s2[threadIdx.x] = b;
+    __syncthreads();
+    for (int w = blockDim.x / 2; w > 0; w >>= 1) {
+        if (threadIdx.x < w) { s[threadIdx.x] += s[threadIdx.x + w]; s2[threadIdx.x] += s2[threadIdx.x + w]; }
+        __syncthreads();
+    }
+    const float m1 = s[0] / (float)cols, m2 = s2[0] / (float)cols;
+    for (long long j = threadIdx.x; j < cols; j += blockDim.x) {
+        const float xh = (xr[j] - mean) * inv;
+        dxr[j] = inv * (g[j] * dyr[j] - m1 - xh * m2);
+    }
+    if (threadIdx.x == 0) { mean_out[blockIdx.x] = mean; inv_out[blockIdx.x] = inv; }
+}
+// gamma / beta gradients: one thread per column, summing over the rows
+extern "C" __global__ void b_layernorm_cols(const float* x, const float* dy, const float* mean, const float* inv,
+                                            float* dg, float* db, long long rows, long long cols) {
+    long long j = gid(); if (j >= cols) return;
+    float ag = 0.0f, ab = 0.0f;
+    for (long long r = 0; r < rows; r++) {
+        const float d = dy[r * cols + j];
+        ag += d * (x[r * cols + j] - mean[r]) * inv[r];
+        ab += d;
+    }
+    dg[j] = ag;
+    db[j] = ab;
+}
+// GELU (tanh form): dx = dy * d/dx [0.5 x (1 + tanh(k (x + c x^3)))]
+extern "C" __global__ void b_gelu(const float* x, const float* dy, float* dx, long long n) {
+    long long i = gid(); if (i >= n) return;
+    const float k = 0.7978845608f, c = 0.044715f, v = x[i];
+    const float t = tanhf(k * (v + c * v * v * v));
+    dx[i] = dy[i] * (0.5f * (1.0f + t) + 0.5f * v * (1.0f - t * t) * k * (1.0f + 3.0f * c * v * v));
+}
+// embedding: rows of the table by id, and the scatter-add back (ids repeat)
+extern "C" __global__ void b_embed_fwd(const float* w, const long long* ids, float* out, long long rows, long long e) {
+    long long i = gid(); if (i >= rows * e) return;
+    out[i] = w[ids[i / e] * e + i % e];
+}
+extern "C" __global__ void b_embed_bwd(const float* g, const long long* ids, float* dw, long long rows, long long e) {
+    long long i = gid(); if (i >= rows * e) return;
+    atomicAdd(&dw[ids[i / e] * e + i % e], g[i]);
+}
+)");
+    return s;
+}
+
+vector<TensorPtr> layernorm_backward(const TensorPtr& x0, const TensorPtr& g0, const TensorPtr& G0, float eps) {
+    auto x = contiguous_on_device(f32(x0, "LayerNorm")), g = contiguous_on_device(f32(g0, "LayerNorm"));
+    auto G = contiguous_on_device(f32(G0, "LayerNorm"));
+    long long cols = x->shape().back();
+    long long rows = cols ? x->numel() / cols : 0;
+    auto dx = empty_cuda(x->shape()), dg = empty_cuda({cols}), db = empty_cuda({cols});
+    auto mean = empty_cuda({max(rows, 1LL)}), inv = empty_cuda({max(rows, 1LL)});
+    const void* px = base(x);
+    const void* pg = base(g);
+    const void* pd = base(G);
+    void* pdx = dx->storage()->data();
+    void* pm = mean->storage()->data();
+    void* pi = inv->storage()->data();
+    void* pdg = dg->storage()->data();
+    void* pdb = db->storage()->data();
+    void* a1[] = {&px, &pg, &pd, &pdx, &pm, &pi, &cols, &eps};
+    if (rows) cuda::launch(K("b_layernorm_rows", BACKWARD_SRC()), (unsigned)rows, 1, 1, 256, 1, 1, 0, a1);
+    void* a2[] = {&px, &pd, &pm, &pi, &pdg, &pdb, &rows, &cols};
+    cuda::launch(K("b_layernorm_cols", BACKWARD_SRC()), cols, a2);
+    return {dx, dg, db};
+}
+
+TensorPtr gelu_backward(const TensorPtr& x0, const TensorPtr& G0) {
+    auto x = contiguous_on_device(f32(x0, "gelu")), G = contiguous_on_device(f32(G0, "gelu"));
+    auto dx = empty_cuda(x->shape());
+    const void* px = base(x);
+    const void* pg = base(G);
+    void* pd = dx->storage()->data();
+    long long n = x->numel();
+    void* args[] = {&px, &pg, &pd, &n};
+    cuda::launch(K("b_gelu", BACKWARD_SRC()), n, args);
+    return dx;
+}
+
+TensorPtr embedding(const TensorPtr& W0, const vector<int64_t>& ids, const Shape& out_shape) {
+    auto W = contiguous_on_device(f32(W0, "Embedding"));
+    long long e = W->shape().back(), rows = (long long)ids.size();
+    auto host = make_shared<Tensor>(Shape{rows}, DType::Int64);
+    if (rows) memcpy(host->storage()->data(), ids.data(), ids.size() * sizeof(int64_t));
+    auto dev_ids = host->to(Device::CUDA);
+    auto out = empty_cuda(out_shape);
+    const void* pw = base(W);
+    const void* pi = dev_ids->storage()->data();
+    void* po = out->storage()->data();
+    void* args[] = {&pw, &pi, &po, &rows, &e};
+    cuda::launch(K("b_embed_fwd", BACKWARD_SRC()), rows * e, args);
+    if (W->requires_grad()) {
+        auto node = make_node(out, {W});
+        node->name = "Embedding";
+        // the op form, for gradients that are themselves differentiated
+        autograd::attach_reference(*node, [ids, e, out_shape](const vector<TensorPtr>& in) -> TensorPtr {
+            auto idx = make_shared<vector<int64_t>>(ids.size() * (size_t)e);
+            for (size_t r = 0; r < ids.size(); r++)
+                for (long long d = 0; d < e; d++) (*idx)[r * e + d] = ids[r] * e + d;
+            return gather_flat(in[0], idx, out_shape);
+        });
+        auto reference = node->backward_graph;
+        node->backward_graph = [reference, dev_ids, rows, e, W](const TensorPtr& out, const TensorPtr& G0) -> vector<TensorPtr> {
+            if (grad_enabled()) return reference(out, G0);
+            auto G = contiguous_on_device(f32(G0, "Embedding"));
+            auto dw = make_shared<Tensor>(W->shape(), F32, Device::CUDA);      // zeroed
+            const void* pg = base(G);
+            const void* pi = dev_ids->storage()->data();
+            void* pd = dw->storage()->data();
+            long long r = rows, ee = e;
+            void* a[] = {&pg, &pi, &pd, &r, &ee};
+            cuda::launch(K("b_embed_bwd", BACKWARD_SRC()), r * ee, a);
+            return {dw};
+        };
+    }
+    return out;
 }
 
 } // namespace cuda_ops
