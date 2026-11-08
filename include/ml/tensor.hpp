@@ -90,7 +90,9 @@ private:
 /// from share one Storage; nothing else does.
 class Storage {
 public:
-    Storage(std::size_t nbytes, DType dtype, Device device);
+    /// `zero` false leaves the bytes as the allocator returned them, for an
+    /// output whose every element the caller is about to write.
+    Storage(std::size_t nbytes, DType dtype, Device device, bool zero = true);
     ~Storage();
     Storage(const Storage&) = delete;
     Storage& operator=(const Storage&) = delete;
@@ -142,6 +144,10 @@ public:
     /// Zero-filled tensor of the given shape.
     explicit Tensor(ShapeArg shape, DType dtype = DType::Float32,
                     Device device = Device::CPU);
+
+    /// Tag for a tensor whose elements are left uninitialised.
+    struct Uninitialized {};
+    Tensor(ShapeArg shape, Uninitialized, DType dtype = DType::Float32);
 
     /// float32 tensor holding `values` in row-major order.
     Tensor(ShapeArg shape, const std::vector<float>& values);
@@ -216,6 +222,9 @@ public:
 
     // ── factories ────────────────────────────────────────────────────────
     static TensorPtr zeros(ShapeArg shape, DType dtype = DType::Float32);
+    /// Uninitialised: for a kernel output that writes every element. Skips the
+    /// zero-fill pass, a third of the memory traffic of a memory-bound op.
+    static TensorPtr empty(ShapeArg shape, DType dtype = DType::Float32);
     static TensorPtr ones(ShapeArg shape, DType dtype = DType::Float32);
     static TensorPtr full(ShapeArg shape, float value, DType dtype = DType::Float32);
     /// float32 samples from N(0, 1).

@@ -1,6 +1,7 @@
 #include "ml/nn/batchnorm.hpp"
 #include "ml/ops.hpp"
 #include "ml/tensor.hpp"
+#include "norm_kernels.hpp"
 #include <cmath>
 #include <cstdint>
 #include <utility>
@@ -25,89 +26,92 @@ BatchNorm::BatchNorm(int num_features, float eps, bool training, float momentum)
 //   2D [batch, features]          -> S = 1,    the BatchNorm1d case
 //   4D [batch, channels, H, W]    -> S = H*W,  the BatchNorm2d case
 //
-// A 4D input used to be read as if it were 2D: shape[1] was taken as the
-// feature count and elements indexed b * features + f, which normalised the
-// wrong groups and returned silently wrong numbers rather than erroring. Any
-// CNN using BatchNorm was affected.
-//
 // Backward is the usual normalisation gradient, over N*S elements per channel:
 //
 //   dL/dx[i] = (1/std) * ( g[i] - mean(g) - x_hat[i] * mean(g * x_hat) )
 //
 // with g[i] = gamma[c] * dL/dy[i]. In eval mode the statistics come from the
 // running estimate and are constants, so the last two terms vanish.
+//
+// Layout of the work. The tensor is N*C rows of S contiguous values. Each pass
+// runs in parallel over rows, which keeps every core busy even when C is small,
+// and each row is read while it sits in L1:
+//
+//   forward   row mean and M2 -> per-channel mean and variance (Chan's
+//             combination, exact in double) -> y = a*(x - mean) + beta
+//   backward  row sums of dy and dy*(x - mean) -> per-channel coefficients ->
+//             dx = k1*dy + k2*(x - mean) + k3
+//
+// x_hat is not stored: the backward recomputes it from x and two numbers per
+// channel. Storing it cost a full write and read of the activation.
 TensorPtr BatchNorm::forward(TensorPtr input) {
+    input = checked_input("BatchNorm", input);
     const int ndim = (int)input->shape().size();
     if (ndim < 2)
         throw runtime_error("BatchNorm: expected at least 2 dimensions "
                             "[batch, features, ...]");
 
-    const int N = input->shape()[0];
-    const int C = input->shape()[1];
-    if (C != (int)running_mean.size())
+    const int64_t N = input->shape()[0];
+    const int64_t C = input->shape()[1];
+    if (C != (int64_t)running_mean.size())
         throw runtime_error("BatchNorm: input has " + to_string(C) +
                             " channels but the layer was built for " +
                             to_string(running_mean.size()));
 
-    int S = 1;
+    int64_t S = 1;
     for (int d = 2; d < ndim; d++) S *= input->shape()[d];
+    const int64_t rows  = N * C;
+    const int64_t count = N * S;
+    const bool    big   = rows * S >= 65536;
 
-    auto output = make_shared<Tensor>(input->shape());
+    auto output = Tensor::empty(input->shape());
+    const float* X  = input->data();
+    float*       Y  = output->data();
+    const float* gm = gamma->data();
+    const float* bt = beta->data();
 
-    // saved for the backward pass
-    vector<float> x_hat(input->num_el());
-    vector<float> inv_std_all(C);
+    vector<float> mean_c(C), inv_std_c(C);
+    if (training) {
+        vector<double> rmean(rows), rm2(rows);
+        #pragma omp parallel for schedule(static) if(big)
+        for (int64_t r = 0; r < rows; r++)
+            normk::moments(X + r * S, S, rmean[r], rm2[r]);
 
-    const int count = N * S;
-
-    // Every channel is independent -- its statistics, its running averages,
-    // its slice of the output and its gamma/beta gradient -- so they run in
-    // parallel. They ran one at a time on one core: 10x slower than PyTorch.
-    #pragma omp parallel for schedule(static) if((int64_t)C * count >= 65536)
-    for (int c = 0; c < C; c++) {
-        float mean, var;
-
-        if (training) {
-            const float* X = input->data();
-            double acc = 0.0;
-            for (int n = 0; n < N; n++) {
-                const float* row = X + ((int64_t)n * C + c) * S;
-                for (int s = 0; s < S; s++) acc += row[s];
+        for (int64_t c = 0; c < C; c++) {
+            double m = 0.0;
+            for (int64_t n = 0; n < N; n++) m += rmean[n * C + c];
+            m /= (double)N;
+            double m2 = 0.0;
+            for (int64_t n = 0; n < N; n++) {
+                const double d = rmean[n * C + c] - m;
+                m2 += rm2[n * C + c] + (double)S * d * d;
             }
-            mean = (float)(acc / count);
-
-            acc = 0.0;
-            for (int n = 0; n < N; n++) {
-                const float* row = X + ((int64_t)n * C + c) * S;
-                for (int s = 0; s < S; s++) { const float d = row[s] - mean; acc += (double)d * d; }
-            }
-            var = (float)(acc / count);
-
+            const float var = count ? (float)(m2 / (double)count) : 0.0f;
+            mean_c[c]    = (float)m;
+            inv_std_c[c] = 1.0f / std::sqrt(var + eps);
             // exponential moving average, as PyTorch does
-            running_mean[c] = (1.0f - momentum) * running_mean[c] + momentum * mean;
+            running_mean[c] = (1.0f - momentum) * running_mean[c] + momentum * (float)m;
             running_var[c]  = (1.0f - momentum) * running_var[c]  + momentum * var;
-        } else {
-            mean = running_mean[c];
-            var  = running_var[c];
         }
+    } else {
+        for (int64_t c = 0; c < C; c++) {
+            mean_c[c]    = running_mean[c];
+            inv_std_c[c] = 1.0f / std::sqrt(running_var[c] + eps);
+        }
+    }
 
-        const float inv_std = 1.0f / std::sqrt(var + eps);
-        inv_std_all[c] = inv_std;
-
-        for (int n = 0; n < N; n++)
-            for (int s = 0; s < S; s++) {
-                const int idx = (n * C + c) * S + s;
-                const float norm = (input->data()[idx] - mean) * inv_std;
-                x_hat[idx] = norm;
-                output->data()[idx] = gamma->data()[c] * norm + beta->data()[c];
-            }
+    #pragma omp parallel for schedule(static) if(big)
+    for (int64_t r = 0; r < rows; r++) {
+        const int64_t c = r % C;
+        const float a = gm[c] * inv_std_c[c];
+        normk::affine(X + r * S, Y + r * S, S, a, mean_c[c], bt[c]);
     }
 
     if (input->requires_grad() || gamma->requires_grad() || beta->requires_grad()) {
         auto node = make_node(output, {input, gamma, beta});
         node->name = "BatchNorm::forward";
         autograd::attach_reference(*node, [N, C, S, eps = eps, was_training = training, rm = running_mean, rv = running_var](const std::vector<TensorPtr>& in) -> TensorPtr {
-            auto x3 = reshape(in[0], {(int64_t)N, (int64_t)C, (int64_t)S});
+            auto x3 = reshape(in[0], {N, C, S});
             TensorPtr xh;
             if (was_training) {
                 auto m   = mean(mean(x3, 2, true), 0, true);
@@ -118,11 +122,11 @@ TensorPtr BatchNorm::forward(TensorPtr input) {
                 // the running statistics are constants. They are copied as they stood
                 // at the forward pass; the forward in eval mode does not update them.
                 vector<float> mv(C), iv(C);
-                for (int c = 0; c < C; c++) { mv[c] = rm[c]; iv[c] = 1.0f / std::sqrt(rv[c] + eps); }
+                for (int64_t c = 0; c < C; c++) { mv[c] = rm[c]; iv[c] = 1.0f / std::sqrt(rv[c] + eps); }
                 xh = multiply(subtract(x3, make_shared<Tensor>(Shape{1, C, 1}, mv)),
                               make_shared<Tensor>(Shape{1, C, 1}, iv));
             }
-            auto out = add(multiply(xh, reshape(in[1], {1, (int64_t)C, 1})), reshape(in[2], {1, (int64_t)C, 1}));
+            auto out = add(multiply(xh, reshape(in[1], {1, C, 1})), reshape(in[2], {1, C, 1}));
             return reshape(out, in[0]->shape());
         });
 
@@ -130,54 +134,47 @@ TensorPtr BatchNorm::forward(TensorPtr input) {
         auto beta_  = beta;
         const bool was_training = training;
 
-        // moved, not copied: x_hat is the size of the whole activation
-        node->backward_fn = [input, gamma_, beta_, x_hat = std::move(x_hat),
-                             inv_std_all = std::move(inv_std_all),
-                             N, C, S, count, was_training](const TensorPtr& output) {
-            // Pointers hoisted and every per-channel sum kept in a register.
-            // The loop used to add into gamma->grad()[c] and beta->grad()[c]
-            // on every element, re-checking requires_grad each time: a store
-            // to memory the compiler could not keep in a register, which made
-            // this backward 3.9 ms against PyTorch's 1 ms for the whole layer.
+        node->backward_fn = [input, gamma_, beta_, mean_c = std::move(mean_c),
+                             inv_std_c = std::move(inv_std_c),
+                             N, C, S, count, big, was_training](const TensorPtr& output) {
+            const int64_t rows = N * C;
             const float* G  = output->grad();
-            const float* XH = x_hat.data();
+            const float* X  = input->data();
             const float* gm = gamma_->data();
             float* GX = input->requires_grad() ? input->grad() : nullptr;
             float* GG = gamma_->requires_grad() ? gamma_->grad() : nullptr;
             float* GB = beta_->requires_grad() ? beta_->grad() : nullptr;
 
-            #pragma omp parallel for schedule(static) if((int64_t)C * count >= 65536)
-            for (int c = 0; c < C; c++) {
-                const float inv_std = inv_std_all[c];
-                const float g_c = gm[c];
+            // per row: sum(dy) and sum(dy * (x - mean))
+            vector<double> rsg(rows), rsgx(rows);
+            #pragma omp parallel for schedule(static) if(big)
+            for (int64_t r = 0; r < rows; r++)
+                normk::grad_sums(G + r * S, X + r * S, S, mean_c[r % C], rsg[r], rsgx[r]);
 
-                // sum(dy) and sum(dy * x_hat) over the channel: they give the
-                // beta and gamma gradients and the input gradient's two means
-                float sum_dy = 0.0f, sum_dy_xhat = 0.0f;
-                for (int n = 0; n < N; n++) {
-                    const int64_t base = ((int64_t)n * C + c) * S;
-                    const float* gy = G + base;
-                    const float* xh = XH + base;
-                    for (int s = 0; s < S; s++) {
-                        sum_dy      += gy[s];
-                        sum_dy_xhat += gy[s] * xh[s];
-                    }
-                }
-                if (GG) GG[c] += sum_dy_xhat;
-                if (GB) GB[c] += sum_dy;
-                if (!GX) continue;
+            // per channel: the gamma/beta gradients and dx's coefficients
+            vector<float> k1(C), k2(C), k3(C);
+            for (int64_t c = 0; c < C; c++) {
+                double sum_dy = 0.0, sum_dyxc = 0.0;
+                for (int64_t n = 0; n < N; n++) { sum_dy += rsg[n * C + c]; sum_dyxc += rsgx[n * C + c]; }
+                const double inv_std     = inv_std_c[c];
+                const double sum_dy_xhat = inv_std * sum_dyxc;
+                if (GG) GG[c] += (float)sum_dy_xhat;
+                if (GB) GB[c] += (float)sum_dy;
 
                 // dx = inv_std * (g*dy - mean(g*dy) - x_hat * mean(g*dy*x_hat))
-                const float mean_g      = was_training ? g_c * sum_dy / count : 0.0f;
-                const float mean_g_xhat = was_training ? g_c * sum_dy_xhat / count : 0.0f;
-                for (int n = 0; n < N; n++) {
-                    const int64_t base = ((int64_t)n * C + c) * S;
-                    const float* gy = G + base;
-                    const float* xh = XH + base;
-                    float* gx = GX + base;
-                    for (int s = 0; s < S; s++)
-                        gx[s] += inv_std * (g_c * gy[s] - mean_g - xh[s] * mean_g_xhat);
-                }
+                const double mean_g      = was_training ? gm[c] * sum_dy / count : 0.0;
+                const double mean_g_xhat = was_training ? gm[c] * sum_dy_xhat / count : 0.0;
+                k1[c] = (float)(inv_std * gm[c]);
+                k2[c] = (float)(-inv_std * inv_std * mean_g_xhat);
+                k3[c] = (float)(-inv_std * mean_g);
+            }
+            if (!GX) return;
+
+            #pragma omp parallel for schedule(static) if(big)
+            for (int64_t r = 0; r < rows; r++) {
+                const int64_t c = r % C;
+                normk::affine_grad(G + r * S, X + r * S, GX + r * S, S,
+                                   k1[c], k2[c], mean_c[c], k3[c]);
             }
         };
     }

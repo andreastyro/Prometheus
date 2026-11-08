@@ -225,14 +225,14 @@ void FloatBuffer::reset() {
 
 // ── Storage ──────────────────────────────────────────────────────────────────
 
-Storage::Storage(size_t nbytes, DType dtype, Device device)
+Storage::Storage(size_t nbytes, DType dtype, Device device, bool zero)
     : dtype_(dtype), device_(device) {
     if (device != Device::CPU)
         throw runtime_error(string("device '") + device_name(device) +
                             "' is not available in this build; only cpu is");
     nbytes_ = nbytes;
     ptr_ = static_cast<unsigned char*>(mem::alloc(nbytes));
-    if (nbytes) std::memset(ptr_, 0, nbytes);
+    if (nbytes && zero) std::memset(ptr_, 0, nbytes);
 }
 
 Storage::~Storage() { mem::free(ptr_, nbytes_); }
@@ -259,6 +259,14 @@ Tensor::Tensor(ShapeArg shape, DType dtype, Device device)
     : shape_(shape.get()) {
     numel_   = product(shape_);
     storage_ = make_shared<Storage>((size_t)numel_ * dtype_size(dtype), dtype, device);
+    strides_ = contiguous_strides(shape_);
+    init_layout();
+}
+
+Tensor::Tensor(ShapeArg shape, Uninitialized, DType dtype)
+    : shape_(shape.get()) {
+    numel_   = product(shape_);
+    storage_ = make_shared<Storage>((size_t)numel_ * dtype_size(dtype), dtype, Device::CPU, false);
     strides_ = contiguous_strides(shape_);
     init_layout();
 }
@@ -440,6 +448,10 @@ void Tensor::manual_seed(unsigned int seed) { global_rng().seed(seed); }
 
 TensorPtr Tensor::zeros(ShapeArg shape, DType dtype) {
     return make_shared<Tensor>(shape, dtype);
+}
+
+TensorPtr Tensor::empty(ShapeArg shape, DType dtype) {
+    return make_shared<Tensor>(shape, Uninitialized{}, dtype);
 }
 
 TensorPtr Tensor::ones(ShapeArg shape, DType dtype) {

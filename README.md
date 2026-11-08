@@ -176,8 +176,8 @@ Per layer, forward + backward, against PyTorch 2.15 on the same shapes
 | ConvTranspose2D | [16,64,16,16] -> 32, k4 s2 | 4.07 ms | 1.48 ms | 2.8x slower |
 | MaxPool2D | [16,64,32,32], k2 | 0.72 ms | 1.03 ms | 1.4x faster |
 | AvgPool2D | [16,64,32,32], k2 | 0.24 ms | 0.52 ms | 2.2x faster |
-| BatchNorm | [16,64,32,32] | 1.47 ms | 0.89 ms | 1.7x slower |
-| GroupNorm | [16,64,32,32], 8 groups | 1.34 ms | 0.45 ms | 3.0x slower |
+| BatchNorm | [16,64,32,32] | 0.81 ms | 1.38 ms | 1.7x faster |
+| GroupNorm | [16,64,32,32], 8 groups | 0.44 ms | 0.65 ms | 1.5x faster |
 | RNN | seq 64, batch 32, 128 -> 256 | 6.24 ms | 5.92 ms | 1.1x slower |
 | LSTM | seq 64, batch 32, 128 -> 256 | 24.12 ms | 10.59 ms | 2.3x slower |
 | GRU | seq 64, batch 32, 128 -> 256 | 15.98 ms | 18.82 ms | 1.2x faster |
