@@ -269,7 +269,9 @@ its kernels; without it, or with `PROMETHEUS_CUDNN=0`, they run on the
 library's own. `cuda_cudnn_status()` names the version in use or why it is not
 used. A tiny test convolution runs when it loads, because recent cuDNN releases
 load on older cards and then fail; on a GTX 900 card use cuDNN 9.10, the
-version PyTorch bundles:
+version PyTorch bundles. Each convolution shape's algorithms are timed once
+and the fastest kept (`PROMETHEUS_CUDNN_BENCHMARK=0` takes cuDNN's heuristic
+pick instead, with no timing run):
 
 ```bash
 pip install nvidia-cudnn-cu12            # Maxwell: nvidia-cudnn-cu12==9.10.2.21
@@ -279,8 +281,8 @@ GPT training step on a GTX 970 (4 layers x 256, batch 8 x 128,
 [tests/bench_gpu_gpt.py](tests/bench_gpu_gpt.py)): Prometheus 26.6 ms
 (38.4k tokens/s), PyTorch 2.14 19.8 ms (51.8k tokens/s), the same step on a
 Ryzen AI 7 350 CPU 208 ms. Small-CNN training step, batch 64 of 32x32
-([tests/bench_gpu_cnn.py](tests/bench_gpu_cnn.py)): Prometheus 7.6-8.2 ms
-with cuDNN, 10.7 ms without, PyTorch 4.9 ms. The GPU suite is
+([tests/bench_gpu_cnn.py](tests/bench_gpu_cnn.py)): Prometheus 6.4-6.6 ms
+with cuDNN, 10.7 ms without, PyTorch 4.9-5.5 ms. The GPU suite is
 [tests/test_cuda.cpp](tests/test_cuda.cpp) and
 [tests/test_cuda.py](tests/test_cuda.py): every op and layer against the CPU,
 forward and gradient; CI has no GPU, so there they build and skip.

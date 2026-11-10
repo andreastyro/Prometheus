@@ -674,6 +674,11 @@ struct Dnn {
     int (*bwd_filter_ws)(dnnHandle, dnnDesc, dnnDesc, dnnDesc, dnnDesc, int, size_t*);
     int (*bwd_filter)(dnnHandle, const void*, dnnDesc, const void*, dnnDesc, const void*, dnnDesc, int, void*, size_t,
                       const void*, dnnDesc, void*);
+    // optional: time every algorithm on the real shape (cudnnFind*); same
+    // arguments as the _v7 heuristics
+    int (*find_fwd)(dnnHandle, dnnDesc, dnnDesc, dnnDesc, dnnDesc, int, int*, DnnPerf*);
+    int (*find_bwd_data)(dnnHandle, dnnDesc, dnnDesc, dnnDesc, dnnDesc, int, int*, DnnPerf*);
+    int (*find_bwd_filter)(dnnHandle, dnnDesc, dnnDesc, dnnDesc, dnnDesc, int, int*, DnnPerf*);
 };
 Dnn       g_dnn{};
 dnnHandle g_dnn_handle = nullptr;
@@ -751,6 +756,11 @@ void init_dnn_locked() {
         bind(lib, d.bwd_filter_ws, "cudnnGetConvolutionBackwardFilterWorkspaceSize") &&
         bind(lib, d.bwd_filter, "cudnnConvolutionBackwardFilter");
     if (!all) { g_dnn_why = "cuDNN is missing a convolution entry point"; return; }
+    const char* bench = getenv("PROMETHEUS_CUDNN_BENCHMARK");
+    if (!(bench && string(bench) == "0") && !(bind(lib, d.find_fwd, "cudnnFindConvolutionForwardAlgorithm") &&
+                                              bind(lib, d.find_bwd_data, "cudnnFindConvolutionBackwardDataAlgorithm") &&
+                                              bind(lib, d.find_bwd_filter, "cudnnFindConvolutionBackwardFilterAlgorithm")))
+        d.find_fwd = nullptr;
     g_dnn_version = d.get_version();
     if (g.d.cuCtxSetCurrent(g.ctx) != 0 || d.create(&g_dnn_handle) != 0 || d.set_stream(g_dnn_handle, g.stream) != 0) {
         g_dnn_why = "cudnnCreate failed (this cuDNN may not support compute " + to_string(g.cc / 10) + "." +
@@ -774,8 +784,10 @@ void check_dnn(int status, const char* what) {
                             (g_dnn.error_string ? g_dnn.error_string(status) : to_string(status)));
 }
 
-// the plan for a shape: descriptors, the heuristic's first working algorithm
-// for each direction, and their workspace sizes
+// the plan for a shape: descriptors, an algorithm for each direction and its
+// workspace size. Each algorithm is timed on this shape once (what PyTorch's
+// cudnn.benchmark does) and the fastest kept; with PROMETHEUS_CUDNN_BENCHMARK=0
+// the heuristic's first choice is taken untimed.
 DnnPlan& dnn_plan(const ConvShape& s) {
     lock_guard<mutex> lock(g_dnn_mu);
     auto key = std::make_tuple(s.B, s.C, s.H, s.W, s.F, s.K, s.stride, s.pad);
@@ -793,19 +805,27 @@ DnnPlan& dnn_plan(const ConvShape& s) {
     check_dnn(d.set_filter4d(p.w, 0, 0, s.F, s.C, s.K, s.K), "filter descriptor");
     check_dnn(d.create_conv(&p.conv), "convolution descriptor");
     check_dnn(d.set_conv2d(p.conv, s.pad, s.pad, s.stride, s.stride, 1, 1, 1, 0), "convolution descriptor");
+    // results come fastest first; skip failures and workspaces over 256 MB
     auto pick = [](const DnnPerf* perf, int n) {
-        for (int i = 0; i < n; i++) if (perf[i].status == 0) return perf[i].algo;
+        for (int i = 0; i < n; i++)
+            if (perf[i].status == 0 && perf[i].memory <= (size_t(256) << 20)) return perf[i].algo;
         return perf[0].algo;
     };
+    const bool timed = d.find_fwd != nullptr;
+    // cudnnFind runs synchronously on the default stream: let ours drain first
+    if (timed) check(g.d.cuStreamSynchronize(g.stream), "cuStreamSynchronize");
     DnnPerf perf[16];
     int n = 0;
-    check_dnn(d.fwd_algo(g_dnn_handle, p.x, p.w, p.conv, p.y, 16, &n, perf), "forward algorithm");
+    check_dnn((timed ? d.find_fwd : d.fwd_algo)(g_dnn_handle, p.x, p.w, p.conv, p.y, 16, &n, perf),
+              "forward algorithm");
     p.fwd_algo = pick(perf, n);
     check_dnn(d.fwd_ws(g_dnn_handle, p.x, p.w, p.conv, p.y, p.fwd_algo, &p.fwd_ws), "forward workspace");
-    check_dnn(d.bwd_data_algo(g_dnn_handle, p.w, p.y, p.conv, p.x, 16, &n, perf), "backward-data algorithm");
+    check_dnn((timed ? d.find_bwd_data : d.bwd_data_algo)(g_dnn_handle, p.w, p.y, p.conv, p.x, 16, &n, perf),
+              "backward-data algorithm");
     p.data_algo = pick(perf, n);
     check_dnn(d.bwd_data_ws(g_dnn_handle, p.w, p.y, p.conv, p.x, p.data_algo, &p.data_ws), "backward-data workspace");
-    check_dnn(d.bwd_filter_algo(g_dnn_handle, p.x, p.y, p.conv, p.w, 16, &n, perf), "backward-filter algorithm");
+    check_dnn((timed ? d.find_bwd_filter : d.bwd_filter_algo)(g_dnn_handle, p.x, p.y, p.conv, p.w, 16, &n, perf),
+              "backward-filter algorithm");
     p.filter_algo = pick(perf, n);
     check_dnn(d.bwd_filter_ws(g_dnn_handle, p.x, p.y, p.conv, p.w, p.filter_algo, &p.filter_ws),
               "backward-filter workspace");
