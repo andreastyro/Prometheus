@@ -282,7 +282,11 @@ GPT training step on a GTX 970 (4 layers x 256, batch 8 x 128,
 (41.0k tokens/s), PyTorch 2.14 19.4 ms (52.9k tokens/s), the same step on a
 Ryzen AI 7 350 CPU 208 ms. Small-CNN training step, batch 64 of 32x32
 ([tests/bench_gpu_cnn.py](tests/bench_gpu_cnn.py)): Prometheus 5.8-5.9 ms
-with cuDNN, PyTorch 4.9 ms. The GPU suite is
+with cuDNN, PyTorch 4.9 ms. Recurrent layers run fused on the GPU (one gemm
+and one gate kernel per step, backward through time on the device); a training
+step over 64 x 32 x 128 -> 256 ([tests/bench_gpu_lstm.py](tests/bench_gpu_lstm.py)):
+LSTM 5.8 ms, GRU 5.8 ms, RNN 2.8-3.5 ms against PyTorch's cuDNN 4.9-5.4,
+4.6-5.5 and 3.3-4.2 ms. The GPU suite is
 [tests/test_cuda.cpp](tests/test_cuda.cpp) and
 [tests/test_cuda.py](tests/test_cuda.py): every op and layer against the CPU,
 forward and gradient; CI has no GPU, so there they build and skip.

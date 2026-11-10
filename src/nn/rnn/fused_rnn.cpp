@@ -1,4 +1,6 @@
 #include "ml/nn/rnn/fused_rnn.hpp"
+#include "../../ops_internal.hpp"
+#include "ml/cuda.hpp"
 #include "ml/matmul_backend.hpp"
 #include "ml/ops.hpp"
 #include <algorithm>
@@ -68,6 +70,24 @@ TensorPtr slice_of(const TensorPtr& src, int64_t offset, Shape shape) {
             for (int64_t i = 0; i < n; i++) idx->push_back(offset + i);
             return gather_flat(in[0], idx, shape);
         });
+        if (src->device() == Device::CUDA) {
+            // the gradient placed at `offset` in a zeroed buffer of src's size,
+            // by one device copy; the op form (a gather built on the host,
+            // uploaded every step: 13 ms of an 18 ms LSTM step) only when the
+            // backward itself is recorded
+            auto ref_graph = node->backward_graph;
+            const int64_t n_src = src->numel();
+            node->backward_graph = [ref_graph, offset, n_src](const TensorPtr& o, const TensorPtr& G)
+                -> std::vector<TensorPtr> {
+                if (grad_enabled() || G->dtype() != DType::Float32) return ref_graph(o, G);
+                auto g = G->is_contiguous() ? G : contiguous(G);
+                auto full = make_shared<Tensor>(Shape{n_src}, DType::Float32, Device::CUDA);   // zeroed
+                cuda::copy_device(static_cast<float*>(full->storage()->data()) + offset,
+                                  static_cast<const float*>(g->storage()->data()) + g->offset(),
+                                  (size_t)g->numel() * sizeof(float));
+                return {full};
+            };
+        }
         node->backward_fn = [src, offset](const TensorPtr& out) {
             const float* g = out->grad();
             float* gs = src->grad() + offset;
@@ -164,11 +184,9 @@ Result run(Cell cell, TensorPtr input, TensorPtr h0, TensorPtr c0, int H,
             return lstm ? concat_op({seq, reshape(c, {(int64_t)B * H})}, 0) : seq;
         };
     if (input->device() == Device::CUDA || Wx[0]->device() == Device::CUDA) {
-        vector<TensorPtr> ins = {input};
-        if (h0) ins.push_back(h0);
-        if (cell == Cell::LSTM && c0) ins.push_back(c0);
-        for (auto* group : {&Wx, &Wh, &b}) for (auto& w : *group) ins.push_back(w);
-        auto packed = contiguous(reference(ins));
+        // fused kernels; the op form above serves recorded (higher-order) gradients
+        const int code = cell == Cell::RNN ? 0 : cell == Cell::LSTM ? 1 : 2;
+        auto packed = cuda_ops::rnn(code, input, h0, cell == Cell::LSTM ? c0 : nullptr, H, Wx, Wh, b, reference);
         Result r;
         r.output = slice_of(packed, 0, Shape{S, B, H});
         r.h_n    = slice_of(packed, (int64_t)(S - 1) * BH, Shape{B, H});

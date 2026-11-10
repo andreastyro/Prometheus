@@ -37,6 +37,8 @@
 #include <cstdlib>
 #include <random>
 #include <functional>
+#include <tuple>
+#include <type_traits>
 #include <string>
 #include <vector>
 
@@ -403,6 +405,51 @@ int main() {
         layer_check("RNN", [] { return std::make_shared<RNN>(5, 7); }, seq, 1e-5f);
         layer_check("LSTM", [] { return std::make_shared<LSTM>(5, 7); }, seq, 1e-5f);
         layer_check("GRU", [] { return std::make_shared<GRU>(5, 7); }, seq, 1e-5f);
+        {
+            // initial states in, final states out: every output and every
+            // input's gradient, including h0 and c0
+            auto h0 = random_tensor({3, 7}, 60), c0 = random_tensor({3, 7}, 61);
+            auto w1 = random_tensor({6, 3, 7}, 62), w2 = random_tensor({3, 7}, 63), w3 = random_tensor({3, 7}, 64);
+            auto states = [&](const char* what, auto make, bool lstm) {
+                double m = 0, s = 0;
+                std::vector<std::vector<double>> grads[2];
+                std::vector<TensorPtr> outs[2];
+                for (int dev = 0; dev < 2; dev++) {
+                    auto mv = [&](const TensorPtr& t) { return dev ? t->to(Device::CUDA) : t->detach(); };
+                    Tensor::manual_seed(5);
+                    auto layer = make();
+                    if (dev) layer->to(Device::CUDA);
+                    auto x = mv(seq), h = mv(h0), c = mv(c0);
+                    for (auto& t : {x, h, c}) t->set_requires_grad(true);
+                    TensorPtr out, hn, cn;
+                    if constexpr (std::is_same_v<decltype(layer), std::shared_ptr<LSTM>>)
+                        std::tie(out, hn, cn) = layer->forward(x, h, c);
+                    else
+                        std::tie(out, hn) = layer->forward(x, h);
+                    auto loss = add(sum(multiply(out, mv(w1)), -1), sum(multiply(hn, mv(w2)), -1));
+                    if (lstm) loss = add(loss, sum(multiply(cn, mv(w3)), -1));
+                    loss->backward();
+                    outs[dev] = {out, hn};
+                    if (lstm) outs[dev].push_back(cn);
+                    auto ps = layer->parameters();
+                    ps.push_back(x); ps.push_back(h);
+                    if (lstm) ps.push_back(c);
+                    for (auto& p : ps) grads[dev].push_back(p->grad_doubles());
+                }
+                float worst = 0.0f;
+                for (size_t i = 0; i < outs[0].size(); i++) worst = std::max(worst, rel(outs[1][i], outs[0][i]));
+                CHECK_NEAR((std::string(what) + ": outputs and final states").c_str(), worst, 0.0f, 1e-5f);
+                for (size_t i = 0; i < grads[0].size(); i++)
+                    for (size_t j = 0; j < grads[0][i].size(); j++) {
+                        m = std::max(m, std::fabs(grads[1][i][j] - grads[0][i][j]));
+                        s = std::max(s, std::fabs(grads[0][i][j]));
+                    }
+                CHECK_NEAR((std::string(what) + ": gradients incl. h0 / c0").c_str(), (float)(m / std::max(s, 1e-12)),
+                           0.0f, 1e-5f);
+            };
+            states("LSTM with states", [] { return std::make_shared<LSTM>(5, 7); }, true);
+            states("GRU with state", [] { return std::make_shared<GRU>(5, 7); }, false);
+        }
 
         // the losses written with raw loops on the CPU
         auto pa = random_tensor({4, 6}, 56), pb = random_tensor({4, 6}, 57), pn = random_tensor({4, 6}, 58);
