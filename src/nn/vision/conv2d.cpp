@@ -1,3 +1,4 @@
+#include <random>
 #include "../../ops_internal.hpp"
 #include "ml/nn/vision/conv2d.hpp"
 #include "ml/nn/vision/im2col.hpp"
@@ -36,6 +37,13 @@ Conv2D::Conv2D(int in_channels, int out_channels, int kernel_size, int stride, i
     } else if (weight_init == "kaiming"){
         float std = sqrt(2.0f / inputs_per_filter);
         for (auto& v : weights->values()) v *= std;
+    } else {
+        // as nn.Conv2d: U(+-1/sqrt(C*K*K)) for weights and bias. N(0, 1) made
+        // a three-layer CNN diverge to NaN within a few SGD steps
+        const float bound = 1.0f / sqrt((float)inputs_per_filter);
+        std::uniform_real_distribution<float> u(-bound, bound);
+        for (auto& v : weights->values()) v = u(prometheus_rng());
+        for (auto& v : bias->values()) v = u(prometheus_rng());
     }
 
     weights->set_requires_grad(true);

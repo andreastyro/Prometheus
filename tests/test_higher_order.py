@@ -324,10 +324,13 @@ def test_layers():
     gids = p.Tensor([2, 6], [float(v) for v in rng.integers(0, 20, 12)], p.int64)
     tg = [int(v) for v in rng.integers(0, 20, 12)]
     # the loss is scaled down because the harness takes its tanh: at a
-    # cross entropy of ~3 tanh saturates, and its curvature would be lost
+    # cross entropy of ~3 tanh saturates, and its curvature would be lost.
+    # The step is 1e-3: the embeddings start at N(0, 0.02), and the default
+    # 1e-2 moved them by half their own scale -- 12% "error" that fell to
+    # 0.3% at 3e-3 and 4e-5 at 1e-3, truncation and not a wrong HVP
     layer_check("GPT (whole model)",
                 lambda ts: p.multiply(0.1, p.reshape(p.cross_entropy_sparse_seq(gpt.forward(gids), tg), [1])),
-                gpt.parameters())
+                gpt.parameters(), eps=1e-3)
 
     # the losses that were missing one
     pr, tgt = X(3, 4), T(rng.uniform(-1, 1, (3, 4)), grad=False)

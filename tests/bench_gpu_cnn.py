@@ -26,10 +26,10 @@ if args.lib == "prometheus":
     import prometheus as p
     p.Tensor.manual_seed(0)
     model = p.Sequential([
-        p.Conv2D(3, 32, 3, 1, 1, "kaiming"), p.ReLU(), p.MaxPool2D(2),
-        p.Conv2D(32, 64, 3, 1, 1, "kaiming"), p.ReLU(), p.MaxPool2D(2),
-        p.Conv2D(64, 128, 3, 1, 1, "kaiming"), p.ReLU(), p.AvgPool2D(2),
-        p.Flatten(), p.Linear(128 * 4 * 4, 10, "kaiming")])
+        p.Conv2D(3, 32, 3, 1, 1), p.ReLU(), p.MaxPool2D(2),
+        p.Conv2D(32, 64, 3, 1, 1), p.ReLU(), p.MaxPool2D(2),
+        p.Conv2D(64, 128, 3, 1, 1), p.ReLU(), p.AvgPool2D(2),
+        p.Flatten(), p.Linear(128 * 4 * 4, 10)])
     if args.device == "cuda":
         model.cuda()
     opt = p.SGD(model.parameters(), 0.01, 0.9)

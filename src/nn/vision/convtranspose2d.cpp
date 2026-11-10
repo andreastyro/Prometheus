@@ -1,3 +1,4 @@
+#include <random>
 #include "../../ops_internal.hpp"
 #include "ml/nn/vision/convtranspose2d.hpp"
 #include "ml/nn/vision/im2col.hpp"
@@ -33,6 +34,13 @@ ConvTranspose2D::ConvTranspose2D(int in_channels, int out_channels, int kernel_s
     } else if (weight_init == "kaiming"){
         float std = sqrt(2.0f / fan_in);
         for (auto& v : weights->values()) v *= std;
+    } else {
+        // as nn.ConvTranspose2d, whose fan_in for a [Cin, Cout, K, K] weight
+        // is Cout*K*K
+        const float bound = 1.0f / sqrt((float)fan_out);
+        std::uniform_real_distribution<float> u(-bound, bound);
+        for (auto& v : weights->values()) v = u(prometheus_rng());
+        for (auto& v : bias->values()) v = u(prometheus_rng());
     }
 
     weights->set_requires_grad(true);

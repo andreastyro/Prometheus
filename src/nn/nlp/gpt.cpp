@@ -80,6 +80,13 @@ GPT::GPT(int vocab_size, int max_seq_len, int embed_dim,
     for (int i = 0; i < num_layers; i++)
         blocks.emplace_back(embed_dim, num_heads, ffn_dim, /*causal=*/true, rope);
 
+    // Token and position embeddings at N(0, 0.02), as GPT-2. Embedding's own
+    // default is N(0, 1) (as nn.Embedding), but the token table doubles as the
+    // output layer here, and at N(0, 1) the first logits had a spread of
+    // sqrt(embed_dim): a starting loss of ~45 on a 2048-token vocabulary.
+    for (float& v : tok_emb.weight->values()) v *= 0.02f;
+    for (float& v : pos_emb.weight->values()) v *= 0.02f;
+
     // Scale down weight init for residual paths (GPT-2 paper, §2.3):
     // W_o and ff2 weights divided by sqrt(2 * num_layers) so that at
     // initialisation the residual stream variance stays ≈1.

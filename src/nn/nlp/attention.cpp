@@ -1,3 +1,4 @@
+#include <random>
 #include "../../ops_internal.hpp"
 #include "ml/nn/nlp/attention.hpp"
 #include "ml/ops.hpp"
@@ -55,10 +56,23 @@ MultiHeadAttention::MultiHeadAttention(int embed_dim, int num_heads, bool causal
     if (embed_dim % num_heads != 0)
         throw runtime_error("MultiHeadAttention: embed_dim must be divisible by num_heads");
 
-    W_q = Tensor::randn({embed_dim, embed_dim}); W_q->set_requires_grad(true);
-    W_k = Tensor::randn({embed_dim, embed_dim}); W_k->set_requires_grad(true);
-    W_v = Tensor::randn({embed_dim, embed_dim}); W_v->set_requires_grad(true);
-    W_o = Tensor::randn({embed_dim, embed_dim}); W_o->set_requires_grad(true);
+    // As nn.MultiheadAttention: Q, K, V Xavier-uniform, the output projection
+    // a Linear's default. They were N(0, 1), which put the attention scores
+    // in the hundreds and the softmax at one-hot from the first step.
+    W_q = Tensor::zeros({embed_dim, embed_dim});
+    W_k = Tensor::zeros({embed_dim, embed_dim});
+    W_v = Tensor::zeros({embed_dim, embed_dim});
+    W_o = Tensor::zeros({embed_dim, embed_dim});
+    const float xavier = sqrtf(6.0f / (2.0f * (float)embed_dim)), lin = 1.0f / sqrtf((float)embed_dim);
+    for (auto* w : {&W_q, &W_k, &W_v}) {
+        std::uniform_real_distribution<float> u(-xavier, xavier);
+        for (auto& v : (*w)->values()) v = u(prometheus_rng());
+    }
+    {
+        std::uniform_real_distribution<float> u(-lin, lin);
+        for (auto& v : W_o->values()) v = u(prometheus_rng());
+    }
+    for (auto* w : {&W_q, &W_k, &W_v, &W_o}) (*w)->set_requires_grad(true);
 }
 
 // Fused multi-head attention forward + backward.

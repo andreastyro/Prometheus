@@ -103,6 +103,12 @@ python examples/gpt_shakespeare.py path/to/text.txt  # your own corpus
 | **Recurrent** | `RNN`, `LSTM`, `GRU` (all with `forward_with_state`) |
 | **NLP** | `Embedding`, `LayerNorm`, `PositionalEncoding`, `MultiHeadAttention` (causal + RoPE), `TransformerBlock`, `GPT` |
 
+Initialisation matches PyTorch's defaults: `Linear`, `Conv2D` and
+`ConvTranspose2D` draw weights and biases from U(±1/√fan_in), attention uses
+Xavier-uniform for Q/K/V, embeddings N(0, 1) and the `GPT`'s embeddings
+N(0, 0.02) as GPT-2. `"xavier"` and `"kaiming"` are available as the last
+argument of `Linear` and the convolutions.
+
 ### Losses
 
 `mse_loss` · `mae_loss` · `huber_loss` · `bce_loss` · `cross_entropy_loss` ·

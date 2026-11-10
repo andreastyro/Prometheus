@@ -1,8 +1,17 @@
 #include "ml/nn/linear.hpp"
 #include "ml/ops.hpp"
 #include <cmath>
+#include <random>
 
 using namespace std;
+
+// Every value drawn from U(-bound, bound): PyTorch's default for Linear and
+// the convolutions (kaiming_uniform with a = sqrt(5) works out to
+// bound = 1/sqrt(fan_in), and the bias uses the same bound).
+static void fill_uniform(const TensorPtr& t, float bound) {
+    std::uniform_real_distribution<float> u(-bound, bound);
+    for (auto& v : t->values()) v = u(prometheus_rng());
+}
 
 Linear::Linear(int in_features, int out_features, string init) {
     weights = Tensor::randn({in_features, out_features});
@@ -16,6 +25,13 @@ Linear::Linear(int in_features, int out_features, string init) {
     }
 
     bias = Tensor::zeros({out_features});
+    if (init == "default") {
+        // as nn.Linear. This used to leave the weights at N(0, 1), which no
+        // network of any depth trains from: activations grow by sqrt(in) a layer
+        const float bound = 1.0f / sqrt((float)in_features);
+        fill_uniform(weights, bound);
+        fill_uniform(bias, bound);
+    }
     weights->set_requires_grad(true);
     bias->set_requires_grad(true);
 }
