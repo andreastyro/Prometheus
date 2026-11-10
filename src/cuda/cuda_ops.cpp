@@ -1906,4 +1906,226 @@ TensorPtr avgpool2d(const TensorPtr& x0, int K, int stride, Reference reference)
     return y;
 }
 
+// ── BatchNorm and GroupNorm on the device ────────────────────────────────────
+//
+// BatchNorm: per channel, one block reduces the N*S values (mean, then the
+// variance about it) and updates the running estimate in device memory, so a
+// training step never waits to read statistics back; a second kernel applies
+// the normalisation. The backward is the same shape: one block per channel
+// for sum(dy) and sum(dy * xhat), then an element-wise kernel for dx.
+// GroupNorm: an (image, group) is one contiguous run of group_size * S values,
+// so it is a LayerNorm over that run with a per-channel affine.
+
+static const string& NORM_SRC() {
+    static const string s = src(R"(
+__device__ float block_sum(float v, float* sh) {
+    sh[threadIdx.x] = v;
+    __syncthreads();
+    for (int w = blockDim.x / 2; w > 0; w >>= 1) { if (threadIdx.x < w) sh[threadIdx.x] += sh[threadIdx.x + w]; __syncthreads(); }
+    const float r = sh[0];
+    __syncthreads();
+    return r;
+}
+// one block per channel of x viewed as [N, C, S]: mean and 1/std, and the running estimate
+extern "C" __global__ void n_bn_stats(const float* x, float* mean, float* inv, float* rm, float* rv,
+                                      long long N, long long C, long long S, float eps, float momentum, int update) {
+    __shared__ float sh[256];
+    const long long c = blockIdx.x, count = N * S;
+    float t = 0.0f;
+    for (long long i = threadIdx.x; i < count; i += blockDim.x) t += x[((i / S) * C + c) * S + i % S];
+    const float m = block_sum(t, sh) / (float)count;
+    t = 0.0f;
+    for (long long i = threadIdx.x; i < count; i += blockDim.x) { float d = x[((i / S) * C + c) * S + i % S] - m; t += d * d; }
+    const float var = block_sum(t, sh) / (float)count;
+    if (threadIdx.x == 0) {
+        mean[c] = m;
+        inv[c] = rsqrtf(var + eps);
+        if (update) {
+            const float unbiased = count > 1 ? var * (float)count / (float)(count - 1) : var;
+            rm[c] = (1.0f - momentum) * rm[c] + momentum * m;
+            rv[c] = (1.0f - momentum) * rv[c] + momentum * unbiased;
+        }
+    }
+}
+// eval: the statistics are the running estimate
+extern "C" __global__ void n_bn_running(const float* rm, const float* rv, float* mean, float* inv, long long C, float eps) {
+    long long c = gid(); if (c >= C) return;
+    mean[c] = rm[c];
+    inv[c] = rsqrtf(rv[c] + eps);
+}
+extern "C" __global__ void n_affine(const float* x, const float* mean, const float* inv, const float* g, const float* b,
+                                    float* y, long long C, long long S, long long n) {
+    long long i = gid(); if (i >= n) return;
+    const long long c = (i / S) % C;
+    y[i] = (x[i] - mean[c]) * inv[c] * g[c] + b[c];
+}
+// backward sums per channel: sum(dy), sum(dy * xhat) -> also beta's and gamma's gradients
+extern "C" __global__ void n_bn_back_sums(const float* x, const float* dy, const float* mean, const float* inv,
+                                          float* sdy, float* sdyx, long long N, long long C, long long S) {
+    __shared__ float sh[256];
+    const long long c = blockIdx.x, count = N * S;
+    float a = 0.0f, b = 0.0f;
+    for (long long i = threadIdx.x; i < count; i += blockDim.x) {
+        const long long j = ((i / S) * C + c) * S + i % S;
+        a += dy[j];
+        b += dy[j] * (x[j] - mean[c]) * inv[c];
+    }
+    a = block_sum(a, sh);
+    b = block_sum(b, sh);
+    if (threadIdx.x == 0) { sdy[c] = a; sdyx[c] = b; }
+}
+// dx = inv * g * (dy - mean(dy) - xhat * mean(dy * xhat)) in training; inv * g * dy in eval
+extern "C" __global__ void n_bn_back_dx(const float* x, const float* dy, const float* mean, const float* inv,
+                                        const float* g, const float* sdy, const float* sdyx, float* dx,
+                                        long long C, long long S, long long count, long long n, int training) {
+    long long i = gid(); if (i >= n) return;
+    const long long c = (i / S) % C;
+    const float k = inv[c] * g[c];
+    if (!training) { dx[i] = k * dy[i]; return; }
+    const float xh = (x[i] - mean[c]) * inv[c];
+    dx[i] = k * (dy[i] - sdy[c] / (float)count - xh * sdyx[c] / (float)count);
+}
+// GroupNorm forward: one block per (image, group), a contiguous run of L = gs * S values
+extern "C" __global__ void n_gn_forward(const float* x, const float* g, const float* b, float* y, float* mean, float* inv,
+                                        long long gs, long long S, long long C, float eps) {
+    __shared__ float sh[256];
+    const long long L = gs * S, off = (long long)blockIdx.x * L;
+    const long long c0 = (blockIdx.x * gs) % C;
+    float t = 0.0f;
+    for (long long j = threadIdx.x; j < L; j += blockDim.x) t += x[off + j];
+    const float m = block_sum(t, sh) / (float)L;
+    t = 0.0f;
+    for (long long j = threadIdx.x; j < L; j += blockDim.x) { float d = x[off + j] - m; t += d * d; }
+    const float iv = rsqrtf(block_sum(t, sh) / (float)L + eps);
+    for (long long j = threadIdx.x; j < L; j += blockDim.x) {
+        const long long c = c0 + j / S;
+        y[off + j] = (x[off + j] - m) * iv * g[c] + b[c];
+    }
+    if (threadIdx.x == 0) { mean[blockIdx.x] = m; inv[blockIdx.x] = iv; }
+}
+// GroupNorm backward dx: per (image, group), dx = inv * (g*dy - mean(g*dy) - xhat * mean(g*dy*xhat))
+extern "C" __global__ void n_gn_back(const float* x, const float* g, const float* dy, const float* mean, const float* inv,
+                                     float* dx, long long gs, long long S, long long C) {
+    __shared__ float sh[256];
+    const long long L = gs * S, off = (long long)blockIdx.x * L;
+    const long long c0 = (blockIdx.x * gs) % C;
+    const float m = mean[blockIdx.x], iv = inv[blockIdx.x];
+    float a = 0.0f, b = 0.0f;
+    for (long long j = threadIdx.x; j < L; j += blockDim.x) {
+        const float gd = g[c0 + j / S] * dy[off + j];
+        a += gd;
+        b += gd * (x[off + j] - m) * iv;
+    }
+    a = block_sum(a, sh) / (float)L;
+    b = block_sum(b, sh) / (float)L;
+    for (long long j = threadIdx.x; j < L; j += blockDim.x) {
+        const float xh = (x[off + j] - m) * iv;
+        dx[off + j] = iv * (g[c0 + j / S] * dy[off + j] - a - xh * b);
+    }
+}
+// GroupNorm gamma / beta: a thread per (image, channel), summed over S, added atomically
+extern "C" __global__ void n_gn_back_affine(const float* x, const float* dy, const float* mean, const float* inv,
+                                            float* dg, float* db, long long B, long long C, long long gs, long long S) {
+    long long i = gid(); if (i >= B * C) return;
+    const long long c = i % C, bimg = i / C, grp = bimg * (C / gs) + c / gs;
+    const float m = mean[grp], iv = inv[grp];
+    const float* xr = x + i * S;
+    const float* dr = dy + i * S;
+    float ag = 0.0f, ab = 0.0f;
+    for (long long s = 0; s < S; s++) { ag += dr[s] * (xr[s] - m) * iv; ab += dr[s]; }
+    atomicAdd(&dg[c], ag);
+    atomicAdd(&db[c], ab);
+}
+)");
+    return s;
+}
+
+static cuda::Kernel NK(const char* name) { return K(name, NORM_SRC()); }
+
+TensorPtr batchnorm(const TensorPtr& x0, const TensorPtr& g0, const TensorPtr& b0, const TensorPtr& rm,
+                    const TensorPtr& rv, bool training, float momentum, float eps, Reference reference) {
+    auto x = contiguous_on_device(f32(x0, "BatchNorm"));
+    auto g = contiguous_on_device(f32(g0, "BatchNorm")), b = contiguous_on_device(f32(b0, "BatchNorm"));
+    long long N = x->size(0), C = x->size(1), S = x->numel() / max<long long>(N * C, 1), n = x->numel();
+    auto mean = empty_cuda({C}), inv = empty_cuda({C}), y = empty_cuda(x->shape());
+    const void* px = base(x);
+    void* pm = mean->storage()->data();
+    void* pi = inv->storage()->data();
+    void* prm = rm->storage()->data();
+    void* prv = rv->storage()->data();
+    if (training) {
+        int upd = 1;
+        float mo = momentum, ep = eps;
+        void* a[] = {&px, &pm, &pi, &prm, &prv, &N, &C, &S, &ep, &mo, &upd};
+        cuda::launch(NK("n_bn_stats"), (unsigned)C, 1, 1, 256, 1, 1, 0, a);
+    } else {
+        float ep = eps;
+        void* a[] = {&prm, &prv, &pm, &pi, &C, &ep};
+        cuda::launch(NK("n_bn_running"), C, a);
+    }
+    const void* pg = base(g);
+    const void* pb = base(b);
+    void* py = y->storage()->data();
+    void* a2[] = {&px, &pm, &pi, &pg, &pb, &py, &C, &S, &n};
+    cuda::launch(NK("n_affine"), n, a2);
+    attach_fused(y, {x0, g0, b0}, "BatchNorm", reference, [=](const TensorPtr& G0) -> vector<TensorPtr> {
+        auto G = contiguous_on_device(f32(G0, "BatchNorm"));
+        auto sdy = empty_cuda({C}), sdyx = empty_cuda({C}), dx = empty_cuda(x->shape());
+        const void* px2 = base(x);
+        const void* pg2 = base(G);
+        const void* pm2 = base(mean);
+        const void* pi2 = base(inv);
+        void* ps1 = sdy->storage()->data();
+        void* ps2 = sdyx->storage()->data();
+        long long NN = N, CC = C, SS = S, nn = n, count = N * S;
+        void* a3[] = {&px2, &pg2, &pm2, &pi2, &ps1, &ps2, &NN, &CC, &SS};
+        cuda::launch(NK("n_bn_back_sums"), (unsigned)C, 1, 1, 256, 1, 1, 0, a3);
+        const void* pgam = base(g);
+        void* pdx = dx->storage()->data();
+        int tr = training ? 1 : 0;
+        void* a4[] = {&px2, &pg2, &pm2, &pi2, &pgam, &ps1, &ps2, &pdx, &CC, &SS, &count, &nn, &tr};
+        cuda::launch(NK("n_bn_back_dx"), nn, a4);
+        return {dx, sdyx, sdy};          // gamma's gradient is sum(dy*xhat), beta's sum(dy)
+    });
+    return y;
+}
+
+TensorPtr groupnorm(const TensorPtr& x0, const TensorPtr& g0, const TensorPtr& b0, int groups, float eps,
+                    Reference reference) {
+    auto x = contiguous_on_device(f32(x0, "GroupNorm"));
+    auto g = contiguous_on_device(f32(g0, "GroupNorm")), b = contiguous_on_device(f32(b0, "GroupNorm"));
+    long long B = x->size(0), C = x->size(1), S = x->numel() / max<long long>(B * C, 1), gs = C / groups;
+    const long long blocks = B * groups;
+    auto y = empty_cuda(x->shape()), mean = empty_cuda({blocks}), inv = empty_cuda({blocks});
+    const void* px = base(x);
+    const void* pg = base(g);
+    const void* pb = base(b);
+    void* py = y->storage()->data();
+    void* pm = mean->storage()->data();
+    void* pi = inv->storage()->data();
+    float ep = eps;
+    void* a[] = {&px, &pg, &pb, &py, &pm, &pi, &gs, &S, &C, &ep};
+    if (blocks) cuda::launch(NK("n_gn_forward"), (unsigned)blocks, 1, 1, 256, 1, 1, 0, a);
+    attach_fused(y, {x0, g0, b0}, "GroupNorm", reference, [=](const TensorPtr& G0) -> vector<TensorPtr> {
+        auto G = contiguous_on_device(f32(G0, "GroupNorm"));
+        auto dx = empty_cuda(x->shape());
+        auto dg = make_shared<Tensor>(Shape{C}, F32, Device::CUDA), db = make_shared<Tensor>(Shape{C}, F32, Device::CUDA);
+        const void* px2 = base(x);
+        const void* pg2 = base(g);
+        const void* pd = base(G);
+        const void* pm2 = base(mean);
+        const void* pi2 = base(inv);
+        void* pdx = dx->storage()->data();
+        long long gss = gs, SS = S, CC = C, BB = B;
+        void* a1[] = {&px2, &pg2, &pd, &pm2, &pi2, &pdx, &gss, &SS, &CC};
+        if (blocks) cuda::launch(NK("n_gn_back"), (unsigned)blocks, 1, 1, 256, 1, 1, 0, a1);
+        void* pdg = dg->storage()->data();
+        void* pdb = db->storage()->data();
+        void* a2[] = {&px2, &pd, &pm2, &pi2, &pdg, &pdb, &BB, &CC, &gss, &SS};
+        cuda::launch(NK("n_gn_back_affine"), B * C, a2);
+        return {dx, dg, db};
+    });
+    return y;
+}
+
 } // namespace cuda_ops

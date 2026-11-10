@@ -37,6 +37,13 @@ public:
     std::vector<float> running_mean; ///< [num_features], starts at 0
     std::vector<float> running_var;  ///< [num_features], starts at 1
 
+    /// On the GPU the running estimate lives on the device and is updated
+    /// there, so a training step never waits to read it back. Call this (or
+    /// move the module to the CPU) before reading the two vectors in C++;
+    /// Python's bn.running_mean / running_var do it for you.
+    void sync_running_stats();
+    void to(Device device) override;
+
     BatchNorm(int num_features, float eps = 1e-5f, bool training = true,
               float momentum = 0.1f);
 
@@ -47,4 +54,7 @@ public:
 
     TensorPtr forward(TensorPtr input) override;
     std::vector<TensorPtr> parameters() override; // returns {gamma, beta}
+
+private:
+    TensorPtr running_mean_dev_, running_var_dev_;   // the device copies, while on the GPU
 };

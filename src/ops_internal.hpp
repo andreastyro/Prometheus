@@ -154,6 +154,12 @@ TensorPtr conv2d(const TensorPtr& x, const TensorPtr& w, const TensorPtr& b, int
 TensorPtr conv_transpose2d(const TensorPtr& x, const TensorPtr& w, const TensorPtr& b, int stride, int pad,
                            std::function<TensorPtr(const std::vector<TensorPtr>&)> reference);
 TensorPtr maxpool2d(const TensorPtr& x, int kernel, int stride);
+/// BatchNorm on the device; rm / rv are the running estimate as device tensors, updated in place
+TensorPtr batchnorm(const TensorPtr& x, const TensorPtr& gamma, const TensorPtr& beta, const TensorPtr& rm,
+                    const TensorPtr& rv, bool training, float momentum, float eps,
+                    std::function<TensorPtr(const std::vector<TensorPtr>&)> reference);
+TensorPtr groupnorm(const TensorPtr& x, const TensorPtr& gamma, const TensorPtr& beta, int groups, float eps,
+                    std::function<TensorPtr(const std::vector<TensorPtr>&)> reference);
 TensorPtr avgpool2d(const TensorPtr& x, int kernel, int stride,
                     std::function<TensorPtr(const std::vector<TensorPtr>&)> reference);
 }

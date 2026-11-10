@@ -1,3 +1,4 @@
+#include "../ops_internal.hpp"
 #include "ml/nn/groupnorm.hpp"
 #include "ml/ops.hpp"
 #include "ml/tensor.hpp"
@@ -70,7 +71,7 @@ TensorPtr GroupNorm::forward(TensorPtr input) {
             return reshape(out, in[0]->shape());
         };
     if (input->device() == Device::CUDA || gamma->device() == Device::CUDA)
-        return reference({input, gamma, beta});
+        return cuda_ops::groupnorm(input, gamma, beta, (int)groups, eps, reference);
 
     auto output = Tensor::empty(input->shape());
     const float* X  = input->data();

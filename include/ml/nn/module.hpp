@@ -30,7 +30,7 @@ public:
 
     /// Move every parameter to `device` in place (model.to(cuda)). Optimizers
     /// built before or after see the same tensors.
-    void to(Device device) {
+    virtual void to(Device device) {
         for (auto& p : parameters()) p->move_to_(device);
     }
 

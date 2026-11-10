@@ -623,8 +623,8 @@ PYBIND11_MODULE(_C, m) {
         .def("train",      &BatchNorm::train)
         .def_readwrite("training",     &BatchNorm::training)
         .def_readwrite("momentum",     &BatchNorm::momentum)
-        .def_readonly("running_mean",  &BatchNorm::running_mean)
-        .def_readonly("running_var",   &BatchNorm::running_var);
+        .def_property_readonly("running_mean", [](BatchNorm& b) { b.sync_running_stats(); return b.running_mean; })
+        .def_property_readonly("running_var",  [](BatchNorm& b) { b.sync_running_stats(); return b.running_var; });
 
     py::class_<MultiHeadAttention, Module, std::shared_ptr<MultiHeadAttention>>(m, "MultiHeadAttention")
         .def(py::init<int, int, bool, bool>(),

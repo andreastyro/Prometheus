@@ -359,6 +359,22 @@ int main() {
             xb->set_requires_grad(true);
             CHECK_NEAR("second derivative through Conv2D, MaxPool, AvgPool", rel(net(xb, cg, mp, ap), net(xa, cc, mp, ap)), 0.0f, 1e-4f);
         }
+        {
+            // and through BatchNorm and GroupNorm: their op form with create_graph
+            auto net = [](const TensorPtr& x, BatchNorm& bn, GroupNorm& gn) {
+                auto y = sum(tanh_op(gn.forward(bn.forward(x))), -1);
+                auto g = autograd::grad(y, {x}, true)[0];
+                return autograd::grad(sum(multiply(g, g), -1), {x})[0];
+            };
+            BatchNorm bc(4), bg(4);
+            GroupNorm gc(2, 4), gg(2, 4);
+            bg.to(Device::CUDA);
+            gg.to(Device::CUDA);
+            auto xa = random_tensor({3, 4, 5, 5}, 63), xb = G(xa);
+            xa->set_requires_grad(true);
+            xb->set_requires_grad(true);
+            CHECK_NEAR("second derivative through BatchNorm, GroupNorm", rel(net(xb, bg, gg), net(xa, bc, gc)), 0.0f, 1e-4f);
+        }
         layer_check("GroupNorm 3 groups", [] { return std::make_shared<GroupNorm>(3, 6); }, random_tensor({2, 6, 4, 4}, 54), 1e-5f);
         layer_check("Flatten", [] { return std::make_shared<Flatten>(); }, img, 0.0f);
         {
@@ -369,6 +385,7 @@ int main() {
                 (keep_c ? keep_g : keep_c) = b;
                 return b;
             }, img, 1e-5f);
+            keep_g->sync_running_stats();
             float m = 0;
             for (int c = 0; c < 3; c++)
                 m = std::max(m, std::max(std::fabs(keep_g->running_mean[c] - keep_c->running_mean[c]),
