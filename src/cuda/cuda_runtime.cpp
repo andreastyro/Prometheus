@@ -9,6 +9,7 @@
 #include <map>
 #include <mutex>
 #include <stdexcept>
+#include <tuple>
 #include <unordered_map>
 
 #ifdef _WIN32
@@ -628,6 +629,239 @@ void gemm_half(bool ta, bool tb, int m, int n, int k, DType dtype, const void* a
     const float alpha = 1.0f, beta = 0.0f;
     check_blas(g_blas.gemm_ex(h, tb ? 1 : 0, ta ? 1 : 0, n, m, k, &alpha, b, type, ldb, sb, a, type, lda, sa,
                               &beta, c, 0, ldc, sc, batch, 68, -1), "GemmEx");
+}
+
+// ── cuDNN ────────────────────────────────────────────────────────────────────
+//
+// Only the legacy convolution API is used (still present in cuDNN 9): tensor,
+// filter and convolution descriptors, the _v7 heuristics to pick an algorithm,
+// and the three convolution calls. Each distinct shape gets a plan -- its
+// descriptors, chosen algorithms and workspace sizes -- made once and kept.
+
+namespace {
+using dnnHandle = void*;
+using dnnDesc = void*;
+// cudnnConvolution{Fwd,BwdData,BwdFilter}AlgoPerf_t share this layout
+struct DnnPerf {
+    int algo;
+    int status;
+    float time;
+    size_t memory;
+    int determinism;
+    int math_type;
+    int reserved[3];
+};
+struct Dnn {
+    size_t (*get_version)();
+    const char* (*error_string)(int);
+    int (*create)(dnnHandle*);
+    int (*set_stream)(dnnHandle, void*);
+    int (*create_tensor)(dnnDesc*);
+    int (*set_tensor4d)(dnnDesc, int, int, int, int, int, int);
+    int (*create_filter)(dnnDesc*);
+    int (*set_filter4d)(dnnDesc, int, int, int, int, int, int);
+    int (*create_conv)(dnnDesc*);
+    int (*set_conv2d)(dnnDesc, int, int, int, int, int, int, int, int);
+    int (*fwd_algo)(dnnHandle, dnnDesc, dnnDesc, dnnDesc, dnnDesc, int, int*, DnnPerf*);
+    int (*fwd_ws)(dnnHandle, dnnDesc, dnnDesc, dnnDesc, dnnDesc, int, size_t*);
+    int (*fwd)(dnnHandle, const void*, dnnDesc, const void*, dnnDesc, const void*, dnnDesc, int, void*, size_t,
+               const void*, dnnDesc, void*);
+    int (*bwd_data_algo)(dnnHandle, dnnDesc, dnnDesc, dnnDesc, dnnDesc, int, int*, DnnPerf*);
+    int (*bwd_data_ws)(dnnHandle, dnnDesc, dnnDesc, dnnDesc, dnnDesc, int, size_t*);
+    int (*bwd_data)(dnnHandle, const void*, dnnDesc, const void*, dnnDesc, const void*, dnnDesc, int, void*, size_t,
+                    const void*, dnnDesc, void*);
+    int (*bwd_filter_algo)(dnnHandle, dnnDesc, dnnDesc, dnnDesc, dnnDesc, int, int*, DnnPerf*);
+    int (*bwd_filter_ws)(dnnHandle, dnnDesc, dnnDesc, dnnDesc, dnnDesc, int, size_t*);
+    int (*bwd_filter)(dnnHandle, const void*, dnnDesc, const void*, dnnDesc, const void*, dnnDesc, int, void*, size_t,
+                      const void*, dnnDesc, void*);
+};
+Dnn       g_dnn{};
+dnnHandle g_dnn_handle = nullptr;
+bool      g_dnn_tried = false, g_dnn_ok = false;
+string    g_dnn_why;
+size_t    g_dnn_version = 0;
+
+struct DnnPlan {
+    dnnDesc x, w, y, conv;
+    int fwd_algo, data_algo, filter_algo;
+    size_t fwd_ws, data_ws, filter_ws;
+};
+map<std::tuple<int, int, int, int, int, int, int, int>, DnnPlan> g_dnn_plans;
+mutex g_dnn_mu;
+
+// 91002 -> "9.10.2"
+string dnn_version_string() {
+    return to_string(g_dnn_version / 10000) + "." + to_string(g_dnn_version / 100 % 100) + "." +
+           to_string(g_dnn_version % 100);
+}
+
+// a 3x3 convolution of a 4x4 image, on raw device memory (the caching
+// allocator would take g_mu, which the caller holds); true if it ran
+bool dnn_probe() {
+    const Dnn& d = g_dnn;
+    dnnDesc x = nullptr, w = nullptr, y = nullptr, conv = nullptr;
+    CUdeviceptr px = 0, pw = 0, py = 0, pws = 0;
+    bool ok = d.create_tensor(&x) == 0 && d.set_tensor4d(x, 0, 0, 1, 1, 4, 4) == 0 &&
+              d.create_tensor(&y) == 0 && d.set_tensor4d(y, 0, 0, 1, 1, 2, 2) == 0 &&
+              d.create_filter(&w) == 0 && d.set_filter4d(w, 0, 0, 1, 1, 3, 3) == 0 &&
+              d.create_conv(&conv) == 0 && d.set_conv2d(conv, 0, 0, 1, 1, 1, 1, 1, 0) == 0;
+    DnnPerf perf[16];
+    int n = 0, algo = 0;
+    size_t ws = 0;
+    ok = ok && d.fwd_algo(g_dnn_handle, x, w, conv, y, 16, &n, perf) == 0 && n > 0;
+    if (ok) algo = perf[0].algo;
+    ok = ok && d.fwd_ws(g_dnn_handle, x, w, conv, y, algo, &ws) == 0;
+    ok = ok && g.d.cuMemAlloc(&px, 64) == 0 && g.d.cuMemAlloc(&pw, 64) == 0 && g.d.cuMemAlloc(&py, 64) == 0 &&
+         (ws == 0 || g.d.cuMemAlloc(&pws, ws) == 0);
+    const float one = 1.0f, zero = 0.0f;
+    ok = ok && d.fwd(g_dnn_handle, &one, x, (void*)px, w, (void*)pw, conv, algo, (void*)pws, ws, &zero, y,
+                     (void*)py) == 0;
+    ok = ok && g.d.cuStreamSynchronize(g.stream) == 0;
+    for (CUdeviceptr p : {px, pw, py, pws}) if (p) g.d.cuMemFree(p);
+    return ok;  // descriptors are a few bytes; not worth destroy entry points
+}
+
+void init_dnn_locked() {
+    if (g_dnn_tried) return;
+    g_dnn_tried = true;
+    init_locked();
+    if (!g.ok) { g_dnn_why = g.why; return; }
+    if (const char* off = getenv("PROMETHEUS_CUDNN"))
+        if (string(off) == "0") { g_dnn_why = "turned off by PROMETHEUS_CUDNN=0"; return; }
+#ifdef _WIN32
+    void* lib = open_first({"cudnn64_9.dll", "cudnn64_8.dll"});
+#else
+    void* lib = open_first({"libcudnn.so.9", "libcudnn.so.8", "libcudnn.so"});
+#endif
+    if (!lib) { g_dnn_why = "not installed (pip install nvidia-cudnn-cu12 for faster convolutions)"; return; }
+    Dnn& d = g_dnn;
+    const bool all =
+        bind(lib, d.get_version, "cudnnGetVersion") && bind(lib, d.error_string, "cudnnGetErrorString") &&
+        bind(lib, d.create, "cudnnCreate") && bind(lib, d.set_stream, "cudnnSetStream") &&
+        bind(lib, d.create_tensor, "cudnnCreateTensorDescriptor") && bind(lib, d.set_tensor4d, "cudnnSetTensor4dDescriptor") &&
+        bind(lib, d.create_filter, "cudnnCreateFilterDescriptor") && bind(lib, d.set_filter4d, "cudnnSetFilter4dDescriptor") &&
+        bind(lib, d.create_conv, "cudnnCreateConvolutionDescriptor") &&
+        bind(lib, d.set_conv2d, "cudnnSetConvolution2dDescriptor") &&
+        bind(lib, d.fwd_algo, "cudnnGetConvolutionForwardAlgorithm_v7") &&
+        bind(lib, d.fwd_ws, "cudnnGetConvolutionForwardWorkspaceSize") && bind(lib, d.fwd, "cudnnConvolutionForward") &&
+        bind(lib, d.bwd_data_algo, "cudnnGetConvolutionBackwardDataAlgorithm_v7") &&
+        bind(lib, d.bwd_data_ws, "cudnnGetConvolutionBackwardDataWorkspaceSize") &&
+        bind(lib, d.bwd_data, "cudnnConvolutionBackwardData") &&
+        bind(lib, d.bwd_filter_algo, "cudnnGetConvolutionBackwardFilterAlgorithm_v7") &&
+        bind(lib, d.bwd_filter_ws, "cudnnGetConvolutionBackwardFilterWorkspaceSize") &&
+        bind(lib, d.bwd_filter, "cudnnConvolutionBackwardFilter");
+    if (!all) { g_dnn_why = "cuDNN is missing a convolution entry point"; return; }
+    g_dnn_version = d.get_version();
+    if (g.d.cuCtxSetCurrent(g.ctx) != 0 || d.create(&g_dnn_handle) != 0 || d.set_stream(g_dnn_handle, g.stream) != 0) {
+        g_dnn_why = "cudnnCreate failed (this cuDNN may not support compute " + to_string(g.cc / 10) + "." +
+                    to_string(g.cc % 10) + ")";
+        return;
+    }
+    // Newer cuDNN releases load and plan on older GPUs and then fail at the
+    // first kernel (9.28 on a GTX 970: EXECUTION_FAILED_CUDART), so one tiny
+    // convolution is run now and the built-in kernels are kept if it fails.
+    if (!dnn_probe()) {
+        g_dnn_why = "cuDNN " + dnn_version_string() + " cannot run on compute " + to_string(g.cc / 10) + "." +
+                    to_string(g.cc % 10) + " (cuDNN 9.10, as bundled with PyTorch, can)";
+        return;
+    }
+    g_dnn_ok = true;
+}
+
+void check_dnn(int status, const char* what) {
+    if (status != 0)
+        throw runtime_error(string("cuDNN ") + what + " failed: " +
+                            (g_dnn.error_string ? g_dnn.error_string(status) : to_string(status)));
+}
+
+// the plan for a shape: descriptors, the heuristic's first working algorithm
+// for each direction, and their workspace sizes
+DnnPlan& dnn_plan(const ConvShape& s) {
+    lock_guard<mutex> lock(g_dnn_mu);
+    auto key = std::make_tuple(s.B, s.C, s.H, s.W, s.F, s.K, s.stride, s.pad);
+    auto it = g_dnn_plans.find(key);
+    if (it != g_dnn_plans.end()) return it->second;
+    const Dnn& d = g_dnn;
+    const int Ho = (s.H + 2 * s.pad - s.K) / s.stride + 1, Wo = (s.W + 2 * s.pad - s.K) / s.stride + 1;
+    DnnPlan p{};
+    // NCHW = 0, float = 0, cross-correlation = 1
+    check_dnn(d.create_tensor(&p.x), "tensor descriptor");
+    check_dnn(d.set_tensor4d(p.x, 0, 0, s.B, s.C, s.H, s.W), "tensor descriptor");
+    check_dnn(d.create_tensor(&p.y), "tensor descriptor");
+    check_dnn(d.set_tensor4d(p.y, 0, 0, s.B, s.F, Ho, Wo), "tensor descriptor");
+    check_dnn(d.create_filter(&p.w), "filter descriptor");
+    check_dnn(d.set_filter4d(p.w, 0, 0, s.F, s.C, s.K, s.K), "filter descriptor");
+    check_dnn(d.create_conv(&p.conv), "convolution descriptor");
+    check_dnn(d.set_conv2d(p.conv, s.pad, s.pad, s.stride, s.stride, 1, 1, 1, 0), "convolution descriptor");
+    auto pick = [](const DnnPerf* perf, int n) {
+        for (int i = 0; i < n; i++) if (perf[i].status == 0) return perf[i].algo;
+        return perf[0].algo;
+    };
+    DnnPerf perf[16];
+    int n = 0;
+    check_dnn(d.fwd_algo(g_dnn_handle, p.x, p.w, p.conv, p.y, 16, &n, perf), "forward algorithm");
+    p.fwd_algo = pick(perf, n);
+    check_dnn(d.fwd_ws(g_dnn_handle, p.x, p.w, p.conv, p.y, p.fwd_algo, &p.fwd_ws), "forward workspace");
+    check_dnn(d.bwd_data_algo(g_dnn_handle, p.w, p.y, p.conv, p.x, 16, &n, perf), "backward-data algorithm");
+    p.data_algo = pick(perf, n);
+    check_dnn(d.bwd_data_ws(g_dnn_handle, p.w, p.y, p.conv, p.x, p.data_algo, &p.data_ws), "backward-data workspace");
+    check_dnn(d.bwd_filter_algo(g_dnn_handle, p.x, p.y, p.conv, p.w, 16, &n, perf), "backward-filter algorithm");
+    p.filter_algo = pick(perf, n);
+    check_dnn(d.bwd_filter_ws(g_dnn_handle, p.x, p.y, p.conv, p.w, p.filter_algo, &p.filter_ws),
+              "backward-filter workspace");
+    return g_dnn_plans.emplace(key, p).first->second;
+}
+
+// a workspace from the caching allocator for the length of one call: the
+// stream orders the reuse, so it can go straight back
+struct Workspace {
+    void* p = nullptr;
+    size_t n = 0;
+    explicit Workspace(size_t bytes) : n(bytes) { if (n) p = alloc(n); }
+    ~Workspace() { if (p) cuda::free(p, n); }
+};
+} // namespace
+
+bool dnn_available() {
+    if (!available()) return false;
+    lock_guard<mutex> lock(g_mu);
+    init_dnn_locked();
+    return g_dnn_ok;
+}
+
+string dnn_status() {
+    if (!available()) return "unavailable: " + state().why;
+    lock_guard<mutex> lock(g_mu);
+    init_dnn_locked();
+    if (!g_dnn_ok) return "not used: " + g_dnn_why;
+    return "cuDNN " + dnn_version_string();
+}
+
+void dnn_conv_forward(const ConvShape& s, const float* x, const float* w, float* y) {
+    bind_context();
+    DnnPlan& p = dnn_plan(s);
+    Workspace ws(p.fwd_ws);
+    const float one = 1.0f, zero = 0.0f;
+    check_dnn(g_dnn.fwd(g_dnn_handle, &one, p.x, x, p.w, w, p.conv, p.fwd_algo, ws.p, ws.n, &zero, p.y, y),
+              "convolution forward");
+}
+
+void dnn_conv_backward_data(const ConvShape& s, const float* w, const float* dy, float* dx) {
+    bind_context();
+    DnnPlan& p = dnn_plan(s);
+    Workspace ws(p.data_ws);
+    const float one = 1.0f, zero = 0.0f;
+    check_dnn(g_dnn.bwd_data(g_dnn_handle, &one, p.w, w, p.y, dy, p.conv, p.data_algo, ws.p, ws.n, &zero, p.x, dx),
+              "convolution backward data");
+}
+
+void dnn_conv_backward_filter(const ConvShape& s, const float* x, const float* dy, float* dw) {
+    bind_context();
+    DnnPlan& p = dnn_plan(s);
+    Workspace ws(p.filter_ws);
+    const float one = 1.0f, zero = 0.0f;
+    check_dnn(g_dnn.bwd_filter(g_dnn_handle, &one, p.x, x, p.y, dy, p.conv, p.filter_algo, ws.p, ws.n, &zero, p.w, dw),
+              "convolution backward filter");
 }
 
 void launch(const Kernel& k, int64_t n, void** args, unsigned block) {

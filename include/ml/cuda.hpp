@@ -111,4 +111,27 @@ void gemm_half(bool trans_a, bool trans_b, int m, int n, int k, DType dtype,
                const void* b, int ldb, long long stride_b,
                float* c, int ldc, long long stride_c, int batch);
 
+// ── cuDNN (optional) ─────────────────────────────────────────────────────────
+//
+// Loaded at runtime like cuBLAS (pip install nvidia-cudnn-cu12). When it is
+// present, convolutions run on its kernels; when it is not -- or
+// PROMETHEUS_CUDNN=0 -- they run on this library's own im2col kernels. Results
+// agree either way; cuDNN is only faster.
+
+bool dnn_available();
+/// The cuDNN version loaded, or why it is not used.
+std::string dnn_status();
+
+/// A 2-D convolution's shape: input [B, C, H, W], filter [F, C, K, K],
+/// output [B, F, Ho, Wo], one stride and padding for both axes.
+struct ConvShape {
+    int B, C, H, W, F, K, stride, pad;
+};
+
+/// y = conv(x, w); dx = conv^T(w, dy); dw = sum over the batch. Float32,
+/// contiguous NCHW; each overwrites its output.
+void dnn_conv_forward(const ConvShape& s, const float* x, const float* w, float* y);
+void dnn_conv_backward_data(const ConvShape& s, const float* w, const float* dy, float* dx);
+void dnn_conv_backward_filter(const ConvShape& s, const float* x, const float* dy, float* dw);
+
 } // namespace cuda

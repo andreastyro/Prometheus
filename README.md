@@ -259,15 +259,28 @@ opt.step()
 Kernels are compiled for the GPU actually present the first time each is used,
 so one build serves every generation; CUDA 12 covers Maxwell (GTX 900) onward,
 CUDA 13 Turing onward. Mixed precision uses tensor cores where the card has
-them (`cuda_has_tensor_cores`, `cuda_has_bf16`). `cuda_memory_stats()` reports
+them (`cuda_has_tensor_cores`, `cuda_has_bf16`, `cuda_cudnn_available`). `cuda_memory_stats()` reports
 memory held by tensors, its peak and the allocator's cache; running out names
 the sizes involved. `cuda_set_device(i)` or `PROMETHEUS_CUDA_DEVICE` picks a
 GPU. `PROMETHEUS_PROFILE_BACKWARD=1` prints the backward pass's time by op.
 
+cuDNN is optional: with it installed, `Conv2D` and `ConvTranspose2D` run on
+its kernels; without it, or with `PROMETHEUS_CUDNN=0`, they run on the
+library's own. `cuda_cudnn_status()` names the version in use or why it is not
+used. A tiny test convolution runs when it loads, because recent cuDNN releases
+load on older cards and then fail; on a GTX 900 card use cuDNN 9.10, the
+version PyTorch bundles:
+
+```bash
+pip install nvidia-cudnn-cu12            # Maxwell: nvidia-cudnn-cu12==9.10.2.21
+```
+
 GPT training step on a GTX 970 (4 layers x 256, batch 8 x 128,
 [tests/bench_gpu_gpt.py](tests/bench_gpu_gpt.py)): Prometheus 26.6 ms
 (38.4k tokens/s), PyTorch 2.14 19.8 ms (51.8k tokens/s), the same step on a
-Ryzen AI 7 350 CPU 208 ms. The GPU suite is
+Ryzen AI 7 350 CPU 208 ms. Small-CNN training step, batch 64 of 32x32
+([tests/bench_gpu_cnn.py](tests/bench_gpu_cnn.py)): Prometheus 7.6-8.2 ms
+with cuDNN, 10.7 ms without, PyTorch 4.9 ms. The GPU suite is
 [tests/test_cuda.cpp](tests/test_cuda.cpp) and
 [tests/test_cuda.py](tests/test_cuda.py): every op and layer against the CPU,
 forward and gradient; CI has no GPU, so there they build and skip.

@@ -1842,6 +1842,11 @@ extern "C" __global__ void v_to_cb(const float* x, float* out, long long B, long
     const long long q = i % (B * P), c = i / (B * P), b = q / P, pos = q % P;
     out[i] = x[(b * C + c) * P + pos];
 }
+// y[b, c, pos] += bias[c], in place
+extern "C" __global__ void v_add_bias_c(float* y, const float* bias, long long C, long long P, long long n) {
+    long long i = gid(); if (i >= n) return;
+    y[i] += bias[(i / P) % C];
+}
 // max pooling: value and the flat input index of each window's winner (first max)
 extern "C" __global__ void v_maxpool(const float* x, float* y, long long* arg, long long planes, long long H, long long W,
                                      int K, int s, long long Ho, long long Wo) {
@@ -1953,6 +1958,24 @@ static TensorPtr to_cb(const TensorPtr& x, long long B, long long C, long long P
     return out;
 }
 
+// y [B, C, P] += bias[c] in place; no bias, nothing to do
+static void add_bias_c(const TensorPtr& y, const TensorPtr& bias, long long C, long long P) {
+    if (!bias) return;
+    long long n = y->numel();
+    void* py = y->storage()->data();
+    const void* pb = base(bias);
+    void* args[] = {&py, &pb, &C, &P, &n};
+    cuda::launch(VK("v_add_bias_c"), n, args);
+}
+
+static const float* fp(const TensorPtr& t) { return static_cast<const float*>(base(t)); }
+static float* wp(const TensorPtr& t) { return static_cast<float*>(t->storage()->data()); }
+
+// db for a [B, C, H, W] gradient: the sum over everything but the channel
+static TensorPtr bias_grad(const TensorPtr& G, long long B, long long C, long long P) {
+    return ::sum(::sum(reshape(G, {B, C, P}), 2), 0);
+}
+
 using Reference = std::function<TensorPtr(const vector<TensorPtr>&)>;
 
 // a node on `out` over `inputs`: `fused` for a plain backward, `reference` (the
@@ -1983,6 +2006,21 @@ TensorPtr conv2d(const TensorPtr& x0, const TensorPtr& w0, const TensorPtr& b0, 
     const int K = (int)w->size(2);
     const long long Ho = (H + 2 * pad - K) / stride + 1, Wo = (W + 2 * pad - K) / stride + 1;
     const long long HW = Ho * Wo, CKK = C * K * K, BHW = B * HW;
+    if (cuda::dnn_available()) {
+        const cuda::ConvShape cs{(int)B, (int)C, (int)H, (int)W, (int)F, K, stride, pad};
+        auto out = empty_cuda({B, F, Ho, Wo});
+        cuda::dnn_conv_forward(cs, fp(x), fp(w), wp(out));
+        add_bias_c(out, bias, F, HW);
+        attach_fused(out, {x0, w0, b0}, "Conv2D", reference, [=](const TensorPtr& G0) -> vector<TensorPtr> {
+            auto G = contiguous_on_device(f32(G0, "Conv2D"));
+            auto dx = empty_cuda({B, C, H, W});
+            auto dw = empty_cuda({F, C, (long long)K, (long long)K});
+            cuda::dnn_conv_backward_data(cs, fp(w), fp(G), wp(dx));
+            cuda::dnn_conv_backward_filter(cs, fp(x), fp(G), wp(dw));
+            return {dx, dw, bias_grad(G, B, F, HW)};
+        });
+        return out;
+    }
     // the whole batch as one gemm: W [F, CKK] @ col [CKK, B*HW] -> [F, B*HW],
     // then back to [B, F, Ho, Wo] with the bias added in the same pass
     auto col = im2col_b(x, C, H, W, K, stride, pad, Ho, Wo);
@@ -2018,6 +2056,24 @@ TensorPtr conv_transpose2d(const TensorPtr& x0, const TensorPtr& w0, const Tenso
     const int K = (int)w->size(2);
     const long long Ho = (H - 1) * stride - 2 * pad + K, Wo = (W - 1) * stride - 2 * pad + K;
     const long long HWi = H * W, CKK = Cout * K * K, BHW = B * HWi;
+    if (cuda::dnn_available()) {
+        // the transpose of a convolution from [B, Cout, Ho, Wo] to [B, Cin, H, W]
+        // with filter [Cin, Cout, K, K]: its forward is that convolution's
+        // backward-data, and the other way round
+        const cuda::ConvShape cs{(int)B, (int)Cout, (int)Ho, (int)Wo, (int)Cin, K, stride, pad};
+        auto out = empty_cuda({B, Cout, Ho, Wo});
+        cuda::dnn_conv_backward_data(cs, fp(w), fp(x), wp(out));
+        add_bias_c(out, bias, Cout, Ho * Wo);
+        attach_fused(out, {x0, w0, b0}, "ConvTranspose2D", reference, [=](const TensorPtr& G0) -> vector<TensorPtr> {
+            auto G = contiguous_on_device(f32(G0, "ConvTranspose2D"));
+            auto dx = empty_cuda({B, Cin, H, W});
+            auto dw = empty_cuda({Cin, Cout, (long long)K, (long long)K});
+            cuda::dnn_conv_forward(cs, fp(G), fp(w), wp(dx));
+            cuda::dnn_conv_backward_filter(cs, fp(G), fp(x), wp(dw));
+            return {dx, dw, bias_grad(G, B, Cout, Ho * Wo)};
+        });
+        return out;
+    }
     // col = W^T [CKK, Cin] @ x' [Cin, B*HWi], one gemm, then scattered onto the output
     auto xf = to_cb(x, B, Cin, HWi);
     auto col = empty_cuda({CKK, BHW});

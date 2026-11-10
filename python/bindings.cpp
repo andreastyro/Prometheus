@@ -341,7 +341,7 @@ PYBIND11_MODULE(_C, m) {
         try { for (auto p : site.attr("getsitepackages")()) sites.push_back(py::str(p)); } catch (...) {}
         try { sites.push_back(py::str(site.attr("getusersitepackages")())); } catch (...) {}
         for (const auto& s : sites)
-            for (const char* pkg : {"cuda_nvrtc", "cublas", "cuda_runtime"}) {
+            for (const char* pkg : {"cuda_nvrtc", "cublas", "cuda_runtime", "cudnn"}) {
 #ifdef _WIN32
                 cuda_dirs.push_back(s + "/nvidia/" + pkg + "/bin");
 #else
@@ -359,6 +359,10 @@ PYBIND11_MODULE(_C, m) {
           "Tensor cores (compute 7.0+): float16 matmuls run on them.");
     m.def("cuda_has_bf16", &cuda::has_bf16,
           "bfloat16 matmuls in hardware (compute 8.0+); older GPUs compute them in float32.");
+    m.def("cuda_cudnn_available", &cuda::dnn_available,
+          "True when cuDNN loaded (pip install nvidia-cudnn-cu12); convolutions then run on it.");
+    m.def("cuda_cudnn_status", &cuda::dnn_status,
+          "The cuDNN version in use, or why convolutions use the built-in kernels.");
     m.def("cuda_memory_stats", []() {
               auto s = cuda::memory_stats();
               py::dict d;
