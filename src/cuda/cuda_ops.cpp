@@ -1796,6 +1796,52 @@ extern "C" __global__ void v_col2im(const float* col, float* x, long long B, lon
     }
     x[i] = acc;
 }
+// The same two with the batch folded into the columns: col[r, b*HW + pos], a
+// [C*K*K, B*HW] matrix. Then a convolution over the whole batch is one gemm
+// rather than one per image.
+extern "C" __global__ void v_im2col_b(const float* x, float* col, long long B, long long C, long long H, long long W,
+                                      int K, int s, int p, long long Hc, long long Wc) {
+    const long long HW = Hc * Wc, CKK = C * K * K, BHW = B * HW;
+    long long i = gid(); if (i >= CKK * BHW) return;
+    const long long r = i / BHW, q = i % BHW, b = q / HW, pos = q % HW;
+    const long long oy = pos / Wc, ox = pos % Wc;
+    const int kw = (int)(r % K), kh = (int)((r / K) % K);
+    const long long c = r / (K * K);
+    const long long y = oy * s + kh - p, xx = ox * s + kw - p;
+    col[i] = (y < 0 || y >= H || xx < 0 || xx >= W) ? 0.0f : x[((b * C + c) * H + y) * W + xx];
+}
+extern "C" __global__ void v_col2im_b(const float* col, float* x, long long B, long long C, long long H, long long W,
+                                      int K, int s, int p, long long Hc, long long Wc) {
+    long long i = gid(); if (i >= B * C * H * W) return;
+    const long long xx = i % W, y = (i / W) % H, c = (i / (W * H)) % C, b = i / (W * H * C);
+    const long long HW = Hc * Wc, BHW = B * HW;
+    float acc = 0.0f;
+    for (int kh = 0; kh < K; kh++) {
+        const long long ty = y + p - kh;
+        if (ty < 0 || ty % s) continue;
+        const long long oy = ty / s;
+        if (oy >= Hc) continue;
+        for (int kw = 0; kw < K; kw++) {
+            const long long tx = xx + p - kw;
+            if (tx < 0 || tx % s) continue;
+            const long long ox = tx / s;
+            if (ox >= Wc) continue;
+            acc += col[((c * K + kh) * K + kw) * BHW + b * HW + oy * Wc + ox];
+        }
+    }
+    x[i] = acc;
+}
+// [C, B*P] -> [B, C, P], adding bias[c] if given; and [B, C, P] -> [C, B*P]
+extern "C" __global__ void v_from_cb(const float* y, const float* bias, float* out, long long B, long long C, long long P) {
+    long long i = gid(); if (i >= B * C * P) return;
+    const long long pos = i % P, c = (i / P) % C, b = i / (P * C);
+    out[i] = y[c * B * P + b * P + pos] + (bias ? bias[c] : 0.0f);
+}
+extern "C" __global__ void v_to_cb(const float* x, float* out, long long B, long long C, long long P) {
+    long long i = gid(); if (i >= B * C * P) return;
+    const long long q = i % (B * P), c = i / (B * P), b = q / P, pos = q % P;
+    out[i] = x[(b * C + c) * P + pos];
+}
 // max pooling: value and the flat input index of each window's winner (first max)
 extern "C" __global__ void v_maxpool(const float* x, float* y, long long* arg, long long planes, long long H, long long W,
                                      int K, int s, long long Ho, long long Wo) {
@@ -1864,6 +1910,49 @@ static TensorPtr col2im(const TensorPtr& col, long long B, long long C, long lon
     return x;
 }
 
+// x [B, C, H, W] -> col [C*K*K, B*Hc*Wc]
+static TensorPtr im2col_b(const TensorPtr& x, long long C, long long H, long long W, int K, int s, int p,
+                          long long Hc, long long Wc) {
+    long long B = x->size(0);
+    auto col = empty_cuda({C * K * K, B * Hc * Wc});
+    const void* px = base(x);
+    void* pc = col->storage()->data();
+    void* args[] = {&px, &pc, &B, &C, &H, &W, &K, &s, &p, &Hc, &Wc};
+    cuda::launch(VK("v_im2col_b"), col->numel(), args);
+    return col;
+}
+
+// col [C*K*K, B*Hc*Wc] -> x [B, C, H, W]
+static TensorPtr col2im_b(const TensorPtr& col, long long B, long long C, long long H, long long W, int K, int s,
+                          int p, long long Hc, long long Wc) {
+    auto x = empty_cuda({B, C, H, W});
+    const void* pc = base(col);
+    void* px = x->storage()->data();
+    void* args[] = {&pc, &px, &B, &C, &H, &W, &K, &s, &p, &Hc, &Wc};
+    cuda::launch(VK("v_col2im_b"), x->numel(), args);
+    return x;
+}
+
+// [C, B*P] -> [B, C, P] (+ bias[c]); [B, C, P] -> [C, B*P]
+static TensorPtr from_cb(const TensorPtr& y, const TensorPtr& bias, long long B, long long C, long long P,
+                         const Shape& shape) {
+    auto out = empty_cuda(shape);
+    const void* py = base(y);
+    const void* pb = bias ? base(bias) : nullptr;
+    void* po = out->storage()->data();
+    void* args[] = {&py, &pb, &po, &B, &C, &P};
+    cuda::launch(VK("v_from_cb"), B * C * P, args);
+    return out;
+}
+static TensorPtr to_cb(const TensorPtr& x, long long B, long long C, long long P) {
+    auto out = empty_cuda({C, B * P});
+    const void* px = base(x);
+    void* po = out->storage()->data();
+    void* args[] = {&px, &po, &B, &C, &P};
+    cuda::launch(VK("v_to_cb"), B * C * P, args);
+    return out;
+}
+
 using Reference = std::function<TensorPtr(const vector<TensorPtr>&)>;
 
 // a node on `out` over `inputs`: `fused` for a plain backward, `reference` (the
@@ -1893,35 +1982,28 @@ TensorPtr conv2d(const TensorPtr& x0, const TensorPtr& w0, const TensorPtr& b0, 
     const long long F = w->size(0);
     const int K = (int)w->size(2);
     const long long Ho = (H + 2 * pad - K) / stride + 1, Wo = (W + 2 * pad - K) / stride + 1;
-    const long long HW = Ho * Wo, CKK = C * K * K;
-    TensorPtr col, out;
-    {
-        NoGrad off;
-        col = im2col(x, C, H, W, K, stride, pad, Ho, Wo);
-        auto y = empty_cuda({B, F, HW});
-        // one launch: the same weight against every image's columns (stride 0)
-        cuda::sgemm_batched(false, false, (int)F, (int)HW, (int)CKK, 1.0f, static_cast<const float*>(base(w)), (int)CKK, 0,
-                            static_cast<const float*>(base(col)), (int)HW, CKK * HW, 0.0f,
-                            static_cast<float*>(y->storage()->data()), (int)HW, F * HW, (int)B);
-        out = reshape(add(y, reshape(bias, {1, F, 1})), {B, F, Ho, Wo});
-        out = contiguous(out);
-    }
+    const long long HW = Ho * Wo, CKK = C * K * K, BHW = B * HW;
+    // the whole batch as one gemm: W [F, CKK] @ col [CKK, B*HW] -> [F, B*HW],
+    // then back to [B, F, Ho, Wo] with the bias added in the same pass
+    auto col = im2col_b(x, C, H, W, K, stride, pad, Ho, Wo);
+    auto yf = empty_cuda({F, BHW});
+    cuda::sgemm(false, false, (int)F, (int)BHW, (int)CKK, 1.0f, static_cast<const float*>(base(w)), (int)CKK,
+                static_cast<const float*>(base(col)), (int)BHW, 0.0f, static_cast<float*>(yf->storage()->data()), (int)BHW);
+    auto out = from_cb(yf, bias, B, F, HW, {B, F, Ho, Wo});
     attach_fused(out, {x0, w0, b0}, "Conv2D", reference, [=](const TensorPtr& G0) -> vector<TensorPtr> {
         auto G = contiguous_on_device(f32(G0, "Conv2D"));
-        const float* pg = static_cast<const float*>(base(G));
-        const float* pw = static_cast<const float*>(base(w));
-        const float* pc = static_cast<const float*>(base(col));
-        // dW = sum_b G_b [F, HW] @ col_b^T, accumulated across the batch
+        auto gf = to_cb(G, B, F, HW);                                   // [F, B*HW]
+        const float* pg = static_cast<const float*>(base(gf));
+        // dW = G' @ col^T: one gemm over every image's positions
         auto dw = empty_cuda({F, C, (long long)K, (long long)K});
-        for (long long b = 0; b < B; b++)
-            cuda::sgemm(false, true, (int)F, (int)CKK, (int)HW, 1.0f, pg + b * F * HW, (int)HW, pc + b * CKK * HW, (int)HW,
-                        b ? 1.0f : 0.0f, static_cast<float*>(dw->storage()->data()), (int)CKK);
-        // dcol = W^T @ G_b for every image, then back onto the input
-        auto dcol = empty_cuda({B, CKK, HW});
-        cuda::sgemm_batched(true, false, (int)CKK, (int)HW, (int)F, 1.0f, pw, (int)CKK, 0, pg, (int)HW, F * HW, 0.0f,
-                            static_cast<float*>(dcol->storage()->data()), (int)HW, CKK * HW, (int)B);
-        auto dx = col2im(dcol, B, C, H, W, K, stride, pad, Ho, Wo);
-        auto db = ::sum(::sum(reshape(G, {B, F, HW}), 2), 0);
+        cuda::sgemm(false, true, (int)F, (int)CKK, (int)BHW, 1.0f, pg, (int)BHW, static_cast<const float*>(base(col)),
+                    (int)BHW, 0.0f, static_cast<float*>(dw->storage()->data()), (int)CKK);
+        // dcol = W^T @ G', then back onto the input
+        auto dcol = empty_cuda({CKK, BHW});
+        cuda::sgemm(true, false, (int)CKK, (int)BHW, (int)F, 1.0f, static_cast<const float*>(base(w)), (int)CKK, pg,
+                    (int)BHW, 0.0f, static_cast<float*>(dcol->storage()->data()), (int)BHW);
+        auto dx = col2im_b(dcol, B, C, H, W, K, stride, pad, Ho, Wo);
+        auto db = ::sum(gf, 1);
         return {dx, dw, db};
     });
     return out;
@@ -1935,31 +2017,29 @@ TensorPtr conv_transpose2d(const TensorPtr& x0, const TensorPtr& w0, const Tenso
     const long long Cout = w->size(1);
     const int K = (int)w->size(2);
     const long long Ho = (H - 1) * stride - 2 * pad + K, Wo = (W - 1) * stride - 2 * pad + K;
-    const long long HWi = H * W, CKK = Cout * K * K;
+    const long long HWi = H * W, CKK = Cout * K * K, BHW = B * HWi;
+    // col = W^T [CKK, Cin] @ x' [Cin, B*HWi], one gemm, then scattered onto the output
+    auto xf = to_cb(x, B, Cin, HWi);
+    auto col = empty_cuda({CKK, BHW});
+    cuda::sgemm(true, false, (int)CKK, (int)BHW, (int)Cin, 1.0f, static_cast<const float*>(base(w)), (int)CKK,
+                static_cast<const float*>(base(xf)), (int)BHW, 0.0f, static_cast<float*>(col->storage()->data()), (int)BHW);
     TensorPtr out;
     {
         NoGrad off;
-        // col = W^T [CKK, Cin] @ x_b [Cin, HWi], then scattered onto the larger output
-        auto col = empty_cuda({B, CKK, HWi});
-        cuda::sgemm_batched(true, false, (int)CKK, (int)HWi, (int)Cin, 1.0f, static_cast<const float*>(base(w)), (int)CKK, 0,
-                            static_cast<const float*>(base(x)), (int)HWi, Cin * HWi, 0.0f,
-                            static_cast<float*>(col->storage()->data()), (int)HWi, CKK * HWi, (int)B);
-        auto y = col2im(col, B, Cout, Ho, Wo, K, stride, pad, H, W);
-        out = contiguous(add(y, reshape(bias, {1, Cout, 1, 1})));
+        out = contiguous(add(col2im_b(col, B, Cout, Ho, Wo, K, stride, pad, H, W), reshape(bias, {1, Cout, 1, 1})));
     }
     attach_fused(out, {x0, w0, b0}, "ConvTranspose2D", reference, [=](const TensorPtr& G0) -> vector<TensorPtr> {
         auto G = contiguous_on_device(f32(G0, "ConvTranspose2D"));
-        auto gc = im2col(G, Cout, Ho, Wo, K, stride, pad, H, W);             // [B, CKK, HWi]
+        auto gc = im2col_b(G, Cout, Ho, Wo, K, stride, pad, H, W);       // [CKK, B*HWi]
         const float* pgc = static_cast<const float*>(base(gc));
-        const float* pw = static_cast<const float*>(base(w));
-        const float* px = static_cast<const float*>(base(x));
-        auto dx = empty_cuda({B, Cin, H, W});
-        cuda::sgemm_batched(false, false, (int)Cin, (int)HWi, (int)CKK, 1.0f, pw, (int)CKK, 0, pgc, (int)HWi, CKK * HWi,
-                            0.0f, static_cast<float*>(dx->storage()->data()), (int)HWi, Cin * HWi, (int)B);
+        // dx' = W [Cin, CKK] @ gc -> [Cin, B*HWi]; dW = x' @ gc^T
+        auto dxf = empty_cuda({Cin, BHW});
+        cuda::sgemm(false, false, (int)Cin, (int)BHW, (int)CKK, 1.0f, static_cast<const float*>(base(w)), (int)CKK, pgc,
+                    (int)BHW, 0.0f, static_cast<float*>(dxf->storage()->data()), (int)BHW);
         auto dw = empty_cuda({Cin, Cout, (long long)K, (long long)K});
-        for (long long b = 0; b < B; b++)
-            cuda::sgemm(false, true, (int)Cin, (int)CKK, (int)HWi, 1.0f, px + b * Cin * HWi, (int)HWi, pgc + b * CKK * HWi,
-                        (int)HWi, b ? 1.0f : 0.0f, static_cast<float*>(dw->storage()->data()), (int)CKK);
+        cuda::sgemm(false, true, (int)Cin, (int)CKK, (int)BHW, 1.0f, static_cast<const float*>(base(xf)), (int)BHW, pgc,
+                    (int)BHW, 0.0f, static_cast<float*>(dw->storage()->data()), (int)CKK);
+        auto dx = from_cb(dxf, nullptr, B, Cin, HWi, {B, Cin, H, W});
         auto db = ::sum(::sum(reshape(G, {B, Cout, Ho * Wo}), 2), 0);
         return {dx, dw, db};
     });
