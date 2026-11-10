@@ -9,6 +9,7 @@
 #include "ml/cuda.hpp"
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <stdexcept>
 #include <string>
 
@@ -1627,6 +1628,282 @@ pair<TensorPtr, TensorPtr> add_layernorm(const TensorPtr& a0, const TensorPtr& c
         };
     }
     return {s, y};
+}
+
+// ── convolution and pooling on the device ────────────────────────────────────
+//
+// The standard non-cuDNN route: im2col turns every output position's patch
+// into a column, so a convolution is one batched gemm per call; col2im is its
+// adjoint (a gather here, so no atomics and a deterministic sum). Pooling keeps
+// each window's winner on the device. Gradients: kernels for a plain backward,
+// the layer's op-form reference when the gradient is itself recorded.
+
+static const string& VISION_SRC() {
+    static const string s = src(R"(
+// col[b, (c*K + kh)*K + kw, oy*Wc + ox] = x[b, c, oy*s + kh - p, ox*s + kw - p] (0 outside)
+extern "C" __global__ void v_im2col(const float* x, float* col, long long B, long long C, long long H, long long W,
+                                    int K, int s, int p, long long Hc, long long Wc) {
+    const long long HW = Hc * Wc, CKK = C * K * K;
+    long long i = gid(); if (i >= B * CKK * HW) return;
+    const long long pos = i % HW, r = (i / HW) % CKK, b = i / (HW * CKK);
+    const long long oy = pos / Wc, ox = pos % Wc;
+    const int kw = (int)(r % K), kh = (int)((r / K) % K);
+    const long long c = r / (K * K);
+    const long long y = oy * s + kh - p, xx = ox * s + kw - p;
+    col[i] = (y < 0 || y >= H || xx < 0 || xx >= W) ? 0.0f : x[((b * C + c) * H + y) * W + xx];
+}
+// the adjoint: x[b, c, y, xx] = sum over the (kh, kw) whose window covers it
+extern "C" __global__ void v_col2im(const float* col, float* x, long long B, long long C, long long H, long long W,
+                                    int K, int s, int p, long long Hc, long long Wc) {
+    long long i = gid(); if (i >= B * C * H * W) return;
+    const long long xx = i % W, y = (i / W) % H, c = (i / (W * H)) % C, b = i / (W * H * C);
+    const long long HW = Hc * Wc, CKK = C * K * K;
+    float acc = 0.0f;
+    for (int kh = 0; kh < K; kh++) {
+        const long long ty = y + p - kh;
+        if (ty < 0 || ty % s) continue;
+        const long long oy = ty / s;
+        if (oy >= Hc) continue;
+        for (int kw = 0; kw < K; kw++) {
+            const long long tx = xx + p - kw;
+            if (tx < 0 || tx % s) continue;
+            const long long ox = tx / s;
+            if (ox >= Wc) continue;
+            acc += col[(b * CKK + (c * K + kh) * K + kw) * HW + oy * Wc + ox];
+        }
+    }
+    x[i] = acc;
+}
+// max pooling: value and the flat input index of each window's winner (first max)
+extern "C" __global__ void v_maxpool(const float* x, float* y, long long* arg, long long planes, long long H, long long W,
+                                     int K, int s, long long Ho, long long Wo) {
+    long long i = gid(); if (i >= planes * Ho * Wo) return;
+    const long long ox = i % Wo, oy = (i / Wo) % Ho, pl = i / (Wo * Ho);
+    const float* xp = x + pl * H * W;
+    long long best = (oy * s) * W + ox * s;
+    float bv = xp[best];
+    for (int kh = 0; kh < K; kh++)
+        for (int kw = 0; kw < K; kw++) {
+            const long long j = (oy * s + kh) * W + ox * s + kw;
+            if (xp[j] > bv) { bv = xp[j]; best = j; }
+        }
+    y[i] = bv;
+    arg[i] = pl * H * W + best;
+}
+extern "C" __global__ void v_scatter_rows(const float* g, const long long* idx, float* dx, long long n) {
+    long long i = gid(); if (i >= n) return;
+    atomicAdd(&dx[idx[i]], g[i]);
+}
+extern "C" __global__ void v_avgpool(const float* x, float* y, long long planes, long long H, long long W,
+                                     int K, int s, long long Ho, long long Wo) {
+    long long i = gid(); if (i >= planes * Ho * Wo) return;
+    const long long ox = i % Wo, oy = (i / Wo) % Ho, pl = i / (Wo * Ho);
+    const float* xp = x + pl * H * W;
+    float acc = 0.0f;
+    for (int kh = 0; kh < K; kh++)
+        for (int kw = 0; kw < K; kw++) acc += xp[(oy * s + kh) * W + ox * s + kw];
+    y[i] = acc / (float)(K * K);
+}
+extern "C" __global__ void v_avgpool_back(const float* g, float* dx, long long planes, long long H, long long W,
+                                          int K, int s, long long Ho, long long Wo) {
+    long long i = gid(); if (i >= planes * Ho * Wo) return;
+    const long long ox = i % Wo, oy = (i / Wo) % Ho, pl = i / (Wo * Ho);
+    const float v = g[i] / (float)(K * K);
+    for (int kh = 0; kh < K; kh++)
+        for (int kw = 0; kw < K; kw++) atomicAdd(&dx[pl * H * W + (oy * s + kh) * W + ox * s + kw], v);
+}
+)");
+    return s;
+}
+
+// a kernel from VISION_SRC (named VK: these functions have a kernel size K)
+static cuda::Kernel VK(const char* name) { return K(name, VISION_SRC()); }
+
+// x [B, C, H, W] -> col [B, C*K*K, Hc*Wc]
+static TensorPtr im2col(const TensorPtr& x, long long C, long long H, long long W, int K, int s, int p,
+                        long long Hc, long long Wc) {
+    long long B = x->size(0);
+    auto col = empty_cuda({B, C * K * K, Hc * Wc});
+    const void* px = base(x);
+    void* pc = col->storage()->data();
+    void* args[] = {&px, &pc, &B, &C, &H, &W, &K, &s, &p, &Hc, &Wc};
+    cuda::launch(VK("v_im2col"), col->numel(), args);
+    return col;
+}
+
+// col [B, C*K*K, Hc*Wc] -> x [B, C, H, W]
+static TensorPtr col2im(const TensorPtr& col, long long B, long long C, long long H, long long W, int K, int s, int p,
+                        long long Hc, long long Wc) {
+    auto x = empty_cuda({B, C, H, W});
+    const void* pc = base(col);
+    void* px = x->storage()->data();
+    void* args[] = {&pc, &px, &B, &C, &H, &W, &K, &s, &p, &Hc, &Wc};
+    cuda::launch(VK("v_col2im"), x->numel(), args);
+    return x;
+}
+
+using Reference = std::function<TensorPtr(const vector<TensorPtr>&)>;
+
+// a node on `out` over `inputs`: `fused` for a plain backward, `reference` (the
+// layer's op form) when the gradient is recorded
+static void attach_fused(const TensorPtr& out, vector<TensorPtr> inputs, const char* name, Reference reference,
+                         function<vector<TensorPtr>(const TensorPtr& G)> fused) {
+    bool need = false;
+    for (auto& t : inputs) need = need || (t && t->requires_grad());
+    if (!need) return;
+    auto node = make_node(out, inputs);
+    node->name = name;
+    autograd::attach_reference(*node, reference);
+    auto ref_graph = node->backward_graph;
+    node->backward_graph = [ref_graph, fused, inputs](const TensorPtr& o, const TensorPtr& G) -> vector<TensorPtr> {
+        if (grad_enabled()) return ref_graph(o, G);
+        auto parts = fused(G);
+        for (size_t i = 0; i < parts.size() && i < inputs.size(); i++)
+            if (!inputs[i] || !inputs[i]->requires_grad()) parts[i] = nullptr;
+        return parts;
+    };
+}
+
+TensorPtr conv2d(const TensorPtr& x0, const TensorPtr& w0, const TensorPtr& b0, int stride, int pad, Reference reference) {
+    auto x = contiguous_on_device(f32(x0, "Conv2D")), w = contiguous_on_device(f32(w0, "Conv2D"));
+    auto bias = contiguous_on_device(f32(b0, "Conv2D"));
+    const long long B = x->size(0), C = x->size(1), H = x->size(2), W = x->size(3);
+    const long long F = w->size(0);
+    const int K = (int)w->size(2);
+    const long long Ho = (H + 2 * pad - K) / stride + 1, Wo = (W + 2 * pad - K) / stride + 1;
+    const long long HW = Ho * Wo, CKK = C * K * K;
+    TensorPtr col, out;
+    {
+        NoGrad off;
+        col = im2col(x, C, H, W, K, stride, pad, Ho, Wo);
+        auto y = empty_cuda({B, F, HW});
+        // one launch: the same weight against every image's columns (stride 0)
+        cuda::sgemm_batched(false, false, (int)F, (int)HW, (int)CKK, 1.0f, static_cast<const float*>(base(w)), (int)CKK, 0,
+                            static_cast<const float*>(base(col)), (int)HW, CKK * HW, 0.0f,
+                            static_cast<float*>(y->storage()->data()), (int)HW, F * HW, (int)B);
+        out = reshape(add(y, reshape(bias, {1, F, 1})), {B, F, Ho, Wo});
+        out = contiguous(out);
+    }
+    attach_fused(out, {x0, w0, b0}, "Conv2D", reference, [=](const TensorPtr& G0) -> vector<TensorPtr> {
+        auto G = contiguous_on_device(f32(G0, "Conv2D"));
+        const float* pg = static_cast<const float*>(base(G));
+        const float* pw = static_cast<const float*>(base(w));
+        const float* pc = static_cast<const float*>(base(col));
+        // dW = sum_b G_b [F, HW] @ col_b^T, accumulated across the batch
+        auto dw = empty_cuda({F, C, (long long)K, (long long)K});
+        for (long long b = 0; b < B; b++)
+            cuda::sgemm(false, true, (int)F, (int)CKK, (int)HW, 1.0f, pg + b * F * HW, (int)HW, pc + b * CKK * HW, (int)HW,
+                        b ? 1.0f : 0.0f, static_cast<float*>(dw->storage()->data()), (int)CKK);
+        // dcol = W^T @ G_b for every image, then back onto the input
+        auto dcol = empty_cuda({B, CKK, HW});
+        cuda::sgemm_batched(true, false, (int)CKK, (int)HW, (int)F, 1.0f, pw, (int)CKK, 0, pg, (int)HW, F * HW, 0.0f,
+                            static_cast<float*>(dcol->storage()->data()), (int)HW, CKK * HW, (int)B);
+        auto dx = col2im(dcol, B, C, H, W, K, stride, pad, Ho, Wo);
+        auto db = ::sum(::sum(reshape(G, {B, F, HW}), 2), 0);
+        return {dx, dw, db};
+    });
+    return out;
+}
+
+TensorPtr conv_transpose2d(const TensorPtr& x0, const TensorPtr& w0, const TensorPtr& b0, int stride, int pad,
+                           Reference reference) {
+    auto x = contiguous_on_device(f32(x0, "ConvTranspose2D")), w = contiguous_on_device(f32(w0, "ConvTranspose2D"));
+    auto bias = contiguous_on_device(f32(b0, "ConvTranspose2D"));
+    const long long B = x->size(0), Cin = x->size(1), H = x->size(2), W = x->size(3);
+    const long long Cout = w->size(1);
+    const int K = (int)w->size(2);
+    const long long Ho = (H - 1) * stride - 2 * pad + K, Wo = (W - 1) * stride - 2 * pad + K;
+    const long long HWi = H * W, CKK = Cout * K * K;
+    TensorPtr out;
+    {
+        NoGrad off;
+        // col = W^T [CKK, Cin] @ x_b [Cin, HWi], then scattered onto the larger output
+        auto col = empty_cuda({B, CKK, HWi});
+        cuda::sgemm_batched(true, false, (int)CKK, (int)HWi, (int)Cin, 1.0f, static_cast<const float*>(base(w)), (int)CKK, 0,
+                            static_cast<const float*>(base(x)), (int)HWi, Cin * HWi, 0.0f,
+                            static_cast<float*>(col->storage()->data()), (int)HWi, CKK * HWi, (int)B);
+        auto y = col2im(col, B, Cout, Ho, Wo, K, stride, pad, H, W);
+        out = contiguous(add(y, reshape(bias, {1, Cout, 1, 1})));
+    }
+    attach_fused(out, {x0, w0, b0}, "ConvTranspose2D", reference, [=](const TensorPtr& G0) -> vector<TensorPtr> {
+        auto G = contiguous_on_device(f32(G0, "ConvTranspose2D"));
+        auto gc = im2col(G, Cout, Ho, Wo, K, stride, pad, H, W);             // [B, CKK, HWi]
+        const float* pgc = static_cast<const float*>(base(gc));
+        const float* pw = static_cast<const float*>(base(w));
+        const float* px = static_cast<const float*>(base(x));
+        auto dx = empty_cuda({B, Cin, H, W});
+        cuda::sgemm_batched(false, false, (int)Cin, (int)HWi, (int)CKK, 1.0f, pw, (int)CKK, 0, pgc, (int)HWi, CKK * HWi,
+                            0.0f, static_cast<float*>(dx->storage()->data()), (int)HWi, Cin * HWi, (int)B);
+        auto dw = empty_cuda({Cin, Cout, (long long)K, (long long)K});
+        for (long long b = 0; b < B; b++)
+            cuda::sgemm(false, true, (int)Cin, (int)CKK, (int)HWi, 1.0f, px + b * Cin * HWi, (int)HWi, pgc + b * CKK * HWi,
+                        (int)HWi, b ? 1.0f : 0.0f, static_cast<float*>(dw->storage()->data()), (int)CKK);
+        auto db = ::sum(::sum(reshape(G, {B, Cout, Ho * Wo}), 2), 0);
+        return {dx, dw, db};
+    });
+    return out;
+}
+
+TensorPtr maxpool2d(const TensorPtr& x0, int K, int stride) {
+    auto x = contiguous_on_device(f32(x0, "MaxPool2D"));
+    long long Bn = x->size(0), C = x->size(1), H = x->size(2), W = x->size(3);
+    long long Ho = (H - K) / stride + 1, Wo = (W - K) / stride + 1, planes = Bn * C;
+    auto y = empty_cuda({Bn, C, Ho, Wo});
+    auto arg = empty_cuda({Bn * C * Ho * Wo}, DType::Int64);
+    const void* px = base(x);
+    void* py = y->storage()->data();
+    void* pa = arg->storage()->data();
+    int k = K, s = stride;
+    void* args[] = {&px, &py, &pa, &planes, &H, &W, &k, &s, &Ho, &Wo};
+    cuda::launch(VK("v_maxpool"), y->numel(), args);
+    const Shape oshape{Bn, C, Ho, Wo};
+    // op form: a gather of the winners (indices read back only for it)
+    Reference reference = [arg, oshape](const vector<TensorPtr>& in) -> TensorPtr {
+        auto h = arg->to(Device::CPU);
+        auto idx = make_shared<vector<int64_t>>(h->numel());
+        memcpy(idx->data(), h->storage()->data(), idx->size() * sizeof(int64_t));
+        return gather_flat(in[0], idx, oshape);
+    };
+    const int64_t nin = x->numel();
+    const Shape xshape = x->shape();
+    attach_fused(y, {x0}, "MaxPool2D", reference, [arg, nin, xshape](const TensorPtr& G0) -> vector<TensorPtr> {
+        auto G = contiguous_on_device(f32(G0, "MaxPool2D"));
+        auto dx = make_shared<Tensor>(xshape, F32, Device::CUDA);        // zeroed
+        const void* pg = base(G);
+        const void* pa = arg->storage()->data();
+        void* pd = dx->storage()->data();
+        long long n = G->numel();
+        void* a[] = {&pg, &pa, &pd, &n};
+        cuda::launch(VK("v_scatter_rows"), n, a);
+        (void)nin;
+        return {dx};
+    });
+    return y;
+}
+
+TensorPtr avgpool2d(const TensorPtr& x0, int K, int stride, Reference reference) {
+    auto x = contiguous_on_device(f32(x0, "AvgPool2D"));
+    long long Bn = x->size(0), C = x->size(1), H = x->size(2), W = x->size(3);
+    long long Ho = (H - K) / stride + 1, Wo = (W - K) / stride + 1, planes = Bn * C;
+    auto y = empty_cuda({Bn, C, Ho, Wo});
+    const void* px = base(x);
+    void* py = y->storage()->data();
+    int k = K, s = stride;
+    void* args[] = {&px, &py, &planes, &H, &W, &k, &s, &Ho, &Wo};
+    cuda::launch(VK("v_avgpool"), y->numel(), args);
+    const Shape xshape = x->shape();
+    attach_fused(y, {x0}, "AvgPool2D", reference, [=](const TensorPtr& G0) -> vector<TensorPtr> {
+        auto G = contiguous_on_device(f32(G0, "AvgPool2D"));
+        auto dx = make_shared<Tensor>(xshape, F32, Device::CUDA);        // zeroed
+        const void* pg = base(G);
+        void* pd = dx->storage()->data();
+        long long pl = planes, hh = H, ww = W, ho = Ho, wo = Wo;
+        int kk = K, ss = stride;
+        void* a[] = {&pg, &pd, &pl, &hh, &ww, &kk, &ss, &ho, &wo};
+        cuda::launch(VK("v_avgpool_back"), G->numel(), a);
+        return {dx};
+    });
+    return y;
 }
 
 } // namespace cuda_ops

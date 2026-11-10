@@ -148,4 +148,12 @@ TensorPtr add_bias_residual(const TensorPtr& y, const TensorPtr& b, const Tensor
 /// {a + c, LayerNorm(a + c)} in one pass
 std::pair<TensorPtr, TensorPtr> add_layernorm(const TensorPtr& a, const TensorPtr& c, const TensorPtr& gamma,
                                               const TensorPtr& beta, float eps);
+// convolution and pooling; `reference` is the layer's op form, for recorded gradients
+TensorPtr conv2d(const TensorPtr& x, const TensorPtr& w, const TensorPtr& b, int stride, int pad,
+                 std::function<TensorPtr(const std::vector<TensorPtr>&)> reference);
+TensorPtr conv_transpose2d(const TensorPtr& x, const TensorPtr& w, const TensorPtr& b, int stride, int pad,
+                           std::function<TensorPtr(const std::vector<TensorPtr>&)> reference);
+TensorPtr maxpool2d(const TensorPtr& x, int kernel, int stride);
+TensorPtr avgpool2d(const TensorPtr& x, int kernel, int stride,
+                    std::function<TensorPtr(const std::vector<TensorPtr>&)> reference);
 }

@@ -683,6 +683,13 @@ PYBIND11_MODULE(_C, m) {
         .def(py::init<py::list>())
         .def("forward",    &PySequential::forward)
         .def("parameters", &PySequential::parameters)
+        .def("to", [](PySequential& self, Device d) -> PySequential& { self.impl->to(d); return self; },
+             py::arg("device"), py::return_value_policy::reference_internal,
+             "Move every parameter to `device` in place; returns the model.")
+        .def("cuda", [](PySequential& self) -> PySequential& { self.impl->to(Device::CUDA); return self; },
+             py::return_value_policy::reference_internal)
+        .def("cpu", [](PySequential& self) -> PySequential& { self.impl->to(Device::CPU); return self; },
+             py::return_value_policy::reference_internal)
         .def_readonly("layers", &PySequential::held,
                       "The child Modules in order, so model.layers can be passed to model_summary or the ONNX exporter without keeping a parallel list.");
 

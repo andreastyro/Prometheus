@@ -1,3 +1,4 @@
+#include "../../ops_internal.hpp"
 #include "ml/nn/vision/conv2d.hpp"
 #include "ml/nn/vision/im2col.hpp"
 #include "ml/matmul_backend.hpp"
@@ -91,7 +92,7 @@ TensorPtr Conv2D::forward(TensorPtr input){
             return reshape(out, {(int64_t)B, (int64_t)F, (int64_t)Ho, (int64_t)Wo});
         };
     if (input->device() == Device::CUDA || weights->device() == Device::CUDA)
-        return reference({input, weights, bias});
+        return cuda_ops::conv2d(input, weights, bias, s, p, reference);
 
     auto output = make_shared<Tensor>(Shape{B, F, Ho, Wo});
     const float* X = input->data();

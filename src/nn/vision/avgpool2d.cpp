@@ -1,3 +1,4 @@
+#include "../../ops_internal.hpp"
 #include "ml/ops.hpp"
 #include "ml/nn/vision/avgpool2d.hpp"
 
@@ -38,7 +39,7 @@ TensorPtr AvgPool2D::forward(TensorPtr input){
             return mean(gather_flat(in[0], idx, wshape), (int)oshape.size(), false);
         };
     if (input->device() == Device::CUDA)
-        return reference({input});
+        return cuda_ops::avgpool2d(input, K, s, reference);
 
     auto output = make_shared<Tensor>(Shape{n, channels, h_out, w_out});
     const float* X = input->data();

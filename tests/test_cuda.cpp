@@ -340,6 +340,25 @@ int main() {
         layer_check("MaxPool2D k2", [] { return std::make_shared<MaxPool2D>(2); }, img, 0.0f);
         layer_check("MaxPool2D k3 s2 (overlapping)", [] { return std::make_shared<MaxPool2D>(3, 2); }, img, 0.0f);
         layer_check("AvgPool2D k3", [] { return std::make_shared<AvgPool2D>(3); }, img, 1e-6f);
+        {
+            // second derivative through conv -> maxpool -> avgpool: the op form of each
+            auto net = [](const TensorPtr& x, Conv2D& c, MaxPool2D& mp, AvgPool2D& ap) {
+                auto y = sum(tanh_op(ap.forward(mp.forward(c.forward(x)))), -1);
+                auto g = autograd::grad(y, {x}, true)[0];
+                return autograd::grad(sum(multiply(g, g), -1), {x})[0];
+            };
+            Tensor::manual_seed(61);
+            Conv2D cc(3, 4, 3, 1, 1);
+            Tensor::manual_seed(61);
+            Conv2D cg(3, 4, 3, 1, 1);
+            cg.to(Device::CUDA);
+            MaxPool2D mp(2);
+            AvgPool2D ap(2);
+            auto xa = random_tensor({2, 3, 8, 8}, 62), xb = G(xa);
+            xa->set_requires_grad(true);
+            xb->set_requires_grad(true);
+            CHECK_NEAR("second derivative through Conv2D, MaxPool, AvgPool", rel(net(xb, cg, mp, ap), net(xa, cc, mp, ap)), 0.0f, 1e-4f);
+        }
         layer_check("GroupNorm 3 groups", [] { return std::make_shared<GroupNorm>(3, 6); }, random_tensor({2, 6, 4, 4}, 54), 1e-5f);
         layer_check("Flatten", [] { return std::make_shared<Flatten>(); }, img, 0.0f);
         {
