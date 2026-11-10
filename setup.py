@@ -77,8 +77,21 @@ ext = Extension(
     extra_link_args=extra_link,
 )
 
+# Compile the ~40 sources in parallel. setuptools can, but does not unless
+# asked; one at a time a rebuild took minutes. PROMETHEUS_BUILD_JOBS overrides.
+from setuptools.command.build_ext import build_ext as _build_ext
+
+
+class build_ext(_build_ext):
+    def finalize_options(self):
+        super().finalize_options()
+        if not self.parallel:
+            self.parallel = int(os.environ.get("PROMETHEUS_BUILD_JOBS", os.cpu_count() or 1))
+
+
 setup(
     name="prometheus",
+    cmdclass={"build_ext": build_ext},
     version="0.1.0",
     ext_modules=[ext],
     packages=["prometheus", "prometheus.models"],
