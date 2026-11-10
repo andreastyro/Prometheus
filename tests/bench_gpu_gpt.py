@@ -21,6 +21,7 @@ ap.add_argument("--layers", type=int, default=4)
 ap.add_argument("--batch", type=int, default=8)
 ap.add_argument("--steps", type=int, default=20)
 ap.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
+ap.add_argument("--issue", action="store_true", help="also time how long the CPU takes to issue a step (before waiting for the GPU)")
 args = ap.parse_args()
 
 import numpy as np
@@ -113,12 +114,16 @@ else:
 for _ in range(3):          # warm-up: kernel compilation, allocator, cuBLAS heuristics
     step()
 sync()
-times = []
+times, issue = [], []
 for _ in range(args.steps):
     t0 = time.perf_counter()
     loss = step()
+    issue.append(time.perf_counter() - t0)    # the CPU's part: the GPU may still be running
     sync()
     times.append(time.perf_counter() - t0)
+if args.issue:
+    print("CPU issue time: median %.1f ms of the step (the rest the CPU waits for the GPU)"
+          % (sorted(issue)[len(issue) // 2] * 1e3))
 best, med = min(times), sorted(times)[len(times) // 2]
 print("%-10s %-4s batch %d x seq %d, embed %d, %d layers: median %.1f ms/step, best %.1f ms -> %.0f tokens/s (loss %.3f)"
       % (args.lib, args.device, args.batch, args.seq, args.embed, args.layers, med * 1e3, best * 1e3,

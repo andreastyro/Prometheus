@@ -22,6 +22,14 @@ TensorPtr Embedding::forward(TensorPtr input) {
     const bool batched = input->dim() == 2;
     int batch   = batched ? (int)input->shape()[0] : 1;
     int seq_len = (int)input->shape().back();
+    if (weight->device() == Device::CUDA) {
+        // one kernel each way, the ids read where they are: checking their
+        // range here would mean copying them back every step, so an id
+        // outside the table gives a zero row on the GPU instead
+        const Shape shape = batched ? Shape{batch, seq_len, embed_dim} : Shape{seq_len, embed_dim};
+        auto ids_dev = input->device() == Device::CUDA ? input : input->to(Device::CUDA);
+        return cuda_ops::embedding_device(weight, ids_dev, 0, (long long)batch * seq_len, shape);
+    }
     // exact for any dtype: int64 ids are not rounded through a float
     const vector<int64_t> ids = index_values(input, "Embedding");
 
@@ -37,9 +45,6 @@ TensorPtr Embedding::forward(TensorPtr input) {
                                 + " out of range [0, " + to_string(vocab_size) + ")");
         token_ids[r] = (int)id;
     }
-
-    if (weight->device() == Device::CUDA)              // one kernel each way
-        return cuda_ops::embedding(weight, vector<int64_t>(token_ids.begin(), token_ids.end()), output->shape());
 
     // gather: every output row is independent
     {

@@ -98,6 +98,27 @@ __device__ void sti(void* p, int dt, long long i, long long v) {
         default: st(p, dt, i, (double)v);
     }
 }
+// single precision where no float64 / int64 is involved: consumer GPUs run
+// double at 1/32 the rate
+__device__ float ldf(const void* p, int dt, long long i) {
+    switch (dt) {
+        case 0: return ((const float*)p)[i];
+        case 2: return h2f(((const unsigned short*)p)[i]);
+        case 3: return bf2f(((const unsigned short*)p)[i]);
+        case 5: return (float)((const int*)p)[i];
+        case 6: return ((const unsigned char*)p)[i] ? 1.0f : 0.0f;
+        default: return (float)ld(p, dt, i);
+    }
+}
+__device__ void stf(void* p, int dt, long long i, float v) {
+    switch (dt) {
+        case 0: ((float*)p)[i] = v; break;
+        case 2: ((unsigned short*)p)[i] = f2h(v); break;
+        case 3: ((unsigned short*)p)[i] = f2bf(v); break;
+        case 6: ((unsigned char*)p)[i] = v != 0.0f; break;
+        default: st(p, dt, i, (double)v);
+    }
+}
 // element i of the output, read through a strided / broadcast operand
 __device__ long long at(const Index& ix, long long i) {
     long long r = i, o = 0;
@@ -182,6 +203,9 @@ extern "C" __global__ void c_compare(const void* a, int da, const void* b, int d
     } else if (integral) {
         long long x = ldi(a, da, oa), z = ldi(b, db, ob);
         r = op == 0 ? x == z : op == 1 ? x != z : op == 2 ? x < z : op == 3 ? x <= z : op == 4 ? x > z : x >= z;
+    } else if (da != 1 && db != 1 && da != 4 && db != 4) {
+        float x = ldf(a, da, oa), z = ldf(b, db, ob);
+        r = op == 0 ? x == z : op == 1 ? x != z : op == 2 ? x < z : op == 3 ? x <= z : op == 4 ? x > z : x >= z;
     } else {
         double x = ld(a, da, oa), z = ld(b, db, ob);
         r = op == 0 ? x == z : op == 1 ? x != z : op == 2 ? x < z : op == 3 ? x <= z : op == 4 ? x > z : x >= z;
@@ -198,8 +222,10 @@ const string& CAST_SRC() {
 extern "C" __global__ void k_cast(const void* a, int da, void* y, int dy, long long n, Index ix) {
     long long i = gid(); if (i >= n) return;
     long long o = at(ix, i);
+    if (da == dy && (da == 0 || da == 5)) { ((int*)y)[i] = ((const int*)a)[o]; return; }   // 4-byte copy
     if (da >= 4 && dy >= 4) sti(y, dy, i, ldi(a, da, o));
-    else st(y, dy, i, ld(a, da, o));
+    else if (da == 1 || dy == 1 || da == 4 || dy == 4) st(y, dy, i, ld(a, da, o));        // float64 / int64: exact
+    else stf(y, dy, i, ldf(a, da, o));
 }
 extern "C" __global__ void k_accumulate(float* g, const void* a, int da, long long n, Index ix) {
     long long i = gid(); if (i >= n) return;
@@ -345,6 +371,66 @@ static TensorPtr f32(const TensorPtr& t, const char* op) {
     return d->dtype() == F32 ? d : cast_op(d, F32);
 }
 
+// The backward of every element-wise op as one kernel: dx from x, y = f(x)
+// and dy. A plain backward used to run each op's gradient formula as ops --
+// ReLU's was a comparison, a cast and a multiply -- three launches and three
+// passes over memory where one does.
+static const string& UNARY_BACK_SRC() {
+    static const string s = src(R"(
+extern "C" __global__ void u_back(int op, const float* x, const float* y, const float* g, float* dx,
+                                  long long n, float p0, float p1) {
+    long long i = gid(); if (i >= n) return;
+    const float v = x[i], o = y[i], d = g[i];
+    float r;
+    switch (op) {
+        case 0:  r = d; break;                                           // x + s, x - s
+        case 1:  r = d * p0; break;                                      // s * x
+        case 2:  r = -d; break;                                          // s - x
+        case 3:  r = -d * p0 / (v * v); break;                           // s / x
+        case 4:  r = d / p0; break;                                      // x / s
+        case 5:  r = d * o; break;                                       // exp
+        case 6:  r = d / v; break;                                       // log
+        case 7:  r = d / (2.0f * o); break;                              // sqrt
+        case 8:  r = v > 0.0f ? d : (v < 0.0f ? -d : 0.0f); break;       // abs
+        case 9:  r = v > 0.0f ? d : 0.0f; break;                         // relu
+        case 10: r = d * o * (1.0f - o); break;                          // sigmoid
+        case 11: r = d * (1.0f - o * o); break;                          // tanh
+        case 12: r = d * p0 * powf(v, p0 - 1.0f); break;                 // pow
+        default: r = (v > p0 && v < p1) ? d : 0.0f; break;               // clip
+    }
+    dx[i] = r;
+}
+)");
+    return s;
+}
+
+static int unary_backward_code(const char* kernel) {
+    static const char* const names[] = {"u_sadd", "u_smul", "u_rsub", "u_rdiv", "u_sdiv", "u_exp", "u_log", "u_sqrt",
+                                        "u_abs", "u_relu", "u_sigmoid", "u_tanh", "u_pow", "u_clip"};
+    static const int codes[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13};
+    const string k = kernel;
+    if (k == "u_ssub") return 0;
+    for (int i = 0; i < 14; i++) if (k == names[i]) return codes[i];
+    return -1;
+}
+
+static TensorPtr unary_backward(int op, const TensorPtr& x0, const TensorPtr& y0, const TensorPtr& G0, float p0, float p1) {
+    auto cont = [](const TensorPtr& t) { return t->is_contiguous() ? t : contiguous(t); };
+    auto x = cont(x0), y = cont(y0);
+    auto G = cont(G0->dtype() == F32 ? G0 : cast_op(G0, F32));
+    auto dx = empty_cuda(x->shape());
+    const void* px = base(x);
+    const void* py = base(y);
+    const void* pg = base(G);
+    void* pd = dx->storage()->data();
+    long long n = x->numel();
+    int o = op;
+    float a = p0, b = p1;
+    void* args[] = {&o, &px, &py, &pg, &pd, &n, &a, &b};
+    cuda::launch(K("u_back", UNARY_BACK_SRC()), n, args);
+    return dx;
+}
+
 TensorPtr unary(const char* kernel, const char* name, const TensorPtr& a0, float p0, float p1,
                 dispatch::Graph1 graph) {
     if (a0->dtype() != F32 && is_floating(a0->dtype()) && a0->dtype() != DType::Bool &&
@@ -360,8 +446,12 @@ TensorPtr unary(const char* kernel, const char* name, const TensorPtr& a0, float
     void* args[] = {&pa, &py, &n, &ix, &p0, &p1};
     cuda::launch(K(kernel, UNARY_SRC()), n, args);
     const bool is_gelu = string(kernel) == "u_gelu";
-    attach(out, {a}, name, [a, graph, is_gelu](const TensorPtr& out, const TensorPtr& G) -> vector<TensorPtr> {
-        if (is_gelu && !grad_enabled()) return {gelu_backward(a, G)};
+    const int back = unary_backward_code(kernel);
+    attach(out, {a}, name, [a, graph, is_gelu, back, p0, p1](const TensorPtr& out, const TensorPtr& G) -> vector<TensorPtr> {
+        if (!grad_enabled()) {
+            if (is_gelu) return {gelu_backward(a, G)};
+            if (back >= 0) return {unary_backward(back, a, out, G, p0, p1)};
+        }
         return {graph(a, out, G)};
     });
     return out;
@@ -399,7 +489,12 @@ TensorPtr binary(int op, const char* name, const TensorPtr& a0, const TensorPtr&
 }
 
 TensorPtr compare(int op, const TensorPtr& a0, const TensorPtr& b0) {
-    auto a = on_device(a0, "compare"), b = on_device(b0, "compare");
+    TensorPtr bb = b0;
+    if (b0->numel() == 1 && b0->dtype() == DType::Float64 && a0->dtype() == F32 && b0->device() == Device::CPU) {
+        const double v = b0->item_double();
+        if ((double)(float)v == v) bb = scalar_tensor(v, F32);
+    }
+    auto a = on_device(a0, "compare"), b = on_device(bb, "compare");
     const Shape shape = broadcast_shapes(a->shape(), b->shape());
     auto out = empty_cuda(shape, DType::Bool);
     Index ia = index_for(a, shape), ib = index_for(b, shape);
@@ -1254,14 +1349,25 @@ extern "C" __global__ void b_gelu(const float* x, const float* dy, float* dx, lo
     const float t = tanhf(k * (v + c * v * v * v));
     dx[i] = dy[i] * (0.5f * (1.0f + t) + 0.5f * v * (1.0f - t * t) * k * (1.0f + 3.0f * c * v * v));
 }
-// embedding: rows of the table by id, and the scatter-add back (ids repeat)
-extern "C" __global__ void b_embed_fwd(const float* w, const long long* ids, float* out, long long rows, long long e) {
-    long long i = gid(); if (i >= rows * e) return;
-    out[i] = w[ids[i / e] * e + i % e];
+// embedding: rows of the table by id, and the scatter-add back (ids repeat).
+// ids come from a device tensor (dtype code dt) or, with mod > 0, are the
+// positions r % mod. Checking range on the host would mean reading the ids
+// back every step; an id outside [0, vocab) reads as a zero row instead.
+__device__ long long emb_id(const void* ids, int dt, long long r, long long mod) {
+    if (mod > 0) return r % mod;
+    return dt == 5 ? (long long)((const int*)ids)[r] : ((const long long*)ids)[r];
 }
-extern "C" __global__ void b_embed_bwd(const float* g, const long long* ids, float* dw, long long rows, long long e) {
+extern "C" __global__ void b_embed_fwd(const float* w, const void* ids, int dt, long long mod, float* out,
+                                       long long rows, long long e, long long vocab) {
     long long i = gid(); if (i >= rows * e) return;
-    atomicAdd(&dw[ids[i / e] * e + i % e], g[i]);
+    const long long id = emb_id(ids, dt, i / e, mod);
+    out[i] = (id < 0 || id >= vocab) ? 0.0f : w[id * e + i % e];
+}
+extern "C" __global__ void b_embed_bwd(const float* g, const void* ids, int dt, long long mod, float* dw,
+                                       long long rows, long long e, long long vocab) {
+    long long i = gid(); if (i >= rows * e) return;
+    const long long id = emb_id(ids, dt, i / e, mod);
+    if (id >= 0 && id < vocab) atomicAdd(&dw[id * e + i % e], g[i]);
 }
 )");
     return s;
@@ -1302,43 +1408,59 @@ TensorPtr gelu_backward(const TensorPtr& x0, const TensorPtr& G0) {
     return dx;
 }
 
-TensorPtr embedding(const TensorPtr& W0, const vector<int64_t>& ids, const Shape& out_shape) {
+// Rows of W by id. `ids` is an int64 / int32 tensor on the device, or null
+// with mod > 0 for positions r % mod. The op form (for recorded gradients)
+// reads the ids back; a plain forward and backward never do.
+TensorPtr embedding_device(const TensorPtr& W0, const TensorPtr& ids, long long mod, long long rows,
+                           const Shape& out_shape) {
     auto W = contiguous_on_device(f32(W0, "Embedding"));
-    long long e = W->shape().back(), rows = (long long)ids.size();
-    auto host = make_shared<Tensor>(Shape{rows}, DType::Int64);
-    if (rows) memcpy(host->storage()->data(), ids.data(), ids.size() * sizeof(int64_t));
-    auto dev_ids = host->to(Device::CUDA);
+    TensorPtr dev_ids = ids ? contiguous_on_device(on_device(ids, "Embedding")) : nullptr;
+    if (dev_ids && dev_ids->dtype() != DType::Int64 && dev_ids->dtype() != DType::Int32)
+        dev_ids = cast_op(dev_ids, DType::Int64);
+    long long e = W->shape().back(), vocab = W->shape()[0];
     auto out = empty_cuda(out_shape);
     const void* pw = base(W);
-    const void* pi = dev_ids->storage()->data();
+    const void* pi = dev_ids ? base(dev_ids) : nullptr;
+    int dt = dev_ids ? (int)dev_ids->dtype() : 4;
     void* po = out->storage()->data();
-    void* args[] = {&pw, &pi, &po, &rows, &e};
+    long long r = rows, md = mod;
+    void* args[] = {&pw, &pi, &dt, &md, &po, &r, &e, &vocab};
     cuda::launch(K("b_embed_fwd", BACKWARD_SRC()), rows * e, args);
     if (W->requires_grad()) {
         auto node = make_node(out, {W});
         node->name = "Embedding";
         // the op form, for gradients that are themselves differentiated
-        autograd::attach_reference(*node, [ids, e, out_shape](const vector<TensorPtr>& in) -> TensorPtr {
-            auto idx = make_shared<vector<int64_t>>(ids.size() * (size_t)e);
-            for (size_t r = 0; r < ids.size(); r++)
-                for (long long d = 0; d < e; d++) (*idx)[r * e + d] = ids[r] * e + d;
+        autograd::attach_reference(*node, [dev_ids, mod, rows, e, out_shape](const vector<TensorPtr>& in) -> TensorPtr {
+            vector<int64_t> host((size_t)rows);
+            if (dev_ids) host = index_values(dev_ids, "Embedding");
+            else for (long long q = 0; q < rows; q++) host[(size_t)q] = q % mod;
+            auto idx = make_shared<vector<int64_t>>((size_t)(rows * e));
+            for (long long q = 0; q < rows; q++)
+                for (long long d = 0; d < e; d++) (*idx)[(size_t)(q * e + d)] = host[(size_t)q] * e + d;
             return gather_flat(in[0], idx, out_shape);
         });
         auto reference = node->backward_graph;
-        node->backward_graph = [reference, dev_ids, rows, e, W](const TensorPtr& out, const TensorPtr& G0) -> vector<TensorPtr> {
+        node->backward_graph = [reference, dev_ids, dt, mod, rows, e, vocab, W](const TensorPtr& out, const TensorPtr& G0) -> vector<TensorPtr> {
             if (grad_enabled()) return reference(out, G0);
             auto G = contiguous_on_device(f32(G0, "Embedding"));
             auto dw = make_shared<Tensor>(W->shape(), F32, Device::CUDA);      // zeroed
             const void* pg = base(G);
-            const void* pi = dev_ids->storage()->data();
+            const void* pi = dev_ids ? base(dev_ids) : nullptr;
             void* pd = dw->storage()->data();
-            long long r = rows, ee = e;
-            void* a[] = {&pg, &pi, &pd, &r, &ee};
-            cuda::launch(K("b_embed_bwd", BACKWARD_SRC()), r * ee, a);
+            int d2 = dt;
+            long long r2 = rows, ee = e, md2 = mod, vv = vocab;
+            void* a[] = {&pg, &pi, &d2, &md2, &pd, &r2, &ee, &vv};
+            cuda::launch(K("b_embed_bwd", BACKWARD_SRC()), r2 * ee, a);
             return {dw};
         };
     }
     return out;
+}
+
+TensorPtr embedding(const TensorPtr& W0, const vector<int64_t>& ids, const Shape& out_shape) {
+    auto host = make_shared<Tensor>(Shape{(int64_t)ids.size()}, DType::Int64);
+    if (!ids.empty()) memcpy(host->storage()->data(), ids.data(), ids.size() * sizeof(int64_t));
+    return embedding_device(W0, host->to(Device::CUDA), 0, (long long)ids.size(), out_shape);
 }
 
 // ── fused attention ──────────────────────────────────────────────────────────

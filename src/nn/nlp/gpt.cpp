@@ -103,8 +103,6 @@ TensorPtr GPT::forward(TensorPtr token_ids) {
     const bool batched = token_ids->dim() == 2;
     const int B = batched ? (int)token_ids->size(0) : 1;
     const int S = (int)token_ids->size(-1);
-    // exact for any dtype: int64 ids are not rounded through a float
-    const vector<int64_t> ids = index_values(token_ids, "GPT::forward");
     int E = embed_dim_;
     int V = vocab_size_;
 
@@ -113,20 +111,19 @@ TensorPtr GPT::forward(TensorPtr token_ids) {
                             + " exceeds max_seq_len " + to_string(max_seq_len_));
 
     if (tok_emb.weight->device() == Device::CUDA) {
-        // on the GPU: the same model written with ops, every one a GPU kernel
-        vector<int64_t> pos((size_t)B * S);
-        for (int r = 0; r < B * S; r++) {
-            if (ids[r] < 0 || ids[r] >= V)
-                throw runtime_error("GPT: token id " + to_string(ids[r]) + " out of range");
-            pos[(size_t)r] = r % S;
-        }
+        // on the GPU: ids read where they are -- never copied back to the host
         const Shape xshape = batched ? Shape{B, S, E} : Shape{S, E};
+        auto ids_dev = token_ids->device() == Device::CUDA ? token_ids : token_ids->to(Device::CUDA);
         auto pw = pos_emb.weight->device() == Device::CUDA ? pos_emb.weight : pos_emb.weight->to(Device::CUDA);
-        auto h = add(cuda_ops::embedding(tok_emb.weight, ids, xshape), cuda_ops::embedding(pw, pos, xshape));
+        auto h = add(cuda_ops::embedding_device(tok_emb.weight, ids_dev, 0, (long long)B * S, xshape),
+                     cuda_ops::embedding_device(pw, nullptr, S, (long long)B * S, xshape));
         for (auto& blk : blocks) h = blk.forward(h);
         h = ln_f.forward(h);
         return matmul(h, transpose(tok_emb.weight));       // weight-tied output projection
     }
+
+    // exact for any dtype: int64 ids are not rounded through a float
+    const vector<int64_t> ids = index_values(token_ids, "GPT::forward");
 
     // ── Input embedding (fused tok + pos, with gradient tracking) ────────────
     // Out[b, t, d] = tok_emb.weight[tok_id, d] + pos_emb.weight[t, d]
