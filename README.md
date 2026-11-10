@@ -278,11 +278,11 @@ pip install nvidia-cudnn-cu12            # Maxwell: nvidia-cudnn-cu12==9.10.2.21
 ```
 
 GPT training step on a GTX 970 (4 layers x 256, batch 8 x 128,
-[tests/bench_gpu_gpt.py](tests/bench_gpu_gpt.py)): Prometheus 26.6 ms
-(38.4k tokens/s), PyTorch 2.14 19.8 ms (51.8k tokens/s), the same step on a
+[tests/bench_gpu_gpt.py](tests/bench_gpu_gpt.py)): Prometheus 25.0 ms
+(41.0k tokens/s), PyTorch 2.14 19.4 ms (52.9k tokens/s), the same step on a
 Ryzen AI 7 350 CPU 208 ms. Small-CNN training step, batch 64 of 32x32
-([tests/bench_gpu_cnn.py](tests/bench_gpu_cnn.py)): Prometheus 6.4-6.6 ms
-with cuDNN, 10.7 ms without, PyTorch 4.9-5.5 ms. The GPU suite is
+([tests/bench_gpu_cnn.py](tests/bench_gpu_cnn.py)): Prometheus 5.8-5.9 ms
+with cuDNN, PyTorch 4.9 ms. The GPU suite is
 [tests/test_cuda.cpp](tests/test_cuda.cpp) and
 [tests/test_cuda.py](tests/test_cuda.py): every op and layer against the CPU,
 forward and gradient; CI has no GPU, so there they build and skip.

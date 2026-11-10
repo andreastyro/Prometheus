@@ -121,6 +121,7 @@ __device__ void stf(void* p, int dt, long long i, float v) {
 }
 // element i of the output, read through a strided / broadcast operand
 __device__ long long at(const Index& ix, long long i) {
+    if (ix.nd < 0) return i;                     // contiguous, same shape
     long long r = i, o = 0;
     for (int d = ix.nd - 1; d >= 0; d--) { long long q = r % ix.shape[d]; r /= ix.shape[d]; o += q * ix.st[d]; }
     return o;
@@ -147,7 +148,26 @@ Index index_for(const TensorPtr& t, const Shape& out) {
         const int k = d - off;
         ix.st[d] = t->shape()[k] == 1 ? 0 : t->strides()[k];
     }
-    return ix;
+    // Merge dimensions the walk crosses as one: d into d+1 when stepping off
+    // the end of d+1 lands where the next d would (broadcast runs merge too).
+    // `at` pays two 64-bit divisions per dimension, which on GeForce cards
+    // made a ReLU three times slower than a copy; a contiguous operand ends
+    // as nd = -1 and indexes with no division at all.
+    Index m{};
+    m.nd = 0;
+    for (int d = 0; d < ix.nd; d++) {
+        if (ix.shape[d] == 1) continue;
+        if (m.nd > 0 && m.st[m.nd - 1] == ix.st[d] * ix.shape[d]) {
+            m.shape[m.nd - 1] *= ix.shape[d];
+            m.st[m.nd - 1] = ix.st[d];
+            continue;
+        }
+        m.shape[m.nd] = ix.shape[d];
+        m.st[m.nd] = ix.st[d];
+        m.nd++;
+    }
+    if (m.nd == 0 || (m.nd == 1 && m.st[0] == 1)) m.nd = -1;
+    return m;
 }
 
 string src(const char* body) { return string(COMMON) + body; }
@@ -380,7 +400,11 @@ static const string& UNARY_BACK_SRC() {
 extern "C" __global__ void u_back(int op, const float* x, const float* y, const float* g, float* dx,
                                   long long n, float p0, float p1) {
     long long i = gid(); if (i >= n) return;
-    const float v = x[i], o = y[i], d = g[i];
+    // load only what the formula reads: `op` is the same for every thread, so
+    // skipped loads cost nothing (ReLU reads x and g, not the output)
+    const bool use_y = op == 5 || op == 7 || op == 10 || op == 11;
+    const bool use_x = op == 3 || op == 6 || op == 8 || op == 9 || op >= 12;
+    const float v = use_x ? x[i] : 0.0f, o = use_y ? y[i] : 0.0f, d = g[i];
     float r;
     switch (op) {
         case 0:  r = d; break;                                           // x + s, x - s
@@ -1867,6 +1891,22 @@ extern "C" __global__ void v_scatter_rows(const float* g, const long long* idx, 
     long long i = gid(); if (i >= n) return;
     atomicAdd(&dx[idx[i]], g[i]);
 }
+// max-pool backward when windows do not overlap (stride >= K): each input
+// element is in at most one window, so it reads that window's gradient if it
+// was the winner and writes 0 otherwise -- every element written once, with
+// no zero-fill and no atomics
+extern "C" __global__ void v_maxpool_back(const float* g, const long long* arg, float* dx, long long planes,
+                                          long long H, long long W, int K, int s, long long Ho, long long Wo) {
+    long long i = gid(); if (i >= planes * H * W) return;
+    const long long xx = i % W, y = (i / W) % H, pl = i / (W * H);
+    const long long oy = y / s, ox = xx / s;
+    float r = 0.0f;
+    if (oy < Ho && ox < Wo && y - oy * s < K && xx - ox * s < K) {
+        const long long o = (pl * Ho + oy) * Wo + ox;
+        if (arg[o] == i) r = g[o];
+    }
+    dx[i] = r;
+}
 extern "C" __global__ void v_avgpool(const float* x, float* y, long long planes, long long H, long long W,
                                      int K, int s, long long Ho, long long Wo) {
     long long i = gid(); if (i >= planes * Ho * Wo) return;
@@ -2124,8 +2164,19 @@ TensorPtr maxpool2d(const TensorPtr& x0, int K, int stride) {
     };
     const int64_t nin = x->numel();
     const Shape xshape = x->shape();
-    attach_fused(y, {x0}, "MaxPool2D", reference, [arg, nin, xshape](const TensorPtr& G0) -> vector<TensorPtr> {
+    attach_fused(y, {x0}, "MaxPool2D", reference, [=](const TensorPtr& G0) -> vector<TensorPtr> {
         auto G = contiguous_on_device(f32(G0, "MaxPool2D"));
+        if (stride >= K) {
+            auto dx = empty_cuda(xshape);
+            const void* pg = base(G);
+            const void* pa = arg->storage()->data();
+            void* pd = dx->storage()->data();
+            long long pls = planes, h = H, w = W, ho = Ho, wo = Wo;
+            int k2 = K, s2 = stride;
+            void* a[] = {&pg, &pa, &pd, &pls, &h, &w, &k2, &s2, &ho, &wo};
+            cuda::launch(VK("v_maxpool_back"), dx->numel(), a);
+            return {dx};
+        }
         auto dx = make_shared<Tensor>(xshape, F32, Device::CUDA);        // zeroed
         const void* pg = base(G);
         const void* pa = arg->storage()->data();

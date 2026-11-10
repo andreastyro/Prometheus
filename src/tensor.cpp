@@ -545,6 +545,16 @@ void Tensor::accumulate_grad(const TensorPtr& g) {
     if (g->numel() != numel_)
         throw runtime_error("accumulate_grad: " + to_string(g->numel()) + " values for " +
                             to_string(numel_) + " elements");
+    // A first gradient that nothing else holds -- a fresh float32 buffer of
+    // exactly this size -- becomes the gradient buffer itself: no zeroed
+    // buffer, no add pass. Most intermediates get exactly one gradient, so
+    // this removes two memory passes per node of a GPU backward.
+    if (device() == Device::CUDA && !grad_dev_ && g->device() == Device::CUDA && g->dtype() == DType::Float32 &&
+        g->is_contiguous() && g->offset() == 0 && g.use_count() == 1 && g->storage().use_count() == 1 &&
+        g->storage()->nbytes() == (size_t)numel_ * sizeof(float)) {
+        grad_dev_ = g->storage();
+        return;
+    }
     ensure_grad();
     if (device() == Device::CUDA) {
         cuda_ops::accumulate(grad_dev_->data(), numel_, g->device() == Device::CUDA ? g : g->to(Device::CUDA));
