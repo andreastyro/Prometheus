@@ -21,6 +21,7 @@ ap.add_argument("--layers", type=int, default=4)
 ap.add_argument("--batch", type=int, default=8)
 ap.add_argument("--steps", type=int, default=20)
 ap.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
+ap.add_argument("--rope", action="store_true", help="RoPE instead of learned positions (Prometheus only; PyTorch keeps its learned positions)")
 ap.add_argument("--issue", action="store_true", help="also time how long the CPU takes to issue a step (before waiting for the GPU)")
 args = ap.parse_args()
 
@@ -35,7 +36,7 @@ if args.lib == "prometheus":
     import prometheus as p
     print("prometheus:", p.cuda_status() if args.device == "cuda" else p.backend())
     p.Tensor.manual_seed(0)
-    model = p.GPT(args.vocab, args.seq, args.embed, args.heads, args.layers)
+    model = p.GPT(args.vocab, args.seq, args.embed, args.heads, args.layers, rope=args.rope)
     if args.device == "cuda":
         model.cuda()
     opt = p.AdamW(model.parameters(), 3e-4)

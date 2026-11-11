@@ -141,10 +141,12 @@ TensorPtr MultiHeadAttention::forward_rows(TensorPtr input, int batch) {
             return matmul(O, in[4]);
         };
     if (input->device() == Device::CUDA || W_q->device() == Device::CUDA) {
-        if (rope_) return reference({input, W_q, W_k, W_v, W_o});     // RoPE: the op form
-        // the fused GPU kernel reads every head straight out of the projections
+        // Q, K and V in one gemm against the weights side by side (concat_op's
+        // backward hands each weight its columns of the gradient); the fused
+        // kernel reads every head in place, RoPE included
         auto x3 = reshape(input, {(int64_t)B, (int64_t)S, (int64_t)E});
-        auto o = cuda_ops::attention(matmul(x3, W_q), matmul(x3, W_k), matmul(x3, W_v), H, causal_);
+        auto qkv = matmul(x3, concat_op({W_q, W_k, W_v}, 1));
+        auto o = cuda_ops::attention_qkv(qkv, H, causal_, rope_);
         return matmul(reshape(o, {(int64_t)B * S, (int64_t)E}), W_o);
     }
 

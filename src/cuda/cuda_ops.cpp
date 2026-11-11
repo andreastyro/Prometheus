@@ -721,7 +721,16 @@ extern "C" __global__ void i_slab(const unsigned char* src, unsigned char* dst, 
                                   long long span, long long row, long long offset, int es) {
     long long i = gid(); if (i >= outer * span) return;
     long long o = i / span, j = i % span;
+    if (es == 4) { ((float*)dst)[o * row + offset + j] = ((const float*)src)[i]; return; }
     for (int b = 0; b < es; b++) dst[(o * row + offset + j) * es + b] = src[i * es + b];
+}
+// the reverse: one input's slab read back out of the concatenation
+extern "C" __global__ void i_unslab(const unsigned char* src, unsigned char* dst, long long outer,
+                                    long long span, long long row, long long offset, int es) {
+    long long i = gid(); if (i >= outer * span) return;
+    long long o = i / span, j = i % span;
+    if (es == 4) { ((float*)dst)[i] = ((const float*)src)[o * row + offset + j]; return; }
+    for (int b = 0; b < es; b++) dst[i * es + b] = src[(o * row + offset + j) * es + b];
 }
 )");
     return s;
@@ -858,9 +867,22 @@ TensorPtr concat(const vector<TensorPtr>& inputs0, int axis) {
     attach(out, c, "concat_op", [c, outer, inner, total, axis](const TensorPtr&, const TensorPtr& G) -> vector<TensorPtr> {
         vector<TensorPtr> parts;
         int64_t off = 0;
+        // a plain backward copies each slab out with one kernel; the gather
+        // (an index list built and uploaded every call) only when recorded
+        const bool plain = !grad_enabled() && G->dtype() == F32;
+        auto Gc = plain ? contiguous_on_device(G) : G;
         for (auto& t : c) {
             const int64_t len = t->shape()[axis];
-            if (t->requires_grad()) {
+            if (t->requires_grad() && plain) {
+                auto part = empty_cuda(t->shape());
+                long long o_ = outer, span = len * inner, row = total * inner, offset = off * inner;
+                int es = 4;
+                const void* ps = base(Gc);
+                void* pd = part->storage()->data();
+                void* args[] = {&ps, &pd, &o_, &span, &row, &offset, &es};
+                cuda::launch(K("i_unslab", INDEX_SRC()), o_ * span, args);
+                parts.push_back(part);
+            } else if (t->requires_grad()) {
                 auto idx = make_shared<vector<int64_t>>();
                 idx->reserve((size_t)t->numel());
                 for (int64_t o = 0; o < outer; o++)
@@ -1624,6 +1646,183 @@ TensorPtr attention(const TensorPtr& q0, const TensorPtr& k0, const TensorPtr& v
             }
             return {q->requires_grad() ? dQ : nullptr, k->requires_grad() ? dK : nullptr,
                     v->requires_grad() ? dV : nullptr};
+        };
+    }
+    return O;
+}
+
+// Attention straight from one fused projection: qkv [B, S, 3E] holds Q, K and
+// V side by side in each row (x @ [W_q W_k W_v], a single gemm), and every
+// head is read in place at row stride 3E. With RoPE, one kernel writes the
+// rotated Q and K (positions restart at 0 in each sequence) and the scores use
+// those; the backward rotates their gradients back in place. The gradient is
+// a single [B, S, 3E] tensor laid out like qkv.
+
+static const string& ROPE_SRC() {
+    static const string s = src(R"(
+// pair i of head h at row (b, t): rotate (v[2i], v[2i+1]) by t * 10000^(-2i/D).
+// sign +1 rotates (forward), -1 the inverse (backward). src / dst row strides.
+__device__ void rope_pair(float* c, float* s, int t, int i, int D, float sign) {
+    const float theta = powf(10000.0f, -2.0f * (float)i / (float)D);
+    const float angle = (float)t * theta;
+    *c = cosf(angle); *s = sign * sinf(angle);
+}
+extern "C" __global__ void a_rope(const float* qkv, float* Q, float* K, long long rows, int S, int E, int D) {
+    long long n = gid(); const int half = E / 2; if (n >= rows * half) return;
+    const long long r = n / half; const int p = (int)(n % half);         // pair p of the row's E dims
+    const int h = p / (D / 2), i = p % (D / 2), t = (int)(r % S);
+    const long long col = (long long)h * D + 2 * i;
+    float c, s; rope_pair(&c, &s, t, i, D, 1.0f);
+    const float* src = qkv + r * 3 * E;
+    const float q0 = src[col], q1 = src[col + 1], k0 = src[E + col], k1 = src[E + col + 1];
+    Q[r * E + col] = q0 * c - q1 * s;  Q[r * E + col + 1] = q0 * s + q1 * c;
+    K[r * E + col] = k0 * c - k1 * s;  K[r * E + col + 1] = k0 * s + k1 * c;
+}
+// the inverse rotation, in place on the Q and K thirds of dqkv [rows, 3E]
+extern "C" __global__ void a_rope_back(float* g, long long rows, int S, int E, int D) {
+    long long n = gid(); const int half = E / 2; if (n >= rows * half) return;
+    const long long r = n / half; const int p = (int)(n % half);
+    const int h = p / (D / 2), i = p % (D / 2), t = (int)(r % S);
+    const long long col = (long long)h * D + 2 * i;
+    float c, s; rope_pair(&c, &s, t, i, D, -1.0f);
+    float* row = g + r * 3 * E;
+    for (int part = 0; part < 2; part++) {
+        float* v = row + part * E + col;
+        const float a = v[0], b = v[1];
+        v[0] = a * c - b * s; v[1] = a * s + b * c;
+    }
+}
+)");
+    return s;
+}
+
+TensorPtr attention_qkv(const TensorPtr& qkv0, int heads, bool causal, bool rope) {
+    auto qkv = contiguous_on_device(f32(qkv0, "attention"));
+    if (qkv->dim() != 3 || qkv->size(2) % 3 != 0)
+        throw runtime_error("attention: qkv must be [batch, seq, 3 * embed]");
+    const int64_t B = qkv->size(0), S = qkv->size(1), E = qkv->size(2) / 3, H = heads, D = E / H;
+    if (D * H != E) throw runtime_error("attention: embed must divide by heads");
+    if (rope && D % 2) throw runtime_error("attention: RoPE needs an even head size");
+    const float scale = 1.0f / std::sqrt((float)D);
+    const int64_t E3 = 3 * E, rows = B * S;
+    const float* px = static_cast<const float*>(base(qkv));
+    // Q and K as the scores read them: in place in qkv, or rotated copies
+    TensorPtr Qr, Kr;
+    const float *pq = px, *pk = px + E;
+    int64_t lqk = E3;
+    if (rope) {
+        Qr = empty_cuda({B, S, E});
+        Kr = empty_cuda({B, S, E});
+        float* q = static_cast<float*>(Qr->storage()->data());
+        float* k = static_cast<float*>(Kr->storage()->data());
+        long long rr = rows;
+        int s_ = (int)S, e_ = (int)E, d_ = (int)D;
+        void* a[] = {&px, &q, &k, &rr, &s_, &e_, &d_};
+        cuda::launch(K("a_rope", ROPE_SRC()), rows * (E / 2), a);
+        pq = q; pk = k; lqk = E;
+    }
+    const float* pv = px + 2 * E;
+    auto P = empty_cuda({B, H, S, S});
+    auto O = empty_cuda({B, S, E});
+    float* pp = static_cast<float*>(P->storage()->data());
+    float* po = static_cast<float*>(O->storage()->data());
+    const int s_ = (int)S, d_ = (int)D, e_ = (int)E, h_ = (int)H, lq = (int)lqk, l3 = (int)E3;
+    for (int64_t b = 0; b < B; b++)       // scores = Q K^T, every head of sequence b
+        cuda::sgemm_batched(false, true, s_, s_, d_, 1.0f, pq + b * S * lqk, lq, D, pk + b * S * lqk, lq, D,
+                            0.0f, pp + b * H * S * S, s_, S * S, h_);
+    long long cols = S;
+    int cz = causal ? 1 : 0;
+    float sc = scale;
+    void* a1[] = {&pp, &cols, &sc, &cz};
+    if (B * H * S) cuda::launch(K("a_softmax", ATTN_SRC()), (unsigned)(B * H * S), 1, 1, 256, 1, 1, 0, a1);
+    for (int64_t b = 0; b < B; b++)       // O = P V, written into the heads' columns
+        cuda::sgemm_batched(false, false, s_, d_, s_, 1.0f, pp + b * H * S * S, s_, S * S, pv + b * S * E3, l3, D,
+                            0.0f, po + b * S * E, e_, D, h_);
+
+    if (qkv->requires_grad()) {
+        auto node = make_node(O, {qkv});
+        node->name = "attention";
+        // the op form: what higher-order gradients differentiate
+        autograd::attach_reference(*node, [B, S, E, H, D, scale, causal, rope](const vector<TensorPtr>& in) -> TensorPtr {
+            auto part = [&](int k) {           // [B, S, E] third k of the rows
+                auto idx = make_shared<vector<int64_t>>((size_t)(B * S * E));
+                for (int64_t r = 0; r < B * S; r++)
+                    for (int64_t j = 0; j < E; j++) (*idx)[(size_t)(r * E + j)] = r * 3 * E + k * E + j;
+                return gather_flat(in[0], idx, Shape{B, S, E});
+            };
+            auto heads_of = [&](const TensorPtr& t) { return permute(reshape(t, {B, S, H, D}), {0, 2, 1, 3}); };
+            auto Q = heads_of(part(0)), Kh = heads_of(part(1)), V = heads_of(part(2));
+            if (rope) {
+                // a constant per-position rotation: v' = v @ R_t
+                vector<float> R((size_t)(S * D * D), 0.0f);
+                for (int64_t t = 0; t < S; t++)
+                    for (int64_t i = 0; i < D / 2; i++) {
+                        const float theta = powf(10000.0f, -2.0f * (float)i / (float)D), angle = (float)t * theta;
+                        const float c = cosf(angle), sn = sinf(angle);
+                        float* r = R.data() + t * D * D;
+                        r[(2 * i) * D + 2 * i] = c;       r[(2 * i) * D + 2 * i + 1] = sn;
+                        r[(2 * i + 1) * D + 2 * i] = -sn; r[(2 * i + 1) * D + 2 * i + 1] = c;
+                    }
+                auto Rt = make_shared<Tensor>(Shape{S, D, D}, R)->to(Device::CUDA);
+                Q = reshape(::matmul(reshape(Q, {B, H, S, 1, D}), Rt), {B, H, S, D});
+                Kh = reshape(::matmul(reshape(Kh, {B, H, S, 1, D}), Rt), {B, H, S, D});
+            }
+            auto scores = multiply(scale, ::matmul(Q, transpose(Kh)));
+            if (causal) {
+                vector<float> m((size_t)(S * S), 0.0f);
+                for (int64_t i = 0; i < S; i++) for (int64_t j = i + 1; j < S; j++) m[(size_t)(i * S + j)] = -1e9f;
+                scores = add(scores, make_shared<Tensor>(Shape{S, S}, m)->to(Device::CUDA));
+            }
+            auto o = ::matmul(::softmax(scores), V);
+            return reshape(permute(o, {0, 2, 1, 3}), {B, S, E});
+        });
+        auto reference = node->backward_graph;
+        node->backward_graph = [reference, qkv, Qr, Kr, P, B, S, E, H, D, scale, rope](
+                                   const TensorPtr& out, const TensorPtr& G0) -> vector<TensorPtr> {
+            if (grad_enabled()) return reference(out, G0);
+            auto G = contiguous_on_device(f32(G0, "attention"));
+            const int64_t E3 = 3 * E;
+            auto dP = empty_cuda({B, H, S, S});
+            auto dX = empty_cuda({B, S, E3});
+            const float* px = static_cast<const float*>(base(qkv));
+            const float* pq = rope ? static_cast<const float*>(base(Qr)) : px;
+            const float* pk = rope ? static_cast<const float*>(base(Kr)) : px + E;
+            const int64_t lqk = rope ? E : E3;
+            const float* pv = px + 2 * E;
+            const float* pp = static_cast<const float*>(base(P));
+            const float* pg = static_cast<const float*>(base(G));
+            float* pdp = static_cast<float*>(dP->storage()->data());
+            float* pdq = static_cast<float*>(dX->storage()->data());
+            float* pdk = pdq + E;
+            float* pdv = pdq + 2 * E;
+            const int s_ = (int)S, d_ = (int)D, e_ = (int)E, h_ = (int)H, lq = (int)lqk, l3 = (int)E3;
+            for (int64_t b = 0; b < B; b++) {
+                const int64_t gb = b * S * E, xb = b * S * E3, pb = b * H * S * S;
+                // dV = P^T dO;  dP = dO V^T
+                cuda::sgemm_batched(true, false, s_, d_, s_, 1.0f, pp + pb, s_, S * S, pg + gb, e_, D,
+                                    0.0f, pdv + xb, l3, D, h_);
+                cuda::sgemm_batched(false, true, s_, s_, d_, 1.0f, pg + gb, e_, D, pv + xb, l3, D,
+                                    0.0f, pdp + pb, s_, S * S, h_);
+            }
+            long long cols = S;
+            float sc = scale;
+            void* a2[] = {&pp, &pdp, &cols, &sc};
+            if (B * H * S) cuda::launch(K("a_softmax_back", ATTN_SRC()), (unsigned)(B * H * S), 1, 1, 256, 1, 1, 0, a2);
+            for (int64_t b = 0; b < B; b++) {
+                const int64_t xb = b * S * E3, qb = b * S * lqk, pb = b * H * S * S;
+                // dQ = dS K;  dK = dS^T Q   (in the rotated space under RoPE)
+                cuda::sgemm_batched(false, false, s_, d_, s_, 1.0f, pdp + pb, s_, S * S, pk + qb, lq, D,
+                                    0.0f, pdq + xb, l3, D, h_);
+                cuda::sgemm_batched(true, false, s_, d_, s_, 1.0f, pdp + pb, s_, S * S, pq + qb, lq, D,
+                                    0.0f, pdk + xb, l3, D, h_);
+            }
+            if (rope) {
+                long long rr = B * S;
+                int s2 = (int)S, e2 = (int)E, d2 = (int)D;
+                void* a3[] = {&pdq, &rr, &s2, &e2, &d2};
+                cuda::launch(K("a_rope_back", ROPE_SRC()), B * S * (E / 2), a3);
+            }
+            return {dX};
         };
     }
     return O;

@@ -145,6 +145,9 @@ TensorPtr embedding_device(const TensorPtr& W, const TensorPtr& ids, long long m
                            const Shape& out_shape);
 /// softmax(Q K^T / sqrt(D) + causal mask) V per head; q, k, v and the result [B, S, E]
 TensorPtr attention(const TensorPtr& q, const TensorPtr& k, const TensorPtr& v, int heads, bool causal);
+/// The same from one fused projection qkv [B, S, 3E] (Q, K, V side by side per
+/// row), with RoPE applied to Q and K inside when `rope`; the result [B, S, E]
+TensorPtr attention_qkv(const TensorPtr& qkv, int heads, bool causal, bool rope);
 /// gelu(z + b), b along the last dim, one kernel each way
 TensorPtr bias_gelu(const TensorPtr& z, const TensorPtr& b);
 /// y + b + r in one kernel

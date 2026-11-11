@@ -285,7 +285,15 @@ int main() {
             xa->set_requires_grad(true);
             xb->set_requires_grad(true);
             CHECK_NEAR("second derivative through the fused attention", rel(second(xb, mg), second(xa, mc)), 0.0f, 1e-4f);
+            // and with RoPE inside the kernel, non-causal
+            Tensor::manual_seed(32);
+            MultiHeadAttention rc(16, 4, false, true);
+            Tensor::manual_seed(32);
+            MultiHeadAttention rg(16, 4, false, true);
+            rg.to(Device::CUDA);
+            CHECK_NEAR("second derivative through attention with RoPE", rel(second(xb, rg), second(xa, rc)), 0.0f, 1e-4f);
         }
+        layer_check("attention with RoPE, not causal", [] { return std::make_shared<MultiHeadAttention>(16, 4, false, true); }, x3, 1e-5f);
         {
             // a whole transformer block: residual + norm, bias + GELU and bias + residual fused;
             // first derivative through the fused kernels, second through their op form

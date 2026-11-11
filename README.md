@@ -278,9 +278,10 @@ pip install nvidia-cudnn-cu12            # Maxwell: nvidia-cudnn-cu12==9.10.2.21
 ```
 
 GPT training step on a GTX 970 (4 layers x 256, batch 8 x 128,
-[tests/bench_gpu_gpt.py](tests/bench_gpu_gpt.py)): Prometheus 25.0 ms
-(41.0k tokens/s), PyTorch 2.14 19.4 ms (52.9k tokens/s), the same step on a
-Ryzen AI 7 350 CPU 208 ms. Small-CNN training step, batch 64 of 32x32
+[tests/bench_gpu_gpt.py](tests/bench_gpu_gpt.py)): Prometheus 24.6 ms
+(41.6k tokens/s), PyTorch 2.14 19.5 ms (52.4k tokens/s), the same step on a
+Ryzen AI 7 350 CPU 208 ms; with RoPE (`--rope`, applied inside the fused
+attention kernel) 25.2 ms. Attention projects Q, K and V in one gemm. Small-CNN training step, batch 64 of 32x32
 ([tests/bench_gpu_cnn.py](tests/bench_gpu_cnn.py)): Prometheus 5.8-5.9 ms
 with cuDNN, PyTorch 4.9 ms. Recurrent layers run fused on the GPU (one gemm
 and one gate kernel per step, backward through time on the device); a training
