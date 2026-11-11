@@ -263,6 +263,12 @@ them (`cuda_has_tensor_cores`, `cuda_has_bf16`, `cuda_cudnn_available`). `cuda_m
 memory held by tensors, its peak and the allocator's cache; running out names
 the sizes involved. `cuda_set_device(i)` or `PROMETHEUS_CUDA_DEVICE` picks a
 GPU. `PROMETHEUS_PROFILE_BACKWARD=1` prints the backward pass's time by op.
+Compiled kernels -- machine code for the GPU present -- are kept on disk
+(`%LOCALAPPDATA%\prometheus\kernels`, `~/.cache/prometheus/kernels`;
+`PROMETHEUS_KERNEL_CACHE` names another folder, `0` turns it off), so a later
+process starts without compiling: the first GPT and CNN steps of a process
+take 0.3 s on a GTX 970, 4.5 s with nothing cached
+([tests/bench_gpu_startup.py](tests/bench_gpu_startup.py)).
 
 cuDNN is optional: with it installed, `Conv2D` and `ConvTranspose2D` run on
 its kernels; without it, or with `PROMETHEUS_CUDNN=0`, they run on the

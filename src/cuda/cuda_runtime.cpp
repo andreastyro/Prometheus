@@ -5,10 +5,14 @@
 #include "ml/cuda.hpp"
 #include <algorithm>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <sstream>
 #include <map>
 #include <mutex>
 #include <stdexcept>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 
@@ -22,6 +26,7 @@
     #include <windows.h>
 #else
     #include <dlfcn.h>
+    #include <sys/stat.h>
 #endif
 
 using namespace std;
@@ -82,6 +87,9 @@ struct Nvrtc {
     const char* (*nvrtcGetErrorString)(int);
     int (*nvrtcGetNumSupportedArchs)(int*);          // optional (CUDA 11.2+)
     int (*nvrtcGetSupportedArchs)(int*);             // optional
+    int (*nvrtcVersion)(int*, int*);                 // optional: part of the disk cache key
+    int (*nvrtcGetCUBINSize)(nvrtcProgram, size_t*); // optional (CUDA 11.1+): machine code
+    int (*nvrtcGetCUBIN)(nvrtcProgram, char*);
 };
 
 struct State {
@@ -120,6 +128,8 @@ struct KernelKeyHash {
     }
 };
 unordered_map<KernelKey, CUfunction, KernelKeyHash> g_kernels;
+// one module per source text: a source holding many kernels is compiled once
+unordered_map<const char*, CUmodule> g_modules;
 mutex                         g_kernel_mu;
 map<size_t, vector<CUdeviceptr>> g_pool;   // idle blocks by size
 size_t                        g_pool_bytes = 0;
@@ -270,6 +280,9 @@ void init_nvrtc_locked() {
     if (!all) { g.nvrtc_why = "NVRTC is missing an entry point"; return; }
     bind(lib, r.nvrtcGetNumSupportedArchs, "nvrtcGetNumSupportedArchs");
     bind(lib, r.nvrtcGetSupportedArchs, "nvrtcGetSupportedArchs");
+    bind(lib, r.nvrtcVersion, "nvrtcVersion");
+    if (!bind(lib, r.nvrtcGetCUBINSize, "nvrtcGetCUBINSize") || !bind(lib, r.nvrtcGetCUBIN, "nvrtcGetCUBIN"))
+        r.nvrtcGetCUBIN = nullptr;
 
     // the newest architecture NVRTC can target that this GPU can run
     g.arch = g.cc;
@@ -290,17 +303,123 @@ void init_nvrtc_locked() {
     g.nvrtc_ok = true;
 }
 
-CUfunction compile(const Kernel& k) {
+// ── the kernel disk cache ────────────────────────────────────────────────────
+//
+// Each source is compiled once per process, all its kernels in one module.
+// NVRTC compiles straight to this GPU's machine code (a cubin) when it can:
+// loading PTX made the driver translate it on every first use -- 25-35 ms per
+// source, most of a cold start, and its own cache did not remove it. The
+// result is kept on disk, keyed by a hash of the source, the target and the
+// NVRTC version, so a later process neither compiles nor translates.
+// $PROMETHEUS_KERNEL_CACHE picks the folder, or "0" turns the cache off; by
+// default %LOCALAPPDATA%\prometheus\kernels or ~/.cache/prometheus/kernels.
+
+uint64_t fnv1a(const string& s) {
+    uint64_t h = 1469598103934665603ull;
+    for (unsigned char c : s) { h ^= c; h *= 1099511628211ull; }
+    return h;
+}
+
+string cache_dir() {
+    static const string dir = [] {
+        string env = getenv("PROMETHEUS_KERNEL_CACHE") ? getenv("PROMETHEUS_KERNEL_CACHE") : "";
+        // trimmed: cmd's `set X= ` leaves a space behind
+        env.erase(0, env.find_first_not_of(" \t"));
+        env.erase(env.find_last_not_of(" \t") + 1);
+        if (env == "0") return string();
+        if (!env.empty()) return env;
+#ifdef _WIN32
+        const char* base = getenv("LOCALAPPDATA");
+        return base ? string(base) + "\\prometheus\\kernels" : string();
+#else
+        if (const char* x = getenv("XDG_CACHE_HOME")) if (*x) return string(x) + "/prometheus/kernels";
+        const char* home = getenv("HOME");
+        return home ? string(home) + "/.cache/prometheus/kernels" : string();
+#endif
+    }();
+    return dir;
+}
+
+// machine code for this GPU: NVRTC can emit it, and its newest target shares
+// the GPU's major version (sm_XY code runs on X.Y and later X.*)
+bool use_cubin() { return g.r.nvrtcGetCUBIN && g.arch / 10 == g.cc / 10; }
+
+string cache_path(const char* source) {
+    const string dir = cache_dir();
+    if (dir.empty()) return {};
+    int major = 0, minor = 0;
+    if (g.r.nvrtcVersion) g.r.nvrtcVersion(&major, &minor);
+    // the leading tag changes whenever the compile options below do
+    const bool bin = use_cubin();
+    const string key = string(bin ? "v2 sm_" : "v2 compute_") + to_string(g.arch) + " nvrtc " + to_string(major) +
+                       "." + to_string(minor) + "\n" + source;
+    char name[48];
+    std::snprintf(name, sizeof name, "%016llx.%s", (unsigned long long)fnv1a(key), bin ? "cubin" : "ptx");
+    return dir + "/" + name;
+}
+
+string read_file(const string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return {};
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
+}
+
+// every folder on the way to `dir` (std::filesystem would raise the macOS
+// deployment target the wheels build for)
+void make_dirs(const string& dir) {
+    for (size_t i = 1; i <= dir.size(); i++) {
+        if (i < dir.size() && dir[i] != '/' && dir[i] != '\\') continue;
+        const string part = dir.substr(0, i);
+#ifdef _WIN32
+        CreateDirectoryA(part.c_str(), nullptr);
+#else
+        mkdir(part.c_str(), 0755);
+#endif
+    }
+}
+
+// written beside its final name and renamed into place, so a reader never
+// sees half a file and two processes writing at once both end up correct
+void write_file(const string& path, const string& data) {
+    make_dirs(path.substr(0, path.find_last_of("/\\")));
+    const string tmp = path + "." + to_string(std::hash<std::thread::id>()(std::this_thread::get_id())) + ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::binary);
+        if (!out) return;
+        out.write(data.data(), (std::streamsize)data.size());
+        if (!out) { out.close(); std::remove(tmp.c_str()); return; }
+    }
+    // replacing what is there: a damaged file is rewritten, and a racing
+    // process wrote the same bytes (std::rename will not replace on Windows)
+#ifdef _WIN32
+    const bool moved = MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+#else
+    const bool moved = std::rename(tmp.c_str(), path.c_str()) == 0;
+#endif
+    if (!moved) std::remove(tmp.c_str());
+}
+
+// the module image for a source -- a cubin, or PTX -- from the disk cache, or
+// compiled by NVRTC (and cached)
+string ptx_for(const char* source, const char* name, bool use_cache) {
     {
         lock_guard<mutex> lock(g_mu);
         init_nvrtc_locked();
         if (!g.nvrtc_ok) throw runtime_error("cuda: cannot compile kernels: " + g.nvrtc_why);
     }
+    const string path = use_cache ? cache_path(source) : string();
+    if (!path.empty()) {
+        string ptx = read_file(path);
+        if (!ptx.empty()) return ptx;
+    }
     const Nvrtc& r = g.r;
     nvrtcProgram prog = nullptr;
-    int rc = r.nvrtcCreateProgram(&prog, k.source, k.name, 0, nullptr, nullptr);
+    int rc = r.nvrtcCreateProgram(&prog, source, name, 0, nullptr, nullptr);
     if (rc != 0) throw runtime_error(string("cuda: nvrtcCreateProgram: ") + r.nvrtcGetErrorString(rc));
-    const string arch = "--gpu-architecture=compute_" + to_string(g.arch);
+    const bool bin = use_cubin();
+    const string arch = (bin ? "--gpu-architecture=sm_" : "--gpu-architecture=compute_") + to_string(g.arch);
     const char* opts[] = {arch.c_str(), "--std=c++14", "-default-device"};
     rc = r.nvrtcCompileProgram(prog, 3, opts);
     if (rc != 0) {
@@ -309,19 +428,46 @@ CUfunction compile(const Kernel& k) {
         string log(n, '\0');
         if (n) r.nvrtcGetProgramLog(prog, &log[0]);
         r.nvrtcDestroyProgram(&prog);
-        throw runtime_error(string("cuda: compiling kernel '") + k.name + "' failed:\n" + log);
+        throw runtime_error(string("cuda: compiling kernel '") + name + "' failed:\n" + log);
     }
     size_t n = 0;
-    r.nvrtcGetPTXSize(prog, &n);
-    string ptx(n, '\0');
-    r.nvrtcGetPTX(prog, &ptx[0]);
+    string ptx;
+    if (bin) {
+        r.nvrtcGetCUBINSize(prog, &n);
+        ptx.assign(n, '\0');
+        r.nvrtcGetCUBIN(prog, &ptx[0]);
+    } else {
+        r.nvrtcGetPTXSize(prog, &n);
+        ptx.assign(n, '\0');
+        r.nvrtcGetPTX(prog, &ptx[0]);
+        while (!ptx.empty() && ptx.back() == '\0') ptx.pop_back();
+    }
     r.nvrtcDestroyProgram(&prog);
+    if (!path.empty()) write_file(path, ptx);
+    return ptx;
+}
 
+// the module holding every kernel of `source`, compiled (or read) once
+CUmodule module_for(const Kernel& k) {
+    {
+        lock_guard<mutex> lock(g_kernel_mu);
+        auto it = g_modules.find(k.source);
+        if (it != g_modules.end()) return it->second;
+    }
     CUmodule mod = nullptr;
-    check(g.d.cuModuleLoadData(&mod, ptx.c_str()), "cuModuleLoadData");
-    CUfunction fn = nullptr;
-    check(g.d.cuModuleGetFunction(&fn, mod, k.name), "cuModuleGetFunction");
-    return fn;
+    string ptx = ptx_for(k.source, k.name, true);
+    if (g.d.cuModuleLoadData(&mod, ptx.c_str()) != 0) {
+        // a damaged cache file: compile afresh (which rewrites it)
+        ptx = ptx_for(k.source, k.name, false);
+        const string path = cache_path(k.source);
+        if (!path.empty()) write_file(path, ptx);
+        check(g.d.cuModuleLoadData(&mod, ptx.c_str()), "cuModuleLoadData");
+    }
+    lock_guard<mutex> lock(g_kernel_mu);
+    auto it = g_modules.find(k.source);
+    if (it != g_modules.end()) return it->second;    // another thread got there first
+    g_modules[k.source] = mod;
+    return mod;
 }
 
 CUfunction function(const Kernel& k) {
@@ -332,7 +478,9 @@ CUfunction function(const Kernel& k) {
         auto it = g_kernels.find(key);
         if (it != g_kernels.end()) return it->second;
     }
-    CUfunction fn = compile(k);
+    CUmodule mod = module_for(k);
+    CUfunction fn = nullptr;
+    check(g.d.cuModuleGetFunction(&fn, mod, k.name), "cuModuleGetFunction");
     lock_guard<mutex> lock(g_kernel_mu);
     g_kernels[key] = fn;
     return fn;
