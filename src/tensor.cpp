@@ -484,6 +484,7 @@ void Tensor::set_grad(const vector<float>& g) {
                             to_string(numel_) + " elements");
     if (device() == Device::CUDA) {
         ensure_grad();
+        grad_zero_ = false;                // overwritten whole
         cuda::copy_to_device(grad_dev_->data(), g.data(), g.size() * sizeof(float));
         return;
     }
@@ -506,10 +507,21 @@ void Tensor::ensure_grad() {
         grad_.assign((size_t)numel_, 0.0f);
 }
 
+// the zeros zero_grad() promised, written now that something reads them
+void Tensor::settle_grad() const {
+    if (!grad_zero_) return;
+    grad_zero_ = false;
+    if (grad_dev_) cuda::memset_zero(grad_dev_->data(), grad_dev_->nbytes());
+}
+
 void Tensor::zero_grad() {
     if (device() == Device::CUDA) {
+        // No memset: the buffer is marked, and the next backward's first
+        // gradient replaces it outright (accumulate_grad) -- a parameter's
+        // gradient was a clear, then a read-add-write pass: 3.3 ms of a 24 ms
+        // GPT step on a GTX 970
         if (!grad_dev_) ensure_grad();
-        else cuda::memset_zero(grad_dev_->data(), grad_dev_->nbytes());
+        else grad_zero_ = true;
         return;
     }
     if (dtype() == DType::Float64) { grad64_.assign((size_t)numel_, 0.0); return; }
@@ -519,6 +531,7 @@ void Tensor::zero_grad() {
 vector<double> Tensor::grad_doubles() const {
     if (device() == Device::CUDA) {
         if (!grad_dev_) return {};
+        settle_grad();
         vector<float> h((size_t)numel_);
         cuda::copy_to_host(h.data(), grad_dev_->data(), h.size() * sizeof(float));
         return vector<double>(h.begin(), h.end());
@@ -529,8 +542,10 @@ vector<double> Tensor::grad_doubles() const {
 
 TensorPtr Tensor::grad_tensor() const {
     if (!has_grad()) return nullptr;
-    if (device() == Device::CUDA)      // a view of the device buffer, no copy
+    if (device() == Device::CUDA) {    // a view of the device buffer, no copy
+        settle_grad();
         return make_shared<Tensor>(grad_dev_, shape_, contiguous_strides(shape_), 0);
+    }
     if (dtype() == DType::Float64) {
         auto t = make_shared<Tensor>(shape_, DType::Float64);
         if (numel_) memcpy(t->storage()->data(), grad64_.data(), (size_t)numel_ * sizeof(double));
@@ -549,14 +564,17 @@ void Tensor::accumulate_grad(const TensorPtr& g) {
     // exactly this size -- becomes the gradient buffer itself: no zeroed
     // buffer, no add pass. Most intermediates get exactly one gradient, so
     // this removes two memory passes per node of a GPU backward.
-    if (device() == Device::CUDA && !grad_dev_ && g->device() == Device::CUDA && g->dtype() == DType::Float32 &&
-        g->is_contiguous() && g->offset() == 0 && g.use_count() == 1 && g->storage().use_count() == 1 &&
-        g->storage()->nbytes() == (size_t)numel_ * sizeof(float)) {
+    // A buffer zero_grad() marked counts as empty here.
+    if (device() == Device::CUDA && (!grad_dev_ || grad_zero_) && g->device() == Device::CUDA &&
+        g->dtype() == DType::Float32 && g->is_contiguous() && g->offset() == 0 && g.use_count() == 1 &&
+        g->storage().use_count() == 1 && g->storage()->nbytes() == (size_t)numel_ * sizeof(float)) {
         grad_dev_ = g->storage();
+        grad_zero_ = false;
         return;
     }
     ensure_grad();
     if (device() == Device::CUDA) {
+        settle_grad();
         cuda_ops::accumulate(grad_dev_->data(), numel_, g->device() == Device::CUDA ? g : g->to(Device::CUDA));
         return;
     }
@@ -697,6 +715,7 @@ void Tensor::move_to_(Device target) {
     grad_.reset();
     grad64_.clear();
     grad_dev_.reset();
+    grad_zero_ = false;
     if (requires_grad_) ensure_grad();
 }
 
@@ -729,7 +748,7 @@ void Tensor::backward() {
             "either a leaf, or it was produced while gradients were disabled "
             "(NoGrad / no_grad()).");
 
-    if (device() == Device::CUDA) { ensure_grad(); cuda_ops::fill(grad_dev_->data(), numel_, 1.0f); }
+    if (device() == Device::CUDA) { ensure_grad(); grad_zero_ = false; cuda_ops::fill(grad_dev_->data(), numel_, 1.0f); }
     else if (dtype() == DType::Float64) grad64_.assign((size_t)numel_, 1.0);
     else grad_.assign((size_t)numel_, 1.0f);
 

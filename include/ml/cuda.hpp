@@ -134,4 +134,37 @@ void dnn_conv_forward(const ConvShape& s, const float* x, const float* w, float*
 void dnn_conv_backward_data(const ConvShape& s, const float* w, const float* dy, float* dx);
 void dnn_conv_backward_filter(const ConvShape& s, const float* x, const float* dy, float* dw);
 
+// ── kernel profiler ──────────────────────────────────────────────────────────
+//
+// GPU time per kernel, gemm and cuDNN call, measured with events on the
+// stream (nothing synchronises per op). On with PROMETHEUS_PROFILE_KERNELS=1
+// or profile(true); profile_report() waits for the GPU and sums by name.
+
+void profile(bool on);
+bool profiling();
+void profile_reset();
+struct ProfEntry {
+    std::string name;
+    double ms = 0.0;
+    int calls = 0;
+};
+/// Slowest first.
+std::vector<ProfEntry> profile_entries();
+/// A table of the `top` slowest (all when 0), with each one's share.
+std::string profile_report(int top = 0);
+
+/// Times what is queued between its construction and destruction, when
+/// profiling. For the library's own calls into cuBLAS / cuDNN / kernels.
+class ProfScope {
+public:
+    explicit ProfScope(const char* name);
+    explicit ProfScope(const std::string& name);
+    ~ProfScope();
+    ProfScope(const ProfScope&) = delete;
+    ProfScope& operator=(const ProfScope&) = delete;
+private:
+    std::string name_;
+    void* a_ = nullptr;
+};
+
 } // namespace cuda

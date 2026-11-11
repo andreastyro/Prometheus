@@ -359,6 +359,18 @@ PYBIND11_MODULE(_C, m) {
           "Tensor cores (compute 7.0+): float16 matmuls run on them.");
     m.def("cuda_has_bf16", &cuda::has_bf16,
           "bfloat16 matmuls in hardware (compute 8.0+); older GPUs compute them in float32.");
+    m.def("cuda_profile", &cuda::profile, py::arg("on") = true,
+          "Time every GPU kernel, gemm and cuDNN call with events on the stream (or "
+          "PROMETHEUS_PROFILE_KERNELS=1); cuda_profile_report() sums them.");
+    m.def("cuda_profile_reset", &cuda::profile_reset, "Drop the profiler's records so far.");
+    m.def("cuda_profile_report", &cuda::profile_report, py::arg("top") = 0,
+          "GPU time by kernel, slowest first, with each one's share; waits for the GPU.");
+    m.def("cuda_profile_entries", []() {
+              py::list out;
+              for (auto& e : cuda::profile_entries()) out.append(py::make_tuple(e.name, e.ms, e.calls));
+              return out;
+          },
+          "The profile as (name, ms, calls), slowest first.");
     m.def("cuda_cudnn_available", &cuda::dnn_available,
           "True when cuDNN loaded (pip install nvidia-cudnn-cu12); convolutions then run on it.");
     m.def("cuda_cudnn_status", &cuda::dnn_status,

@@ -291,6 +291,11 @@ private:
     FloatBuffer               grad_;
     std::vector<double>       grad64_;     // float64 tensors only
     std::shared_ptr<Storage>  grad_dev_;   // GPU tensors: float32 gradient on the device
+    // GPU: grad_dev_ holds zeros in meaning only -- zero_grad() marks it
+    // instead of clearing it, so the first gradient of the next backward can
+    // simply take the buffer's place; anything that reads it clears it first
+    mutable bool              grad_zero_ = false;
+    void settle_grad() const;
     std::shared_ptr<GradNode> grad_fn_;
 };
 

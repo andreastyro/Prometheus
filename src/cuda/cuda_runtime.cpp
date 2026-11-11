@@ -66,6 +66,11 @@ struct Driver {
                                unsigned, unsigned, CUstream, void**, void**);
     CUresult (*cuGetErrorString)(CUresult, const char**);
     CUresult (*cuMemGetInfo)(size_t*, size_t*);
+    // optional: the kernel profiler's GPU timestamps
+    CUresult (*cuEventCreate)(void**, unsigned);
+    CUresult (*cuEventRecord)(void*, CUstream);
+    CUresult (*cuEventElapsedTime)(float*, void*, void*);
+    CUresult (*cuEventDestroy)(void*);
     CUresult (*cuStreamCreate)(CUstream*, unsigned);
     CUresult (*cuStreamSynchronize)(CUstream);
     CUresult (*cuMemcpyHtoDAsync)(CUdeviceptr, const void*, size_t, CUstream);
@@ -207,6 +212,9 @@ void init_locked() {
         bind(lib, d.cuModuleGetFunction, "cuModuleGetFunction") &&
         bind(lib, d.cuLaunchKernel, "cuLaunchKernel") && bind(lib, d.cuGetErrorString, "cuGetErrorString") &&
         bind(lib, d.cuMemGetInfo, "cuMemGetInfo_v2") &&
+        (bind(lib, d.cuEventCreate, "cuEventCreate") || true) && (bind(lib, d.cuEventRecord, "cuEventRecord") || true) &&
+        (bind(lib, d.cuEventElapsedTime, "cuEventElapsedTime") || true) &&
+        (bind(lib, d.cuEventDestroy, "cuEventDestroy_v2") || true) &&
         bind(lib, d.cuStreamCreate, "cuStreamCreate") && bind(lib, d.cuStreamSynchronize, "cuStreamSynchronize") &&
         bind(lib, d.cuMemcpyHtoDAsync, "cuMemcpyHtoDAsync_v2") && bind(lib, d.cuMemcpyDtoHAsync, "cuMemcpyDtoHAsync_v2") &&
         bind(lib, d.cuMemcpyDtoDAsync, "cuMemcpyDtoDAsync_v2") && bind(lib, d.cuMemsetD8Async, "cuMemsetD8Async");
@@ -750,6 +758,7 @@ void sgemm(bool ta, bool tb, int m, int n, int k, float alpha, const float* a, i
            const float* b, int ldb, float beta, float* c, int ldc) {
     if (m == 0 || n == 0) return;
     auto h = blas_handle();
+    ProfScope p(profiling() ? string("sgemm ") + (ta ? "T" : "N") + (tb ? "T" : "N") + " " + to_string(m) + "x" + to_string(n) + "x" + to_string(k) : string());
     check_blas(g_blas.sgemm(h, tb ? 1 : 0, ta ? 1 : 0, n, m, k, &alpha, b, ldb, a, lda, &beta, c, ldc), "sgemm");
 }
 
@@ -758,6 +767,7 @@ void sgemm_batched(bool ta, bool tb, int m, int n, int k, float alpha, const flo
                    long long sc, int batch) {
     if (m == 0 || n == 0 || batch == 0) return;
     auto h = blas_handle();
+    ProfScope p(profiling() ? string("sgemm_batched ") + (ta ? "T" : "N") + (tb ? "T" : "N") + " " + to_string(m) + "x" + to_string(n) + "x" + to_string(k) + " *" + to_string(batch) : string());
     check_blas(g_blas.sgemm_batched(h, tb ? 1 : 0, ta ? 1 : 0, n, m, k, &alpha, b, ldb, sb, a, lda, sa,
                                     &beta, c, ldc, sc, batch), "sgemm (batched)");
 }
@@ -775,6 +785,7 @@ void gemm_half(bool ta, bool tb, int m, int n, int k, DType dtype, const void* a
         throw runtime_error("gemm_half: bfloat16 matmuls need compute 8.0 or newer");
     auto h = blas_handle();
     const float alpha = 1.0f, beta = 0.0f;
+    ProfScope p(profiling() ? string("gemm_half ") + (ta ? "T" : "N") + (tb ? "T" : "N") + " " + to_string(m) + "x" + to_string(n) + "x" + to_string(k) + " *" + to_string(batch) : string());
     check_blas(g_blas.gemm_ex(h, tb ? 1 : 0, ta ? 1 : 0, n, m, k, &alpha, b, type, ldb, sb, a, type, lda, sa,
                               &beta, c, 0, ldc, sc, batch, 68, -1), "GemmEx");
 }
@@ -1010,6 +1021,7 @@ void dnn_conv_forward(const ConvShape& s, const float* x, const float* w, float*
     DnnPlan& p = dnn_plan(s);
     Workspace ws(p.fwd_ws);
     const float one = 1.0f, zero = 0.0f;
+    ProfScope ps("cudnn conv forward");
     check_dnn(g_dnn.fwd(g_dnn_handle, &one, p.x, x, p.w, w, p.conv, p.fwd_algo, ws.p, ws.n, &zero, p.y, y),
               "convolution forward");
 }
@@ -1019,6 +1031,7 @@ void dnn_conv_backward_data(const ConvShape& s, const float* w, const float* dy,
     DnnPlan& p = dnn_plan(s);
     Workspace ws(p.data_ws);
     const float one = 1.0f, zero = 0.0f;
+    ProfScope ps("cudnn conv backward data");
     check_dnn(g_dnn.bwd_data(g_dnn_handle, &one, p.w, w, p.y, dy, p.conv, p.data_algo, ws.p, ws.n, &zero, p.x, dx),
               "convolution backward data");
 }
@@ -1028,8 +1041,101 @@ void dnn_conv_backward_filter(const ConvShape& s, const float* x, const float* d
     DnnPlan& p = dnn_plan(s);
     Workspace ws(p.filter_ws);
     const float one = 1.0f, zero = 0.0f;
+    ProfScope ps("cudnn conv backward filter");
     check_dnn(g_dnn.bwd_filter(g_dnn_handle, &one, p.x, x, p.y, dy, p.conv, p.filter_algo, ws.p, ws.n, &zero, p.w, dw),
               "convolution backward filter");
+}
+
+// ── kernel profiler ──────────────────────────────────────────────────────────
+//
+// With profiling on, every kernel launch, cuBLAS call and cuDNN call is
+// bracketed by a pair of GPU events on the stream, so its time is what the
+// GPU spent on it -- no synchronising per op, which on Windows inflates every
+// small op by the driver's submission latency. The report sums by name.
+
+namespace {
+struct ProfRecord { string name; void* a; void* b; };
+vector<ProfRecord> g_prof;
+vector<void*>      g_event_pool;
+mutex              g_prof_mu;
+bool               g_prof_on = [] {
+    const char* e = getenv("PROMETHEUS_PROFILE_KERNELS");
+    return e && *e && string(e) != "0";
+}();
+
+void* take_event() {
+    if (!g_event_pool.empty()) { void* e = g_event_pool.back(); g_event_pool.pop_back(); return e; }
+    void* e = nullptr;
+    if (g.d.cuEventCreate(&e, 0) != 0) return nullptr;
+    return e;
+}
+} // namespace
+
+ProfScope::ProfScope(const char* name) {
+    if (!g_prof_on || !g.d.cuEventRecord) return;
+    lock_guard<mutex> lock(g_prof_mu);
+    a_ = take_event();
+    if (!a_) return;
+    name_ = name;
+    g.d.cuEventRecord(a_, g.stream);
+}
+ProfScope::ProfScope(const string& name) : ProfScope(name.c_str()) {}
+ProfScope::~ProfScope() {
+    if (!a_) return;
+    lock_guard<mutex> lock(g_prof_mu);
+    void* b = take_event();
+    if (!b) { g_event_pool.push_back(a_); return; }
+    g.d.cuEventRecord(b, g.stream);
+    g_prof.push_back({name_, a_, b});
+}
+
+void profile(bool on) {
+    lock_guard<mutex> lock(g_prof_mu);
+    g_prof_on = on;
+}
+bool profiling() { return g_prof_on; }
+
+void profile_reset() {
+    if (available()) synchronize();
+    lock_guard<mutex> lock(g_prof_mu);
+    for (auto& r : g_prof) { g_event_pool.push_back(r.a); g_event_pool.push_back(r.b); }
+    g_prof.clear();
+}
+
+vector<ProfEntry> profile_entries() {
+    if (available()) synchronize();
+    lock_guard<mutex> lock(g_prof_mu);
+    std::map<string, ProfEntry> by;
+    for (auto& r : g_prof) {
+        float ms = 0.0f;
+        if (g.d.cuEventElapsedTime(&ms, r.a, r.b) != 0) continue;
+        auto& e = by[r.name];
+        e.name = r.name;
+        e.ms += ms;
+        e.calls++;
+    }
+    vector<ProfEntry> out;
+    for (auto& [k, v] : by) out.push_back(v);
+    std::sort(out.begin(), out.end(), [](const ProfEntry& x, const ProfEntry& y) { return x.ms > y.ms; });
+    return out;
+}
+
+string profile_report(int top) {
+    auto rows = profile_entries();
+    double total = 0.0;
+    for (auto& r : rows) total += r.ms;
+    string out;
+    char line[256];
+    std::snprintf(line, sizeof line, "GPU time %.2f ms over %zu kinds\n", total, rows.size());
+    out += line;
+    int k = 0;
+    for (auto& r : rows) {
+        if (top > 0 && k++ >= top) break;
+        std::snprintf(line, sizeof line, "  %-44s %9.3f ms %5.1f%% %6d calls\n", r.name.c_str(), r.ms,
+                      total > 0 ? 100.0 * r.ms / total : 0.0, r.calls);
+        out += line;
+    }
+    return out;
 }
 
 void launch(const Kernel& k, int64_t n, void** args, unsigned block) {
@@ -1041,6 +1147,7 @@ void launch(const Kernel& k, int64_t n, void** args, unsigned block) {
 void launch(const Kernel& k, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by,
             unsigned bz, unsigned shared, void** args) {
     CUfunction fn = function(k);
+    ProfScope p(k.name);
     check(g.d.cuLaunchKernel(fn, gx, gy, gz, bx, by, bz, shared, g.stream, args, nullptr),
           (string("launching ") + k.name).c_str());
 }

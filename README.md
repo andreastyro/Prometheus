@@ -263,6 +263,11 @@ them (`cuda_has_tensor_cores`, `cuda_has_bf16`, `cuda_cudnn_available`). `cuda_m
 memory held by tensors, its peak and the allocator's cache; running out names
 the sizes involved. `cuda_set_device(i)` or `PROMETHEUS_CUDA_DEVICE` picks a
 GPU. `PROMETHEUS_PROFILE_BACKWARD=1` prints the backward pass's time by op.
+`p.cuda_profile()` (or `PROMETHEUS_PROFILE_KERNELS=1`) times every kernel, gemm
+and cuDNN call on the GPU itself, with events on the stream rather than a sync
+per op, and `p.cuda_profile_report()` sums them by name;
+[tests/profile_gpu_gpt.py](tests/profile_gpu_gpt.py) sets it against
+`torch.profiler` on the same model.
 Compiled kernels -- machine code for the GPU present -- are kept on disk
 (`%LOCALAPPDATA%\prometheus\kernels`, `~/.cache/prometheus/kernels`;
 `PROMETHEUS_KERNEL_CACHE` names another folder, `0` turns it off), so a later
@@ -284,8 +289,8 @@ pip install nvidia-cudnn-cu12            # Maxwell: nvidia-cudnn-cu12==9.10.2.21
 ```
 
 GPT training step on a GTX 970 (4 layers x 256, batch 8 x 128,
-[tests/bench_gpu_gpt.py](tests/bench_gpu_gpt.py)): Prometheus 24.6 ms
-(41.6k tokens/s), PyTorch 2.14 19.5 ms (52.4k tokens/s), the same step on a
+[tests/bench_gpu_gpt.py](tests/bench_gpu_gpt.py)): Prometheus 21.2 ms
+(48.2k tokens/s), PyTorch 2.14 19.4 ms (52.8k tokens/s), the same step on a
 Ryzen AI 7 350 CPU 208 ms; with RoPE (`--rope`, applied inside the fused
 attention kernel) 25.2 ms. Attention projects Q, K and V in one gemm. Small-CNN training step, batch 64 of 32x32
 ([tests/bench_gpu_cnn.py](tests/bench_gpu_cnn.py)): Prometheus 5.8-5.9 ms

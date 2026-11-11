@@ -1329,48 +1329,42 @@ void scale_inplace(float* a, int64_t n, float c) {
 
 static const string& BACKWARD_SRC() {
     static const string s = src(R"(
-// LayerNorm, one block per row: dx, and the row's mean and 1/std for the
-// gamma / beta column sums.  dx = inv * (g*dy - mean(g*dy) - xhat * mean(g*dy*xhat))
+// LayerNorm backward, one warp per row (8 rows to a block), sums by shuffles:
+// dx, and the row's mean and 1/std for the gamma / beta column sums.
+//   dx = inv * (g*dy - mean(g*dy) - xhat * mean(g*dy*xhat))
+// A block per row spent most of its time in __syncthreads on rows of a few
+// hundred: 2x PyTorch's time on a GTX 970.
+__device__ float ln_warp_sum(float v) {
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
+}
 extern "C" __global__ void b_layernorm_rows(const float* x, const float* g, const float* dy, float* dx,
-                                            float* mean_out, float* inv_out, long long cols, float eps) {
-    __shared__ float s[256];
-    __shared__ float s2[256];
-    const float* xr = x + (long long)blockIdx.x * cols;
-    const float* dyr = dy + (long long)blockIdx.x * cols;
-    float* dxr = dx + (long long)blockIdx.x * cols;
+                                            float* mean_out, float* inv_out, long long cols, float eps,
+                                            long long rows) {
+    const long long r = (long long)blockIdx.x * 8 + (threadIdx.x >> 5);
+    if (r >= rows) return;
+    const int lane = threadIdx.x & 31;
+    const float* xr = x + r * cols;
+    const float* dyr = dy + r * cols;
+    float* dxr = dx + r * cols;
     float t = 0.0f;
-    for (long long j = threadIdx.x; j < cols; j += blockDim.x) t += xr[j];
-    s[threadIdx.x] = t;
-    __syncthreads();
-    for (int w = blockDim.x / 2; w > 0; w >>= 1) { if (threadIdx.x < w) s[threadIdx.x] += s[threadIdx.x + w]; __syncthreads(); }
-    const float mean = s[0] / (float)cols;
-    __syncthreads();
+    for (long long j = lane; j < cols; j += 32) t += xr[j];
+    const float mean = ln_warp_sum(t) / (float)cols;
     t = 0.0f;
-    for (long long j = threadIdx.x; j < cols; j += blockDim.x) { float d = xr[j] - mean; t += d * d; }
-    s[threadIdx.x] = t;
-    __syncthreads();
-    for (int w = blockDim.x / 2; w > 0; w >>= 1) { if (threadIdx.x < w) s[threadIdx.x] += s[threadIdx.x + w]; __syncthreads(); }
-    const float inv = rsqrtf(s[0] / (float)cols + eps);
-    __syncthreads();
+    for (long long j = lane; j < cols; j += 32) { const float d = xr[j] - mean; t += d * d; }
+    const float inv = rsqrtf(ln_warp_sum(t) / (float)cols + eps);
     float a = 0.0f, b = 0.0f;
-    for (long long j = threadIdx.x; j < cols; j += blockDim.x) {
+    for (long long j = lane; j < cols; j += 32) {
         const float gd = g[j] * dyr[j];
         a += gd;
         b += gd * (xr[j] - mean) * inv;
     }
-    s[threadIdx.x] = a;
-    s2[threadIdx.x] = b;
-    __syncthreads();
-    for (int w = blockDim.x / 2; w > 0; w >>= 1) {
-        if (threadIdx.x < w) { s[threadIdx.x] += s[threadIdx.x + w]; s2[threadIdx.x] += s2[threadIdx.x + w]; }
-        __syncthreads();
-    }
-    const float m1 = s[0] / (float)cols, m2 = s2[0] / (float)cols;
-    for (long long j = threadIdx.x; j < cols; j += blockDim.x) {
+    const float m1 = ln_warp_sum(a) / (float)cols, m2 = ln_warp_sum(b) / (float)cols;
+    for (long long j = lane; j < cols; j += 32) {
         const float xh = (xr[j] - mean) * inv;
         dxr[j] = inv * (g[j] * dyr[j] - m1 - xh * m2);
     }
-    if (threadIdx.x == 0) { mean_out[blockIdx.x] = mean; inv_out[blockIdx.x] = inv; }
+    if (lane == 0) { mean_out[r] = mean; inv_out[r] = inv; }
 }
 // gamma / beta gradients: a thread per (chunk of 32 rows, column), added
 // atomically -- one thread per column left most of the GPU idle
@@ -1435,8 +1429,8 @@ vector<TensorPtr> layernorm_backward(const TensorPtr& x0, const TensorPtr& g0, c
     void* pi = inv->storage()->data();
     void* pdg = dg->storage()->data();
     void* pdb = db->storage()->data();
-    void* a1[] = {&px, &pg, &pd, &pdx, &pm, &pi, &cols, &eps};
-    if (rows) cuda::launch(K("b_layernorm_rows", BACKWARD_SRC()), (unsigned)rows, 1, 1, 256, 1, 1, 0, a1);
+    void* a1[] = {&px, &pg, &pd, &pdx, &pm, &pi, &cols, &eps, &rows};
+    if (rows) cuda::launch(K("b_layernorm_rows", BACKWARD_SRC()), (unsigned)((rows + 7) / 8), 1, 1, 256, 1, 1, 0, a1);
     void* a2[] = {&px, &pd, &pm, &pi, &pdg, &pdb, &rows, &cols};
     cuda::launch(K("b_layernorm_cols", BACKWARD_SRC()), cols * ((rows + 31) / 32), a2);
     return {dx, dg, db};
@@ -1523,42 +1517,48 @@ TensorPtr embedding(const TensorPtr& W0, const vector<int64_t>& ids, const Shape
 static const string& ATTN_SRC() {
     static const string s = src(R"(
 // rows of S scores: P = softmax(scale * s), with j > i masked when causal; in place
-extern "C" __global__ void a_softmax(float* sc, long long cols, float scale, int causal) {
-    __shared__ float s[256];
-    float* row = sc + (long long)blockIdx.x * cols;
-    const long long i = blockIdx.x % cols;              // the query's position
+// One warp per row (8 rows to a 256-thread block), reductions by shuffles:
+// a block per row left most of its threads idle on rows of a few hundred and
+// spent its time in __syncthreads -- 4x slower than PyTorch's on a GTX 970.
+__device__ float warp_max(float v) {
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    return v;
+}
+__device__ float warp_sum(float v) {
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
+}
+// rows of S scores: P = softmax(scale * s), with j > i masked when causal; in place
+extern "C" __global__ void a_softmax(float* sc, long long cols, float scale, int causal, long long rows) {
+    const long long r = (long long)blockIdx.x * 8 + (threadIdx.x >> 5);
+    if (r >= rows) return;
+    const int lane = threadIdx.x & 31;
+    float* row = sc + r * cols;
+    const long long i = r % cols;                       // the query's position
     const long long last = causal ? i : cols - 1;
     float m = -3.402823466e38f;
-    for (long long j = threadIdx.x; j <= last; j += blockDim.x) m = fmaxf(m, row[j] * scale);
-    s[threadIdx.x] = m;
-    __syncthreads();
-    for (int w = blockDim.x / 2; w > 0; w >>= 1) { if (threadIdx.x < w) s[threadIdx.x] = fmaxf(s[threadIdx.x], s[threadIdx.x + w]); __syncthreads(); }
-    m = s[0];
-    __syncthreads();
+    for (long long j = lane; j <= last; j += 32) m = fmaxf(m, row[j] * scale);
+    m = warp_max(m);
     float t = 0.0f;
-    for (long long j = threadIdx.x; j < cols; j += blockDim.x) {
+    for (long long j = lane; j < cols; j += 32) {
         const float e = j <= last ? expf(row[j] * scale - m) : 0.0f;
         row[j] = e;
         t += e;
     }
-    s[threadIdx.x] = t;
-    __syncthreads();
-    for (int w = blockDim.x / 2; w > 0; w >>= 1) { if (threadIdx.x < w) s[threadIdx.x] += s[threadIdx.x + w]; __syncthreads(); }
-    const float inv = 1.0f / s[0];
-    for (long long j = threadIdx.x; j < cols; j += blockDim.x) row[j] *= inv;
+    const float inv = 1.0f / warp_sum(t);
+    for (long long j = lane; j < cols; j += 32) row[j] *= inv;
 }
 // dS = scale * P * (dP - sum(dP * P)) per row, in place on dP
-extern "C" __global__ void a_softmax_back(const float* P, float* dP, long long cols, float scale) {
-    __shared__ float s[256];
-    const float* p = P + (long long)blockIdx.x * cols;
-    float* d = dP + (long long)blockIdx.x * cols;
+extern "C" __global__ void a_softmax_back(const float* P, float* dP, long long cols, float scale, long long rows) {
+    const long long r = (long long)blockIdx.x * 8 + (threadIdx.x >> 5);
+    if (r >= rows) return;
+    const int lane = threadIdx.x & 31;
+    const float* p = P + r * cols;
+    float* d = dP + r * cols;
     float t = 0.0f;
-    for (long long j = threadIdx.x; j < cols; j += blockDim.x) t += d[j] * p[j];
-    s[threadIdx.x] = t;
-    __syncthreads();
-    for (int w = blockDim.x / 2; w > 0; w >>= 1) { if (threadIdx.x < w) s[threadIdx.x] += s[threadIdx.x + w]; __syncthreads(); }
-    const float dot = s[0];
-    for (long long j = threadIdx.x; j < cols; j += blockDim.x) d[j] = scale * p[j] * (d[j] - dot);
+    for (long long j = lane; j < cols; j += 32) t += d[j] * p[j];
+    const float dot = warp_sum(t);
+    for (long long j = lane; j < cols; j += 32) d[j] = scale * p[j] * (d[j] - dot);
 }
 )");
     return s;
@@ -1586,8 +1586,9 @@ TensorPtr attention(const TensorPtr& q0, const TensorPtr& k0, const TensorPtr& v
     long long cols = S;
     int cz = causal ? 1 : 0;
     float sc = scale;
-    void* a1[] = {&pp, &cols, &sc, &cz};
-    if (B * H * S) cuda::launch(K("a_softmax", ATTN_SRC()), (unsigned)(B * H * S), 1, 1, 256, 1, 1, 0, a1);
+    long long nrows = B * H * S;
+    void* a1[] = {&pp, &cols, &sc, &cz, &nrows};
+    if (B * H * S) cuda::launch(K("a_softmax", ATTN_SRC()), (unsigned)((B * H * S + 7) / 8), 1, 1, 256, 1, 1, 0, a1);
     for (int64_t b = 0; b < B; b++)       // O = P V, written into the heads' columns
         cuda::sgemm_batched(false, false, s_, d_, s_, 1.0f, pp + b * H * S * S, s_, S * S, pv + b * S * E, e_, D,
                             0.0f, po + b * S * E, e_, D, h_);
@@ -1634,8 +1635,9 @@ TensorPtr attention(const TensorPtr& q0, const TensorPtr& k0, const TensorPtr& v
             }
             long long cols = S;
             float sc = scale;
-            void* a2[] = {&pp, &pdp, &cols, &sc};
-            if (B * H * S) cuda::launch(K("a_softmax_back", ATTN_SRC()), (unsigned)(B * H * S), 1, 1, 256, 1, 1, 0, a2);
+            long long nrows = B * H * S;
+            void* a2[] = {&pp, &pdp, &cols, &sc, &nrows};
+            if (B * H * S) cuda::launch(K("a_softmax_back", ATTN_SRC()), (unsigned)((B * H * S + 7) / 8), 1, 1, 256, 1, 1, 0, a2);
             for (int64_t b = 0; b < B; b++) {
                 const int64_t ob = b * S * E, pb = b * H * S * S;
                 // dQ = dS K;  dK = dS^T Q
@@ -1733,8 +1735,9 @@ TensorPtr attention_qkv(const TensorPtr& qkv0, int heads, bool causal, bool rope
     long long cols = S;
     int cz = causal ? 1 : 0;
     float sc = scale;
-    void* a1[] = {&pp, &cols, &sc, &cz};
-    if (B * H * S) cuda::launch(K("a_softmax", ATTN_SRC()), (unsigned)(B * H * S), 1, 1, 256, 1, 1, 0, a1);
+    long long nrows = B * H * S;
+    void* a1[] = {&pp, &cols, &sc, &cz, &nrows};
+    if (B * H * S) cuda::launch(K("a_softmax", ATTN_SRC()), (unsigned)((B * H * S + 7) / 8), 1, 1, 256, 1, 1, 0, a1);
     for (int64_t b = 0; b < B; b++)       // O = P V, written into the heads' columns
         cuda::sgemm_batched(false, false, s_, d_, s_, 1.0f, pp + b * H * S * S, s_, S * S, pv + b * S * E3, l3, D,
                             0.0f, po + b * S * E, e_, D, h_);
@@ -1806,8 +1809,9 @@ TensorPtr attention_qkv(const TensorPtr& qkv0, int heads, bool causal, bool rope
             }
             long long cols = S;
             float sc = scale;
-            void* a2[] = {&pp, &pdp, &cols, &sc};
-            if (B * H * S) cuda::launch(K("a_softmax_back", ATTN_SRC()), (unsigned)(B * H * S), 1, 1, 256, 1, 1, 0, a2);
+            long long nrows = B * H * S;
+            void* a2[] = {&pp, &pdp, &cols, &sc, &nrows};
+            if (B * H * S) cuda::launch(K("a_softmax_back", ATTN_SRC()), (unsigned)((B * H * S + 7) / 8), 1, 1, 256, 1, 1, 0, a2);
             for (int64_t b = 0; b < B; b++) {
                 const int64_t xb = b * S * E3, qb = b * S * lqk, pb = b * H * S * S;
                 // dQ = dS K;  dK = dS^T Q   (in the rotated space under RoPE)
