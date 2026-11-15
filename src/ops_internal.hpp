@@ -122,6 +122,9 @@ TensorPtr concat(const std::vector<TensorPtr>& inputs, int axis);
 TensorPtr matmul(const TensorPtr& a, const TensorPtr& b);
 /// mean over rows of -log softmax(logits)[target]
 TensorPtr cross_entropy(const TensorPtr& logits, const std::vector<int>& targets);
+/// The same with the targets as an int64 / int32 tensor (on either device) --
+/// on the GPU they are never read back; an out-of-range target's loss is NaN
+TensorPtr cross_entropy_targets(const TensorPtr& logits, const TensorPtr& targets);
 /// LayerNorm forward over the last dim, one fused kernel (no graph)
 TensorPtr layernorm(const TensorPtr& x, const TensorPtr& gamma, const TensorPtr& beta, float eps);
 /// float32 mask of `shape`: 0 with probability `rate`, else 1/(1-rate). Philox, keyed by `seed`.
@@ -160,10 +163,9 @@ TensorPtr embedding(const TensorPtr& W, const std::vector<int64_t>& ids, const S
 /// mod > 0 for positions r % mod: no host round trip.
 TensorPtr embedding_device(const TensorPtr& W, const TensorPtr& ids, long long mod, long long rows,
                            const Shape& out_shape);
-/// softmax(Q K^T / sqrt(D) + causal mask) V per head; q, k, v and the result [B, S, E]
-TensorPtr attention(const TensorPtr& q, const TensorPtr& k, const TensorPtr& v, int heads, bool causal);
-/// The same from one fused projection qkv [B, S, 3E] (Q, K, V side by side per
-/// row), with RoPE applied to Q and K inside when `rope`; the result [B, S, E]
+/// softmax(Q K^T / sqrt(D) + causal mask) V per head, from one fused projection
+/// qkv [B, S, 3E] (Q, K, V side by side per row), with RoPE applied to Q and K
+/// inside when `rope`; the result [B, S, E]
 TensorPtr attention_qkv(const TensorPtr& qkv, int heads, bool causal, bool rope);
 /// gelu(z + b), b along the last dim, one kernel each way
 TensorPtr bias_gelu(const TensorPtr& z, const TensorPtr& b);

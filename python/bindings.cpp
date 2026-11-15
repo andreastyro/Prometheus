@@ -486,8 +486,14 @@ PYBIND11_MODULE(_C, m) {
     m.def("cross_entropy_loss",      &cross_entropy_loss);
     m.def("cross_entropy_sparse",    &cross_entropy_sparse,
           py::arg("logits"), py::arg("target_idx"));
-    m.def("cross_entropy_sparse_seq",&cross_entropy_sparse_seq,
+    m.def("cross_entropy_sparse_seq",
+          py::overload_cast<TensorPtr, const std::vector<int>&>(&cross_entropy_sparse_seq),
           py::arg("logits"), py::arg("targets"));
+    m.def("cross_entropy_sparse_seq",
+          py::overload_cast<TensorPtr, TensorPtr>(&cross_entropy_sparse_seq),
+          py::arg("logits"), py::arg("targets"),
+          "Targets as an int64 / int32 tensor; with logits and targets on the GPU nothing is "
+          "uploaded per step (an out-of-range target gives a NaN loss there).");
     m.def("huber_loss",         &huber_loss,         py::arg("pred"), py::arg("target"), py::arg("delta") = 1.0f);
     m.def("kl_divergence",      &kl_divergence);
     m.def("reconstruction_loss",&reconstruction_loss);

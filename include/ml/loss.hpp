@@ -57,3 +57,10 @@ TensorPtr cross_entropy_sparse(TensorPtr logits, int target_idx);
 /// targets: vector of seq_len correct class indices
 /// Returns mean loss over all positions.
 TensorPtr cross_entropy_sparse_seq(TensorPtr logits, const std::vector<int>& targets);
+
+/// The same with the targets as an int64 / int32 tensor of one class index per
+/// position. With GPU logits and GPU targets nothing is copied from the host
+/// each step (the list form uploads its targets every call); on the GPU an
+/// out-of-range target makes the loss NaN rather than raising, since checking
+/// would mean reading the targets back.
+TensorPtr cross_entropy_sparse_seq(TensorPtr logits, TensorPtr targets);

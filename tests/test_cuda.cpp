@@ -522,6 +522,37 @@ int main() {
         const auto a = lg->grad_doubles(), b = logits->grad_doubles();
         for (size_t j = 0; j < b.size(); j++) m = std::max(m, std::fabs(a[j] - b[j]));
         CHECK_NEAR("cross-entropy gradient", (float)m, 0.0f, 1e-6f);
+
+        // targets as a tensor: on the GPU (int64 and int32) and on the CPU,
+        // against the list form; the second derivative through the op form
+        auto tg64 = std::make_shared<Tensor>(Shape{6}, std::vector<float>{0, 3, 10, 5, 5, 7})->to(DType::Int64);
+        for (auto t : {tg64->to(Device::CUDA), tg64->to(DType::Int32)->to(Device::CUDA), tg64}) {
+            auto x = lg->detach();
+            x->set_requires_grad(true);
+            auto l = cross_entropy_sparse_seq(x, t);
+            l->backward();
+            const auto gx = x->grad_doubles();
+            double d = 0;
+            for (size_t j = 0; j < b.size(); j++) d = std::max(d, std::fabs(gx[j] - b[j]));
+            const std::string where = std::string(t->device() == Device::CUDA ? "GPU " : "CPU ") +
+                                      (t->dtype() == DType::Int32 ? "int32" : "int64");
+            CHECK_NEAR(("cross-entropy, " + where + " targets: value").c_str(),
+                       (float)std::fabs(l->item_double() - lc->item_double()), 0.0f, 1e-6f);
+            CHECK_NEAR(("cross-entropy, " + where + " targets: gradient").c_str(), (float)d, 0.0f, 1e-6f);
+        }
+        {
+            auto xa = lg->detach(), xb = lg->detach();
+            xa->set_requires_grad(true);
+            xb->set_requires_grad(true);
+            auto ga = autograd::grad(cross_entropy_sparse_seq(xa, tg), {xa}, true)[0];
+            auto gb = autograd::grad(cross_entropy_sparse_seq(xb, tg64->to(Device::CUDA)), {xb}, true)[0];
+            auto ha = autograd::grad(sum(multiply(ga, ga), -1), {xa})[0];
+            auto hb = autograd::grad(sum(multiply(gb, gb), -1), {xb})[0];
+            CHECK_NEAR("cross-entropy, GPU targets: second derivative", rel(hb, ha), 0.0f, 1e-6f);
+        }
+        auto bad = std::make_shared<Tensor>(Shape{6}, std::vector<float>{0, 3, 11, 5, 5, 7})->to(DType::Int64);
+        CHECK_TRUE("cross-entropy, GPU targets: one out of range gives NaN",
+                   std::isnan(cross_entropy_sparse_seq(lg->detach(), bad->to(Device::CUDA))->item_double()));
     }
 
     // ── the milestone: a GPT's training step on the GPU matches the CPU ──

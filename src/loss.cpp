@@ -3,6 +3,7 @@
 #include "ml/ops.hpp"
 #include "ml/autograd.hpp"
 #include "ml/fastmath.hpp"
+#include "ml/strided.hpp"
 #include <cmath>
 #include <algorithm>
 
@@ -304,6 +305,19 @@ TensorPtr cross_entropy_sparse(TensorPtr logits, int target_idx) {
     }
 
     return result;
+}
+
+TensorPtr cross_entropy_sparse_seq(TensorPtr logits, TensorPtr targets) {
+    if (logits->device() == Device::CUDA) return cuda_ops::cross_entropy_targets(logits, targets);
+    if (targets->dtype() != DType::Int64 && targets->dtype() != DType::Int32)
+        throw runtime_error(string("cross_entropy_sparse_seq: targets must be int64 or int32, got ") +
+                            dtype_name(targets->dtype()));
+    auto t = targets->device() == Device::CPU ? targets : targets->to(Device::CPU);
+    vector<int> v((size_t)t->numel());
+    const void* base = t->storage()->data();
+    strided::for_each(t->shape(), t->strides(), t->offset(),
+                      [&](int64_t i, int64_t off) { v[(size_t)i] = (int)strided::load(base, t->dtype(), off); });
+    return cross_entropy_sparse_seq(logits, v);
 }
 
 // Sparse cross-entropy over a full sequence — avoids building a loop in Python.

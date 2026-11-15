@@ -1052,28 +1052,21 @@ extern "C" __global__ void l_cross_entropy(const float* x, const long long* targ
         if (threadIdx.x < w) s[threadIdx.x] += s[threadIdx.x + w];
         __syncthreads();
     }
-    if (threadIdx.x == 0) loss[blockIdx.x] = logf(s[0]) + m - row[target[blockIdx.x]];
+    // a target outside [0, cols) -- device targets are not checked on the host,
+    // which would mean reading them back -- makes that row's loss NaN
+    if (threadIdx.x == 0) {
+        const long long tg = target[blockIdx.x];
+        loss[blockIdx.x] = (tg < 0 || tg >= cols) ? __int_as_float(0x7fc00000) : logf(s[0]) + m - row[tg];
+    }
 }
 )");
     return s;
 }
 
-TensorPtr cross_entropy(const TensorPtr& logits0, const vector<int>& targets) {
-    auto x = contiguous_on_device(f32(logits0, "cross_entropy"));
+// the loss with the targets already on the device as int64 [rows]
+static TensorPtr cross_entropy_on(const TensorPtr& x, const TensorPtr& td) {
     long long cols = x->shape().back();
     const int64_t rows = cols ? x->numel() / cols : 0;
-    if ((int64_t)targets.size() != rows)
-        throw runtime_error("cross_entropy: " + to_string(targets.size()) + " targets for " +
-                            to_string(rows) + " positions");
-    auto t = make_shared<Tensor>(Shape{rows}, DType::Int64);
-    auto pick = make_shared<vector<int64_t>>((size_t)rows);   // flat index of each target logit
-    for (int64_t r = 0; r < rows; r++) {
-        if (targets[r] < 0 || targets[r] >= cols)
-            throw runtime_error("cross_entropy: target " + to_string(targets[r]) + " out of range");
-        static_cast<int64_t*>(t->storage()->data())[r] = targets[r];
-        (*pick)[(size_t)r] = r * cols + targets[r];
-    }
-    auto td = t->to(Device::CUDA);
     auto per_row = empty_cuda({rows});
     const void* px = base(x);
     const void* pt = td->storage()->data();
@@ -1087,8 +1080,13 @@ TensorPtr cross_entropy(const TensorPtr& logits0, const vector<int>& targets) {
     }
     // d/dx = (softmax(x) - onehot(target)) / rows, written with ops so the
     // gradient is itself differentiable
-    attach(out, {x}, "cross_entropy", [x, pick, rows, td](const TensorPtr&, const TensorPtr& G) -> vector<TensorPtr> {
+    attach(out, {x}, "cross_entropy", [x, rows, cols, td](const TensorPtr&, const TensorPtr& G) -> vector<TensorPtr> {
         if (!grad_enabled()) return {cross_entropy_backward(x, td, G)};
+        // the op form (recorded gradients) needs the targets on the host
+        auto th = td->to(Device::CPU);
+        auto pick = make_shared<vector<int64_t>>((size_t)rows);   // flat index of each target logit
+        for (int64_t r = 0; r < rows; r++)
+            (*pick)[(size_t)r] = r * cols + static_cast<const int64_t*>(th->storage()->data())[r];
         auto ones = make_shared<Tensor>(Shape{rows}, F32, Device::CUDA);
         fill(ones->storage()->data(), rows, 1.0f);
         auto onehot = scatter_add_flat(ones, pick, x->shape());
@@ -1096,6 +1094,37 @@ TensorPtr cross_entropy(const TensorPtr& logits0, const vector<int>& targets) {
         return {multiply(reshape(G, {1}), g)};
     });
     return out;
+}
+
+TensorPtr cross_entropy(const TensorPtr& logits0, const vector<int>& targets) {
+    auto x = contiguous_on_device(f32(logits0, "cross_entropy"));
+    long long cols = x->shape().back();
+    const int64_t rows = cols ? x->numel() / cols : 0;
+    if ((int64_t)targets.size() != rows)
+        throw runtime_error("cross_entropy: " + to_string(targets.size()) + " targets for " +
+                            to_string(rows) + " positions");
+    auto t = make_shared<Tensor>(Shape{rows}, DType::Int64);
+    for (int64_t r = 0; r < rows; r++) {
+        if (targets[r] < 0 || targets[r] >= cols)
+            throw runtime_error("cross_entropy: target " + to_string(targets[r]) + " out of range");
+        static_cast<int64_t*>(t->storage()->data())[r] = targets[r];
+    }
+    return cross_entropy_on(x, t->to(Device::CUDA));
+}
+
+TensorPtr cross_entropy_targets(const TensorPtr& logits0, const TensorPtr& targets0) {
+    auto x = contiguous_on_device(f32(logits0, "cross_entropy"));
+    long long cols = x->shape().back();
+    const int64_t rows = cols ? x->numel() / cols : 0;
+    if (targets0->numel() != rows)
+        throw runtime_error("cross_entropy: " + to_string(targets0->numel()) + " targets for " +
+                            to_string(rows) + " positions");
+    if (targets0->dtype() != DType::Int64 && targets0->dtype() != DType::Int32)
+        throw runtime_error(string("cross_entropy: targets must be int64 or int32, got ") +
+                            dtype_name(targets0->dtype()));
+    TensorPtr t = targets0->device() == Device::CUDA ? targets0 : targets0->to(Device::CUDA);
+    if (t->dtype() != DType::Int64) t = cast(t, DType::Int64);
+    return cross_entropy_on(x, contiguous_on_device(t));
 }
 
 // ── matmul on cuBLAS ─────────────────────────────────────────────────────────
@@ -1847,95 +1876,6 @@ extern "C" __global__ void a_softmax_back(const float* P, float* dP, long long c
 }
 )");
     return s;
-}
-
-TensorPtr attention(const TensorPtr& q0, const TensorPtr& k0, const TensorPtr& v0, int heads, bool causal) {
-    auto q = contiguous_on_device(f32(q0, "attention")), k = contiguous_on_device(f32(k0, "attention"));
-    auto v = contiguous_on_device(f32(v0, "attention"));
-    if (q->dim() != 3 || q->shape() != k->shape() || q->shape() != v->shape())
-        throw runtime_error("attention: q, k and v must all be [batch, seq, embed]");
-    const int64_t B = q->size(0), S = q->size(1), E = q->size(2), H = heads, D = E / H;
-    if (D * H != E) throw runtime_error("attention: embed must divide by heads");
-    const float scale = 1.0f / std::sqrt((float)D);
-    auto P = empty_cuda({B, H, S, S});
-    auto O = empty_cuda({B, S, E});
-    const float* pq = static_cast<const float*>(base(q));
-    const float* pk = static_cast<const float*>(base(k));
-    const float* pv = static_cast<const float*>(base(v));
-    float* pp = static_cast<float*>(P->storage()->data());
-    float* po = static_cast<float*>(O->storage()->data());
-    const int s_ = (int)S, d_ = (int)D, e_ = (int)E, h_ = (int)H;
-    for (int64_t b = 0; b < B; b++)       // scores = Q K^T, every head of sequence b
-        cuda::sgemm_batched(false, true, s_, s_, d_, 1.0f, pq + b * S * E, e_, D, pk + b * S * E, e_, D,
-                            0.0f, pp + b * H * S * S, s_, S * S, h_);
-    long long cols = S;
-    int cz = causal ? 1 : 0;
-    float sc = scale;
-    long long nrows = B * H * S;
-    void* a1[] = {&pp, &cols, &sc, &cz, &nrows};
-    if (B * H * S) cuda::launch(K("a_softmax", ATTN_SRC()), (unsigned)((B * H * S + 7) / 8), 1, 1, 256, 1, 1, 0, a1);
-    for (int64_t b = 0; b < B; b++)       // O = P V, written into the heads' columns
-        cuda::sgemm_batched(false, false, s_, d_, s_, 1.0f, pp + b * H * S * S, s_, S * S, pv + b * S * E, e_, D,
-                            0.0f, po + b * S * E, e_, D, h_);
-
-    if (q->requires_grad() || k->requires_grad() || v->requires_grad()) {
-        auto node = make_node(O, {q, k, v});
-        node->name = "attention";
-        // the op form: what higher-order gradients differentiate
-        autograd::attach_reference(*node, [B, S, E, H, D, scale, causal](const vector<TensorPtr>& in) -> TensorPtr {
-            auto heads_of = [&](const TensorPtr& t) { return permute(reshape(t, {B, S, H, D}), {0, 2, 1, 3}); };
-            auto scores = multiply(scale, ::matmul(heads_of(in[0]), transpose(heads_of(in[1]))));
-            if (causal) {
-                vector<float> m((size_t)(S * S), 0.0f);
-                for (int64_t i = 0; i < S; i++) for (int64_t j = i + 1; j < S; j++) m[(size_t)(i * S + j)] = -1e9f;
-                scores = add(scores, make_shared<Tensor>(Shape{S, S}, m)->to(Device::CUDA));
-            }
-            auto o = ::matmul(::softmax(scores), heads_of(in[2]));
-            return reshape(permute(o, {0, 2, 1, 3}), {B, S, E});
-        });
-        auto reference = node->backward_graph;
-        node->backward_graph = [reference, q, k, v, P, B, S, E, H, D, scale](const TensorPtr& out,
-                                                                           const TensorPtr& G0) -> vector<TensorPtr> {
-            if (grad_enabled()) return reference(out, G0);
-            auto G = contiguous_on_device(f32(G0, "attention"));
-            auto dP = empty_cuda({B, H, S, S});
-            auto dQ = empty_cuda({B, S, E}), dK = empty_cuda({B, S, E}), dV = empty_cuda({B, S, E});
-            const float* pq = static_cast<const float*>(base(q));
-            const float* pk = static_cast<const float*>(base(k));
-            const float* pv = static_cast<const float*>(base(v));
-            const float* pp = static_cast<const float*>(base(P));
-            const float* pg = static_cast<const float*>(base(G));
-            float* pdp = static_cast<float*>(dP->storage()->data());
-            float* pdq = static_cast<float*>(dQ->storage()->data());
-            float* pdk = static_cast<float*>(dK->storage()->data());
-            float* pdv = static_cast<float*>(dV->storage()->data());
-            const int s_ = (int)S, d_ = (int)D, e_ = (int)E, h_ = (int)H;
-            for (int64_t b = 0; b < B; b++) {
-                const int64_t ob = b * S * E, pb = b * H * S * S;
-                // dV = P^T dO;  dP = dO V^T
-                cuda::sgemm_batched(true, false, s_, d_, s_, 1.0f, pp + pb, s_, S * S, pg + ob, e_, D,
-                                    0.0f, pdv + ob, e_, D, h_);
-                cuda::sgemm_batched(false, true, s_, s_, d_, 1.0f, pg + ob, e_, D, pv + ob, e_, D,
-                                    0.0f, pdp + pb, s_, S * S, h_);
-            }
-            long long cols = S;
-            float sc = scale;
-            long long nrows = B * H * S;
-            void* a2[] = {&pp, &pdp, &cols, &sc, &nrows};
-            if (B * H * S) cuda::launch(K("a_softmax_back", ATTN_SRC()), (unsigned)((B * H * S + 7) / 8), 1, 1, 256, 1, 1, 0, a2);
-            for (int64_t b = 0; b < B; b++) {
-                const int64_t ob = b * S * E, pb = b * H * S * S;
-                // dQ = dS K;  dK = dS^T Q
-                cuda::sgemm_batched(false, false, s_, d_, s_, 1.0f, pdp + pb, s_, S * S, pk + ob, e_, D,
-                                    0.0f, pdq + ob, e_, D, h_);
-                cuda::sgemm_batched(true, false, s_, d_, s_, 1.0f, pdp + pb, s_, S * S, pq + ob, e_, D,
-                                    0.0f, pdk + ob, e_, D, h_);
-            }
-            return {q->requires_grad() ? dQ : nullptr, k->requires_grad() ? dK : nullptr,
-                    v->requires_grad() ? dV : nullptr};
-        };
-    }
-    return O;
 }
 
 // Attention straight from one fused projection: qkv [B, S, 3E] holds Q, K and
