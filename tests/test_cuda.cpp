@@ -242,6 +242,19 @@ int main() {
     std::printf("cuBLAS: %s\n", cuda::blas_status().c_str());
     auto A = random_tensor({64, 96}, 21), B = random_tensor({96, 48}, 22);
     CHECK_NEAR("matmul 64x96 @ 96x48", rel(matmul(G(A), G(B)), matmul(A, B)), 0.0f, 1e-6f);
+    {
+        // TF32 ("high"): on compute 8.0+ products keep 10 mantissa bits -- close,
+        // not exact; on older GPUs nothing changes. Back to "highest" after.
+        cuda::set_float32_matmul_precision("high");
+        auto Aw = random_tensor({256, 512}, 25), Bw = random_tensor({512, 128}, 26);
+        const float e = rel(matmul(G(Aw), G(Bw)), matmul(Aw, Bw));
+        cuda::set_float32_matmul_precision("highest");
+        const float e2 = rel(matmul(G(Aw), G(Bw)), matmul(Aw, Bw));
+        std::printf("  TF32 matmul error %.2e, float32 %.2e (compute %d)\n", e, e2, cuda::compute_capability());
+        CHECK_NEAR("TF32 matmul (set_float32_matmul_precision(\"high\"))", e, 0.0f,
+                   cuda::compute_capability() >= 80 ? 5e-3f : 1e-5f);   // K = 512: summation order alone ~1e-6
+        CHECK_NEAR("float32 matmul again after \"highest\"", e2, 0.0f, 1e-5f);
+    }
     auto A3 = random_tensor({3, 17, 33}, 23), B3 = random_tensor({3, 33, 9}, 24);
     CHECK_NEAR("batched matmul (strided batched)", rel(matmul(G(A3), G(B3)), matmul(A3, B3)), 0.0f, 1e-6f);
     auto B1 = random_tensor({1, 33, 9}, 25);
@@ -852,6 +865,106 @@ int main() {
         xg->set_requires_grad(true);
         CHECK_NEAR("second derivative through LayerNorm + GELU on the GPU",
                    rel(hvp(xg, G(w0), lgpu), hvp(xc, w0, lc)), 0.0f, 1e-4f);
+    }
+
+    // ── CUDA Graphs: a captured training step replays as the eager one runs ──
+    if (cuda::graphs_available()) {
+        auto ids = std::make_shared<Tensor>(Shape{2, 12}, DType::Int64);
+        std::vector<float> v(24), tv(24);
+        for (int i = 0; i < 24; i++) { v[i] = (float)((i * 5 + 1) % 40); tv[i] = (float)((i * 5 + 6) % 40); }
+        ids->set_data(v);
+        auto idg = ids->to(Device::CUDA);
+        auto tg = std::make_shared<Tensor>(Shape{24}, tv)->to(DType::Int64)->to(Device::CUDA);
+        Tensor::manual_seed(9);
+        GPT ga(40, 16, 32, 4, 2);
+        Tensor::manual_seed(9);
+        GPT gb(40, 16, 32, 4, 2);
+        ga.to(Device::CUDA);
+        gb.to(Device::CUDA);
+        AdamW oa(ga.parameters(), 3e-3f), ob(gb.parameters(), 3e-3f);
+        auto pa = ga.parameters(), pb = gb.parameters();
+        auto step = [&](GPT& m, AdamW& o, std::vector<TensorPtr>& ps) {
+            o.zero_grad();
+            auto l = cross_entropy_sparse_seq(m.forward(idg), tg);
+            l->backward();
+            clip_grad_norm(ps, 1.0f, /*return_norm=*/false);
+            o.step();
+            return l;
+        };
+        std::vector<double> la, lb;
+        for (int k = 0; k < 6; k++) la.push_back(step(ga, oa, pa)->item_double());
+        for (int k = 0; k < 2; k++) lb.push_back(step(gb, ob, pb)->item_double());     // warm-up
+        cuda::Graph graph;
+        graph.capture_begin();
+        auto lcap = step(gb, ob, pb);              // recorded, not run
+        graph.capture_end();
+        for (int k = 0; k < 4; k++) {
+            graph.replay();
+            lb.push_back(lcap->item_double());
+        }
+        double dl = 0;
+        for (size_t k = 0; k < la.size(); k++) dl = std::max(dl, std::fabs(la[k] - lb[k]) / std::fabs(la[k]));
+        double m = 0, s = 0;
+        for (size_t i = 0; i < pa.size(); i++) {
+            const auto a = pa[i]->to_vector(), b = pb[i]->to_vector();
+            for (size_t j = 0; j < a.size(); j++) { m = std::max(m, (double)std::fabs(a[j] - b[j])); s = std::max(s, (double)std::fabs(a[j])); }
+        }
+        std::printf("  CUDA Graph GPT: losses %.4f -> %.4f eager, %.4f -> %.4f replayed\n", la[0], la[5], lb[0], lb[5]);
+        CHECK_NEAR("CUDA Graph: a captured GPT step (AdamW, clipping) replays the eager losses", (float)dl, 0.0f, 1e-5f);
+        CHECK_NEAR("CUDA Graph: and leaves the same weights", (float)(m / s), 0.0f, 1e-5f);
+
+        // an LSTM with SGD: the recurrent layers' many small launches in one replay
+        Tensor::manual_seed(10);
+        LSTM ra(5, 7);
+        Tensor::manual_seed(10);
+        LSTM rb(5, 7);
+        ra.to(Device::CUDA);
+        rb.to(Device::CUDA);
+        SGD sa(ra.parameters(), 0.05f, 0.9f), sb(rb.parameters(), 0.05f, 0.9f);
+        auto x = G(random_tensor({6, 3, 5}, 120)), y = G(random_tensor({6, 3, 7}, 121));
+        auto rstep = [&](LSTM& r, SGD& o) {
+            o.zero_grad();
+            auto l = mse_loss(r.forward(x), y);
+            l->backward();
+            o.step();
+            return l;
+        };
+        std::vector<double> ea, eb;
+        for (int k = 0; k < 5; k++) ea.push_back(rstep(ra, sa)->item_double());
+        eb.push_back(rstep(rb, sb)->item_double());
+        cuda::Graph g2;
+        g2.capture_begin();
+        auto lr = rstep(rb, sb);
+        g2.capture_end();
+        for (int k = 0; k < 4; k++) { g2.replay(); eb.push_back(lr->item_double()); }
+        double de = 0;
+        for (size_t k = 0; k < ea.size(); k++) de = std::max(de, std::fabs(ea[k] - eb[k]) / std::fabs(ea[k]));
+        CHECK_NEAR("CUDA Graph: a captured LSTM step (SGD, momentum) replays the eager losses", (float)de, 0.0f, 1e-5f);
+
+        // reading a value back inside a capture is refused with a reason
+        std::string why;
+        {
+            cuda::Graph g3;
+            g3.capture_begin();
+            try { lcap->item_double(); } catch (const std::exception& e) { why = e.what(); }
+            try { g3.capture_end(); } catch (...) {}
+        }
+        CHECK_TRUE("CUDA Graph: reading a GPU value during capture is refused, with the reason",
+                   why.find("during graph capture") != std::string::npos);
+
+        // new inputs: copied into the captured tensor, the replay computes on them
+        auto xin = G(random_tensor({4, 5}, 122));
+        auto yout = multiply(2.0f, tanh_op(xin));
+        cuda::Graph g4;
+        g4.capture_begin();
+        auto ycap = multiply(2.0f, tanh_op(xin));
+        g4.capture_end();
+        auto fresh = random_tensor({4, 5}, 123);
+        xin->copy_from(fresh);                     // a CPU tensor into the GPU input
+        g4.replay();
+        CHECK_NEAR("CUDA Graph: a replay computes on inputs copied in (copy_from)",
+                   rel(ycap, multiply(2.0f, tanh_op(fresh))), 0.0f, 1e-6f);
+        (void)yout;
     }
 
     // ── phase 3: half precision, GemmEx, autocast, GradScaler ──

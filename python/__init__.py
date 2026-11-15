@@ -36,3 +36,34 @@ class autocast:
         from ._C import _set_autocast_dtype
         _set_autocast_dtype(self._previous)
         return False
+
+
+class _Capture:
+    def __init__(self, graph):
+        self.graph = graph
+
+    def __enter__(self):
+        self.graph.capture_begin()
+        return self.graph
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is not None:
+            # end the capture whatever happened, then let the error through
+            try:
+                self.graph.capture_end()
+            except Exception:
+                pass
+            return False
+        self.graph.capture_end()
+        return False
+
+
+def _graph_capture(self):
+    """`with g.capture(): loss = step()` records the step's GPU work. Run the
+    step a few times beforehand (kernels compiled, cuDNN plans made); inside,
+    nothing may read a GPU value back (no .item(), no printing a GPU tensor,
+    clip_grad_norm with return_norm=False)."""
+    return _Capture(self)
+
+
+CUDAGraph.capture = _graph_capture  # noqa: F405

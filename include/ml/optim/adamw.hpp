@@ -33,6 +33,8 @@ public:
     std::vector<std::vector<float>> m; // first moment per parameter
     std::vector<std::vector<float>> v; // second moment per parameter
     DeviceBuffers m_dev, v_dev;        // their GPU copies, for GPU parameters
+    DeviceBuffers t_dev;               // the step count on the device (GPU parameters), so a
+                                       // CUDA-Graph replay advances it: see step()
 
     AdamW(std::vector<TensorPtr> params,
           float lr           = 0.001f,

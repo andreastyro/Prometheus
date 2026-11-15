@@ -143,6 +143,9 @@ PYBIND11_MODULE(_C, m) {
                           // user marks by hand needs one before any op writes
                           if (v) t.ensure_grad();
                       })
+        .def("copy_from",     &Tensor::copy_from, py::arg("src"),
+             "Copy src's values into this tensor in place (dtype / device converted, same shape) -- "
+             "how new inputs reach a captured CUDAGraph")
         .def("dim",           &Tensor::dim)
         .def("numel",         &Tensor::numel)
         .def("num_el",        &Tensor::num_el)
@@ -357,6 +360,21 @@ PYBIND11_MODULE(_C, m) {
           "The GPU in use, or why there is none.");
     m.def("cuda_has_tensor_cores", &cuda::has_tensor_cores,
           "Tensor cores (compute 7.0+): float16 matmuls run on them.");
+    py::class_<cuda::Graph>(m, "CUDAGraph",
+        "A CUDA Graph, as torch.cuda.CUDAGraph: record a step's GPU work once, replay it with one "
+        "launch. Use `with g.capture():` (warm the step up first), then g.replay().")
+        .def(py::init<>())
+        .def("capture_begin", &cuda::Graph::capture_begin)
+        .def("capture_end", &cuda::Graph::capture_end)
+        .def("replay", &cuda::Graph::replay, "Run the captured work again (asynchronously).")
+        .def_property_readonly("captured", &cuda::Graph::captured);
+    m.def("cuda_graphs_available", &cuda::graphs_available,
+          "True when the driver supports stream capture (CUDA Graphs).");
+    m.def("cuda_capturing", &cuda::capturing, "True while a CUDA Graph capture is in progress.");
+    m.def("set_float32_matmul_precision", &cuda::set_float32_matmul_precision, py::arg("precision"),
+          "\"highest\" (default, float32) or \"high\" (TF32 tensor cores for float32 GPU matmuls on "
+          "compute 8.0+), as torch.set_float32_matmul_precision");
+    m.def("get_float32_matmul_precision", &cuda::float32_matmul_precision);
     m.def("cuda_has_bf16", &cuda::has_bf16,
           "bfloat16 matmuls in hardware (compute 8.0+); older GPUs compute them in float32.");
     m.def("cuda_profile", &cuda::profile, py::arg("on") = true,

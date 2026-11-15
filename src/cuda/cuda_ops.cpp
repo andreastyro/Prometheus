@@ -1391,8 +1391,12 @@ extern "C" __global__ void o_adam(float* w, const float* g, float* m, float* v, 
 // of 8192 elements, a block per chunk. One launch per parameter tensor was
 // ~50 small kernels a GPT step, most too small to fill the GPU.
 struct MultiTensor { float* w; const float* g; float* m; float* v; long long n; };
+// tdev: the step count on the device (capturable: a replayed step reads the
+// count the previous replay left), or null to use bc1 / bc2 as given
 extern "C" __global__ void o_adam_multi(const MultiTensor* t, const long long* chunk_start, const int* chunk_tensor,
-                                        float lr, float b1, float b2, float bc1, float bc2, float eps, float decay) {
+                                        float lr, float b1, float b2, float bc1, float bc2, float eps, float decay,
+                                        const float* tdev) {
+    if (tdev) { bc1 = 1.0f - powf(b1, *tdev); bc2 = 1.0f - powf(b2, *tdev); }
     const MultiTensor T = t[chunk_tensor[blockIdx.x]];
     const long long s = chunk_start[blockIdx.x], e = min(T.n, s + 8192);
     for (long long i = s + threadIdx.x; i < e; i += blockDim.x) {
@@ -1441,6 +1445,8 @@ extern "C" __global__ void o_unscale_multi(const MultiTensor* t, const long long
         if (isinf(v) || isnan(v)) { *bad = 1; g[i] = 0.0f; } else g[i] = v * inv;
     }
 }
+// one more step on the device-held step count
+extern "C" __global__ void o_step_inc(float* t) { if (threadIdx.x == 0 && blockIdx.x == 0) t[0] += 1.0f; }
 // SGD, the same way; m is the velocity (or null for none)
 extern "C" __global__ void o_sgd_multi(const MultiTensor* t, const long long* chunk_start, const int* chunk_tensor,
                                        float lr, float mu) {
@@ -1552,8 +1558,12 @@ static TensorPtr multi_table(const vector<OptTensor>& ts, unsigned& chunks) {
 }
 
 void adam_multi(const vector<OptTensor>& ts, float lr, float b1, float b2, float bc1, float bc2, float eps,
-                float decay) {
+                float decay, float* step) {
     if (ts.empty()) return;
+    if (step) {
+        void* a0[] = {&step};
+        cuda::launch(K("o_step_inc", FUSED_SRC()), 1, a0);
+    }
     unsigned chunks = 0;
     auto table = multi_table(ts, chunks);
     if (!chunks) return;
@@ -1561,7 +1571,8 @@ void adam_multi(const vector<OptTensor>& ts, float lr, float b1, float b2, float
     const void* pt = base_p;
     const void* ps = base_p + ts.size() * 40;
     const void* po = base_p + ts.size() * 40 + (size_t)chunks * 8;
-    void* args[] = {&pt, &ps, &po, &lr, &b1, &b2, &bc1, &bc2, &eps, &decay};
+    const float* tdev = step;
+    void* args[] = {&pt, &ps, &po, &lr, &b1, &b2, &bc1, &bc2, &eps, &decay, &tdev};
     cuda::launch(K("o_adam_multi", FUSED_SRC()), chunks, 1, 1, 256, 1, 1, 0, args);
 }
 

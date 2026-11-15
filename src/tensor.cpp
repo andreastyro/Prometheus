@@ -375,6 +375,27 @@ vector<float> Tensor::to_vector() const {
     return out;
 }
 
+void Tensor::copy_from(const TensorPtr& src) {
+    if (src->shape() != shape_)
+        throw runtime_error("copy_from: shapes differ (" + to_string(src->numel()) + " values into " +
+                            to_string(numel_) + ")");
+    if (!contiguous_) throw runtime_error("copy_from: the destination must be contiguous");
+    TensorPtr c;
+    {
+        NoGrad off;
+        c = src;
+        if (c->dtype() != dtype()) c = c->to(dtype());
+        if (c->device() != device()) c = c->to(device());
+        if (!c->is_contiguous()) c = ::contiguous(c);
+    }
+    const size_t es = dtype_size(dtype()), n = (size_t)numel_ * es;
+    const void* from = static_cast<const unsigned char*>(c->storage()->data()) + c->offset() * es;
+    void* to = static_cast<unsigned char*>(storage_->data()) + offset_ * es;
+    if (!n || from == to) return;
+    if (device() == Device::CUDA) cuda::copy_device(to, from, n);
+    else std::memcpy(to, from, n);
+}
+
 void Tensor::set_data(const vector<float>& v) {
     if ((int64_t)v.size() != numel_)
         throw runtime_error("set_data: " + to_string(v.size()) + " values for " +

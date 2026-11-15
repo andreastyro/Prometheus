@@ -57,10 +57,18 @@ void Adam::step(){
             p->data()[j] -= lr * m_hat / (sqrt(v_hat) + eps);
         }
     }
-    cuda_ops::adam_multi(gpu, lr, beta1, beta2, bc1, bc2, eps, 1.0f);
+    if (!gpu.empty()) {
+        float* td = t_dev.get(0, std::vector<float>{(float)(t - 1)});   // see AdamW::step
+        cuda_ops::adam_multi(gpu, lr, beta1, beta2, bc1, bc2, eps, 1.0f, td);
+    }
 }
 
 void Adam::save_state(const std::string& path) const {
+    if (!t_dev.dev.empty() && t_dev.dev[0]) {   // replays advance the device count, not t
+        std::vector<float> td(1);
+        t_dev.to_host(0, td);
+        const_cast<Adam*>(this)->t = (int)td[0];
+    }
     for (size_t i = 0; i < m.size(); i++) {       // GPU state comes home first
         m_dev.to_host(i, const_cast<std::vector<float>&>(m[i]));
         v_dev.to_host(i, const_cast<std::vector<float>&>(v[i]));
@@ -92,6 +100,7 @@ void Adam::load_state(const std::string& path) {
     v.resize(n_params);
     m_dev.reset();
     v_dev.reset();
+    t_dev.reset();
     for (int i = 0; i < n_params; i++) {
         int sz;
         file.read(reinterpret_cast<char*>(&sz), sizeof(int));

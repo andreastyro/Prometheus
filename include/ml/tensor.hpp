@@ -192,6 +192,11 @@ public:
 
     /// Overwrite every element from row-major `v`; the size must match.
     void set_data(const std::vector<float>& v);
+    /// Copy src's values into this tensor's own memory, in place (converted to
+    /// this tensor's dtype and device; the shapes must match; this tensor must
+    /// be contiguous). How new inputs reach a captured CUDA Graph: the graph
+    /// replays on the memory it captured.
+    void copy_from(const TensorPtr& src);
 
     float item() const;                         ///< the single element of a 1-element tensor
     double item_double() const;                 ///< the same, exact for float64 and int64

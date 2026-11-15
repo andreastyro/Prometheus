@@ -77,6 +77,15 @@ struct Driver {
     CUresult (*cuMemcpyDtoHAsync)(void*, CUdeviceptr, size_t, CUstream);
     CUresult (*cuMemcpyDtoDAsync)(CUdeviceptr, CUdeviceptr, size_t, CUstream);
     CUresult (*cuMemsetD8Async)(CUdeviceptr, unsigned char, size_t, CUstream);
+    // optional: CUDA Graphs (stream capture) and pinned host memory
+    CUresult (*cuStreamBeginCapture)(CUstream, int);
+    CUresult (*cuStreamEndCapture)(CUstream, void**);
+    CUresult (*cuGraphInstantiateWithFlags)(void**, void*, unsigned long long);
+    CUresult (*cuGraphLaunch)(void*, CUstream);
+    CUresult (*cuGraphExecDestroy)(void*);
+    CUresult (*cuGraphDestroy)(void*);
+    CUresult (*cuMemHostAlloc)(void**, size_t, unsigned);
+    CUresult (*cuMemFreeHost)(void*);
 };
 
 // NVRTC: the runtime compiler
@@ -141,6 +150,20 @@ size_t                        g_pool_bytes = 0;
 size_t                        g_in_use = 0, g_peak = 0;   // bytes handed to tensors
 int                           g_device_index = -1;        // -1: not chosen yet
 mutex                         g_pool_mu;
+
+// A captured graph's memory. While a capture runs every allocation comes from
+// its pool, and those blocks stay the graph's for its lifetime: freed, they go
+// back to its pool, never to the shared cache -- a replay writes into them
+// again, so nothing else may be handed one. Host-to-device copies made during
+// capture are staged in pinned buffers the graph keeps (a replay copies from
+// them again). Released when the graph is destroyed.
+struct GraphPool {
+    map<size_t, vector<CUdeviceptr>> idle;
+    vector<void*> pinned;
+    bool alive = true;
+};
+shared_ptr<GraphPool>                               g_capture;   // the capture in progress
+unordered_map<CUdeviceptr, shared_ptr<GraphPool>>   g_owner;     // graph-owned blocks
 
 void* open_library(const string& file) {
 #ifdef _WIN32
@@ -219,6 +242,14 @@ void init_locked() {
         bind(lib, d.cuMemcpyHtoDAsync, "cuMemcpyHtoDAsync_v2") && bind(lib, d.cuMemcpyDtoHAsync, "cuMemcpyDtoHAsync_v2") &&
         bind(lib, d.cuMemcpyDtoDAsync, "cuMemcpyDtoDAsync_v2") && bind(lib, d.cuMemsetD8Async, "cuMemsetD8Async");
     if (!all) { g.why = "the NVIDIA driver is too old (a driver API entry point is missing)"; return; }
+    bind(lib, d.cuStreamBeginCapture, "cuStreamBeginCapture_v2");
+    bind(lib, d.cuStreamEndCapture, "cuStreamEndCapture");
+    bind(lib, d.cuGraphInstantiateWithFlags, "cuGraphInstantiateWithFlags");
+    bind(lib, d.cuGraphLaunch, "cuGraphLaunch");
+    bind(lib, d.cuGraphExecDestroy, "cuGraphExecDestroy");
+    bind(lib, d.cuGraphDestroy, "cuGraphDestroy");
+    bind(lib, d.cuMemHostAlloc, "cuMemHostAlloc");
+    bind(lib, d.cuMemFreeHost, "cuMemFreeHost");
     CUresult r = d.cuInit(0);
     if (r != 0) { g.why = "cuInit failed: " + err(r); return; }
     int count = 0;
@@ -541,6 +572,21 @@ void* alloc(size_t nbytes) {
     const size_t b = bucket(nbytes);
     {
         lock_guard<mutex> lock(g_pool_mu);
+        if (g_capture) {                      // inside a capture: the graph's own blocks
+            auto& idle = g_capture->idle[b];
+            CUdeviceptr p = 0;
+            if (!idle.empty()) {
+                p = idle.back();
+                idle.pop_back();
+            } else {
+                // cuMemAlloc is allowed in a relaxed-mode capture; it is not recorded
+                check(g.d.cuMemAlloc(&p, b), "cuMemAlloc (during graph capture)");
+                g_owner[p] = g_capture;
+            }
+            g_in_use += b;
+            g_peak = max(g_peak, g_in_use);
+            return (void*)p;
+        }
         auto it = g_pool.find(b);
         if (it != g_pool.end() && !it->second.empty()) {
             CUdeviceptr p = it->second.back();
@@ -583,6 +629,15 @@ void free(void* ptr, size_t nbytes) noexcept {
     if (!ptr) return;
     lock_guard<mutex> lock(g_pool_mu);
     const size_t b = bucket(nbytes);
+    auto own = g_owner.find((CUdeviceptr)ptr);
+    if (own != g_owner.end()) {
+        if (own->second->alive) {             // a graph's block goes back to that graph
+            own->second->idle[b].push_back((CUdeviceptr)ptr);
+            g_in_use -= min(g_in_use, b);
+            return;
+        }
+        g_owner.erase(own);                   // its graph is gone: an ordinary block now
+    }
     g_pool[b].push_back((CUdeviceptr)ptr);
     g_pool_bytes += b;
     g_in_use -= min(g_in_use, b);
@@ -652,6 +707,20 @@ void memset_zero(void* dst, size_t nbytes) {
 void copy_to_device(void* dst, const void* src, size_t nbytes) {
     if (!nbytes) return;
     bind_context();
+    {
+        lock_guard<mutex> lock(g_pool_mu);
+        if (g_capture) {
+            // a capture records the copy, and a replay reads the source again:
+            // from a pinned buffer the graph keeps, not the caller's
+            void* pinned = nullptr;
+            if (!g.d.cuMemHostAlloc || g.d.cuMemHostAlloc(&pinned, nbytes, 0) != 0)
+                throw runtime_error("cuda: cannot stage a host-to-device copy during graph capture");
+            std::memcpy(pinned, src, nbytes);
+            g_capture->pinned.push_back(pinned);
+            check(g.d.cuMemcpyHtoDAsync((CUdeviceptr)dst, pinned, nbytes, g.stream), "cuMemcpyHtoD (captured)");
+            return;
+        }
+    }
     // from pageable memory this returns once the bytes are staged, so the
     // caller may free its buffer straight away
     check(g.d.cuMemcpyHtoDAsync((CUdeviceptr)dst, src, nbytes, g.stream), "cuMemcpyHtoD");
@@ -660,6 +729,10 @@ void copy_to_device(void* dst, const void* src, size_t nbytes) {
 void copy_to_host(void* dst, const void* src, size_t nbytes) {
     if (!nbytes) return;
     bind_context();
+    if (capturing())
+        throw runtime_error("cuda: a GPU value was read back during graph capture -- a graph cannot wait for "
+                            "the CPU (item(), .data, printing, clip_grad_norm's returned norm, GradScaler's "
+                            "overflow check); move it out of the captured step");
     // the CPU needs the bytes: wait for the stream, and only it
     check(g.d.cuMemcpyDtoHAsync(dst, (CUdeviceptr)src, nbytes, g.stream), "cuMemcpyDtoH");
     check(g.d.cuStreamSynchronize(g.stream), "cuStreamSynchronize");
@@ -673,6 +746,8 @@ void copy_device(void* dst, const void* src, size_t nbytes) {
 
 void synchronize() {
     bind_context();
+    if (capturing())
+        throw runtime_error("cuda: synchronize() during graph capture -- move it out of the captured step");
     check(g.d.cuStreamSynchronize(g.stream), "cuStreamSynchronize");
 }
 
@@ -692,6 +767,8 @@ struct Cublas {
                    long long, const void*, int, int, long long, const void*, void*, int, int,
                    long long, int, int, int);
     int (*set_stream)(cublasHandle_t, void*);
+    // optional: cublasSetMathMode, for TF32 tensor cores on float32 gemms
+    int (*set_math_mode)(cublasHandle_t, int);
     // cublasSgemmBatched: operands found through device arrays of pointers
     int (*sgemm_pointers)(cublasHandle_t, int, int, int, int, int, const float*, const float* const*, int,
                           const float* const*, int, const float*, float* const*, int, int);
@@ -720,6 +797,7 @@ void init_blas_locked() {
         g_blas_why = "cuBLAS is missing an entry point";
         return;
     }
+    bind(lib, g_blas.set_math_mode, "cublasSetMathMode");
     // the handle belongs to the current context
     if (g.d.cuCtxSetCurrent(g.ctx) != 0 || g_blas.create(&g_handle) != 0 ||
         g_blas.set_stream(g_handle, g.stream) != 0) {
@@ -729,11 +807,21 @@ void init_blas_locked() {
     g_blas_ok = true;
 }
 
+// float32 matmul precision: "highest" (exact float32, the default) or
+// "high" (TF32 tensor cores on compute 8.0+, as PyTorch's
+// set_float32_matmul_precision). Applied to the handle when it changes.
+int g_tf32 = 0, g_tf32_applied = -1;
+
 cublasHandle_t blas_handle() {
     bind_context();
     lock_guard<mutex> lock(g_mu);
     init_blas_locked();
     if (!g_blas_ok) throw runtime_error("cuda: matmul needs cuBLAS: " + g_blas_why);
+    if (g_tf32_applied != g_tf32 && g_blas.set_math_mode) {
+        // CUBLAS_DEFAULT_MATH 0, CUBLAS_TF32_TENSOR_OP_MATH 3
+        g_blas.set_math_mode(g_handle, g_tf32 ? 3 : 0);
+        g_tf32_applied = g_tf32;
+    }
     return g_handle;
 }
 
@@ -785,7 +873,108 @@ void sgemm_batched(bool ta, bool tb, int m, int n, int k, float alpha, const flo
                                     &beta, c, ldc, sc, batch), "sgemm (batched)");
 }
 
+
+// ── CUDA Graphs ───────────────────────────────────────────────────────────────
+
+bool graphs_available() {
+    return available() && g.d.cuStreamBeginCapture && g.d.cuStreamEndCapture &&
+           g.d.cuGraphInstantiateWithFlags && g.d.cuGraphLaunch && g.d.cuMemHostAlloc;
+}
+
+bool capturing() {
+    lock_guard<mutex> lock(g_pool_mu);
+    return (bool)g_capture;
+}
+
+struct Graph::Impl {
+    shared_ptr<GraphPool> pool;
+    void* graph = nullptr;
+    void* exec = nullptr;
+};
+
+Graph::Graph() : impl_(new Impl) {}
+
+Graph::~Graph() {
+    if (!impl_) return;
+    try {
+        if (impl_->exec || impl_->pool) synchronize();
+    } catch (...) {
+    }
+    if (impl_->exec) g.d.cuGraphExecDestroy(impl_->exec);
+    if (impl_->graph) g.d.cuGraphDestroy(impl_->graph);
+    if (impl_->pool) {
+        lock_guard<mutex> lock(g_pool_mu);
+        if (g_capture == impl_->pool) g_capture.reset();
+        impl_->pool->alive = false;
+        // its idle blocks join the shared cache; blocks still held by tensors
+        // follow when those are freed (their owner is no longer alive)
+        for (auto& [b, blocks] : impl_->pool->idle)
+            for (CUdeviceptr p : blocks) {
+                g_owner.erase(p);
+                g_pool[b].push_back(p);
+                g_pool_bytes += b;
+            }
+        impl_->pool->idle.clear();
+        for (void* h : impl_->pool->pinned) g.d.cuMemFreeHost(h);
+        impl_->pool->pinned.clear();
+    }
+    delete impl_;
+}
+
+void Graph::capture_begin() {
+    if (!graphs_available())
+        throw runtime_error("cuda: CUDA Graphs need a driver with stream capture (CUDA 11.4+)");
+    if (impl_->exec) throw runtime_error("cuda: this graph is already captured; make a new one");
+    bind_context();
+    // work queued before the capture must not end up in it
+    check(g.d.cuStreamSynchronize(g.stream), "cuStreamSynchronize");
+    {
+        lock_guard<mutex> lock(g_pool_mu);
+        if (g_capture) throw runtime_error("cuda: another graph is being captured");
+        impl_->pool = make_shared<GraphPool>();
+        g_capture = impl_->pool;
+    }
+    // relaxed: allocation (not recorded) and other unsafe-but-harmless calls
+    // stay allowed while capturing
+    const CUresult r = g.d.cuStreamBeginCapture(g.stream, 2 /* CU_STREAM_CAPTURE_MODE_RELAXED */);
+    if (r != 0) {
+        lock_guard<mutex> lock(g_pool_mu);
+        g_capture.reset();
+        check(r, "cuStreamBeginCapture");
+    }
+}
+
+void Graph::capture_end() {
+    {
+        lock_guard<mutex> lock(g_pool_mu);
+        if (g_capture != impl_->pool) throw runtime_error("cuda: capture_end() without capture_begin()");
+        g_capture.reset();
+    }
+    const CUresult r = g.d.cuStreamEndCapture(g.stream, &impl_->graph);
+    if (r != 0)
+        throw runtime_error("cuda: the captured work could not be recorded (" + err(r) +
+                            ") -- typically a synchronisation inside the captured step");
+    check(g.d.cuGraphInstantiateWithFlags(&impl_->exec, impl_->graph, 0), "cuGraphInstantiate");
+}
+
+void Graph::replay() {
+    if (!impl_->exec) throw runtime_error("cuda: replay() before a capture");
+    bind_context();
+    check(g.d.cuGraphLaunch(impl_->exec, g.stream), "cuGraphLaunch");
+}
+
+bool Graph::captured() const { return impl_->exec != nullptr; }
+
 bool has_tensor_cores() { return available() && state().cc >= 70; }
+
+void set_float32_matmul_precision(const string& p) {
+    if (p != "highest" && p != "high" && p != "medium")
+        throw runtime_error("set_float32_matmul_precision: \"highest\", \"high\" or \"medium\", got \"" + p + "\"");
+    lock_guard<mutex> lock(g_mu);
+    g_tf32 = p == "highest" ? 0 : 1;          // "medium" (bf16 in PyTorch) is TF32 here too
+}
+
+string float32_matmul_precision() { return g_tf32 ? "high" : "highest"; }
 bool has_bf16()         { return available() && state().cc >= 80; }
 
 void gemm_half(bool ta, bool tb, int m, int n, int k, DType dtype, const void* a, int lda, long long sa,

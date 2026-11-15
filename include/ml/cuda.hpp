@@ -29,6 +29,14 @@ bool has_tensor_cores();
 /// bfloat16 matmuls in hardware (compute 8.0+). Older GPUs compute bf16
 /// matmuls in float32 and round, which is correct but no faster.
 bool has_bf16();
+/// float32 matmul precision, as torch.set_float32_matmul_precision:
+/// "highest" (the default) computes in float32; "high" lets cuBLAS use TF32
+/// tensor cores on compute 8.0+ (A100 and newer) -- 10 mantissa bits in the
+/// products, float32 accumulation; much faster for large matmuls. "medium" is
+/// accepted and means "high". No effect on older GPUs. cuDNN convolutions use
+/// TF32 on those GPUs by default, as in PyTorch.
+void set_float32_matmul_precision(const std::string& precision);
+std::string float32_matmul_precision();
 /// Compute capability as major*10 + minor (52 for a GTX 970).
 int compute_capability();
 std::size_t total_memory();
@@ -172,6 +180,37 @@ public:
 private:
     std::string name_;
     void* a_ = nullptr;
+};
+
+// ── CUDA Graphs ───────────────────────────────────────────────────────────────
+//
+// Record the work queued on the stream once and replay it with one launch:
+// for steps made of many small kernels, the CPU cost of issuing them is gone.
+// As torch.cuda.CUDAGraph: run the step a few times first (kernels compiled,
+// cuDNN plans made), capture it, then replay(); a replay repeats exactly the
+// recorded kernels on the same memory, so new inputs are copied into the
+// tensors the capture used, and the outputs it produced are refreshed in
+// place. Inside a capture nothing may wait for the GPU (no item(), no reading
+// a value back); memory allocated during it belongs to the graph until the
+// graph is destroyed.
+
+bool graphs_available();
+/// True while a capture is in progress (on this process's stream).
+bool capturing();
+
+class Graph {
+public:
+    Graph();
+    ~Graph();
+    Graph(const Graph&) = delete;
+    Graph& operator=(const Graph&) = delete;
+    void capture_begin();
+    void capture_end();
+    void replay();
+    bool captured() const;
+private:
+    struct Impl;
+    Impl* impl_;
 };
 
 } // namespace cuda

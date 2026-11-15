@@ -142,8 +142,11 @@ void rmsprop_step(float* w, const float* g, float* v, int64_t n, float lr, float
 /// (m and v for Adam; m the velocity or null for SGD), element count.
 struct OptTensor { float* w; const float* g; float* m; float* v; long long n; };
 /// Every listed tensor's update in one launch.
+/// step: the device-held step count -- incremented here, and the bias
+/// correction computed from it on the device, so a captured step stays right
+/// when replayed (bc1 / bc2 are then unused); null to use bc1 / bc2
 void adam_multi(const std::vector<OptTensor>& ts, float lr, float b1, float b2, float bc1, float bc2, float eps,
-                float decay);
+                float decay, float* step = nullptr);
 void sgd_multi(const std::vector<OptTensor>& ts, float lr, float mu);
 /// The global norm of every listed gradient (OptTensor::g), and with
 /// max_norm >= 0 the gradients scaled to it -- the scaling reads the norm on

@@ -33,6 +33,8 @@ public:
     std::vector<std::vector<float>> m; // first moment (mean of gradients) per parameter
     std::vector<std::vector<float>> v; // second moment (mean of squared gradients) per parameter
     DeviceBuffers m_dev, v_dev;        // their GPU copies, for GPU parameters
+    DeviceBuffers t_dev;               // the step count on the device (GPU parameters), so a
+                                       // CUDA-Graph replay advances it: see step()
 
     Adam(std::vector<TensorPtr> params,
          float lr = 0.001f, float beta1 = 0.9f, float beta2 = 0.999f, float eps = 1e-8f);
