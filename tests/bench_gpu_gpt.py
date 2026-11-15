@@ -45,7 +45,11 @@ if args.lib == "prometheus":
     x = p.Tensor([args.batch, args.seq], [float(v) for v in ids.reshape(-1)], p.int64)
     if args.device == "cuda":
         x = x.cuda()
-    tg = [int(t) for t in targets]
+    # targets as an int64 tensor on the device, built once: the list form
+    # uploads them every step
+    tg = p.Tensor([len(targets)], [float(t) for t in targets], p.int64)
+    if args.device == "cuda":
+        tg = tg.cuda()
 
     def step():
         opt.zero_grad()
@@ -91,6 +95,10 @@ else:
             super().__init__()
             self.tok = nn.Embedding(args.vocab, args.embed)
             self.pos = nn.Embedding(args.seq, args.embed)
+            # initialised as Prometheus's GPT, N(0, 0.02): nn.Embedding's N(0, 1)
+            # with the output tied to it started the loss at ~34 instead of ~log(vocab)
+            nn.init.normal_(self.tok.weight, 0.0, 0.02)
+            nn.init.normal_(self.pos.weight, 0.0, 0.02)
             self.blocks = nn.ModuleList(Block(args.embed, args.heads) for _ in range(args.layers))
             self.ln = nn.LayerNorm(args.embed)
 
