@@ -572,12 +572,19 @@ void Tensor::accumulate_grad(const TensorPtr& g) {
         grad_zero_ = false;
         return;
     }
-    ensure_grad();
     if (device() == Device::CUDA) {
-        settle_grad();
-        cuda_ops::accumulate(grad_dev_->data(), numel_, g->device() == Device::CUDA ? g : g->to(Device::CUDA));
+        // A first gradient that cannot be taken over (a view of another
+        // tensor's gradient -- reshape and add pass theirs straight through)
+        // is copied into an uncleared buffer: one pass, where clearing a
+        // buffer and adding into it was two (29 calls, ~0.9 ms of a GPT step)
+        const bool first = !grad_dev_ || grad_zero_;
+        if (!grad_dev_)
+            grad_dev_ = make_shared<Storage>((size_t)numel_ * sizeof(float), DType::Float32, Device::CUDA, !first);
+        grad_zero_ = false;
+        cuda_ops::accumulate(grad_dev_->data(), numel_, g->device() == Device::CUDA ? g : g->to(Device::CUDA), first);
         return;
     }
+    ensure_grad();
     if (g->device() == Device::CUDA) { accumulate_grad(g->to(Device::CPU)); return; }
     const void* src = g->storage()->data();
     const DType gd = g->dtype();

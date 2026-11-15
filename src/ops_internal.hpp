@@ -109,8 +109,9 @@ TensorPtr cast(const TensorPtr& a, DType d);
 TensorPtr copy(const TensorPtr& a);
 /// a CPU scalar moved to the device; a GPU tensor as is
 TensorPtr on_device(const TensorPtr& t, const char* op);
-/// float32 grad[0..n) += g (any float dtype, any layout, on either device)
-void accumulate(void* grad, int64_t n, const TensorPtr& g);
+/// float32 grad[0..n) += g (any float dtype, any layout, on either device);
+/// with assign, grad = g
+void accumulate(void* grad, int64_t n, const TensorPtr& g, bool assign = false);
 void fill(void* dst, int64_t n, float value);
 TensorPtr extreme(const char* name, const TensorPtr& a, bool is_max);
 TensorPtr argmax(const TensorPtr& a);

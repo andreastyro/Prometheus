@@ -247,9 +247,13 @@ extern "C" __global__ void k_cast(const void* a, int da, void* y, int dy, long l
     else if (da == 1 || dy == 1 || da == 4 || dy == 4) st(y, dy, i, ld(a, da, o));        // float64 / int64: exact
     else stf(y, dy, i, ldf(a, da, o));
 }
-extern "C" __global__ void k_accumulate(float* g, const void* a, int da, long long n, Index ix) {
+// grad += a, or grad = a (assign: a tensor's first gradient, into a buffer
+// that was never cleared). Loads in single precision: ld went through double,
+// 1/32 rate on GeForce cards.
+extern "C" __global__ void k_accumulate(float* g, const void* a, int da, long long n, Index ix, int assign) {
     long long i = gid(); if (i >= n) return;
-    g[i] += (float)ld(a, da, at(ix, i));
+    const float v = ldf(a, da, at(ix, i));
+    g[i] = assign ? v : g[i] + v;
 }
 extern "C" __global__ void k_fill(float* y, long long n, float v) {
     long long i = gid(); if (i >= n) return;
@@ -665,14 +669,15 @@ TensorPtr softmax(const TensorPtr& a0) {
     return out;
 }
 
-void accumulate(void* grad, int64_t n, const TensorPtr& g0) {
+void accumulate(void* grad, int64_t n, const TensorPtr& g0, bool assign) {
     auto g = on_device(g0, "accumulate");
     Index ix = index_for(g, g->shape());
     float* pg = static_cast<float*>(grad);
     const void* pa = base(g);
     int da = (int)g->dtype();
     long long nn = n;
-    void* args[] = {&pg, &pa, &da, &nn, &ix};
+    int as = assign ? 1 : 0;
+    void* args[] = {&pg, &pa, &da, &nn, &ix, &as};
     cuda::launch(K("k_accumulate", CAST_SRC()), nn, args);
 }
 
