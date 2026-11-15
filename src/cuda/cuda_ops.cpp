@@ -13,6 +13,8 @@
 #include <functional>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
+#include <mutex>
 
 using namespace std;
 using namespace cuda_common;
@@ -118,6 +120,16 @@ __device__ void stf(void* p, int dt, long long i, float v) {
         default: st(p, dt, i, (double)v);
     }
 }
+// a fused kernel's activations: io 0 float32, 2 float16, 3 bfloat16 (uniform
+// per launch, so the branch costs nothing)
+__device__ __forceinline__ float ldx(const void* p, int io, long long i) {
+    return io == 0 ? ((const float*)p)[i]
+                   : io == 3 ? bf2f(((const unsigned short*)p)[i]) : h2f(((const unsigned short*)p)[i]);
+}
+__device__ __forceinline__ void stx(void* p, int io, long long i, float v) {
+    if (io == 0) ((float*)p)[i] = v;
+    else ((unsigned short*)p)[i] = io == 3 ? f2bf(v) : f2h(v);
+}
 // element i of the output, read through a strided / broadcast operand
 __device__ long long at(const Index& ix, long long i) {
     if (ix.nd < 0) return i;                     // contiguous, same shape
@@ -168,8 +180,13 @@ string src(const char* body) { return string(COMMON) + body; }
 // kernel sources are built once and live for the process
 const string& UNARY_SRC() {
     static const string s = src(R"(
+// NAME: any layout; NAME##4: contiguous, four elements a thread through
+// 16-byte loads and stores (n4 = n / 4, the buffers 16-byte aligned)
 #define UNARY(NAME, EXPR) extern "C" __global__ void NAME(const float* a, float* y, long long n, Index ix, float p0, float p1) { \
-    long long i = gid(); if (i >= n) return; float x = a[at(ix, i)]; y[i] = EXPR; }
+    long long i = gid(); if (i >= n) return; float x = a[at(ix, i)]; y[i] = EXPR; } \
+extern "C" __global__ void NAME##4(const float4* a, float4* y, long long n4, float p0, float p1) { \
+    long long i = gid(); if (i >= n4) return; const float4 v = a[i]; float4 r; float x; \
+    x = v.x; r.x = EXPR; x = v.y; r.y = EXPR; x = v.z; r.z = EXPR; x = v.w; r.w = EXPR; y[i] = r; }
 UNARY(u_sadd, x + p0)
 UNARY(u_smul, x * p0)
 UNARY(u_rsub, p0 - x)
@@ -193,7 +210,11 @@ UNARY(u_clip, fminf(fmaxf(x, p0), p1))
 const string& BINARY_SRC() {
     static const string s = src(R"(
 #define BINARY(NAME, EXPR) extern "C" __global__ void NAME(const float* a, const float* b, float* c, long long n, Index ia, Index ib) { \
-    long long i = gid(); if (i >= n) return; float x = a[at(ia, i)], y = b[at(ib, i)]; c[i] = EXPR; }
+    long long i = gid(); if (i >= n) return; float x = a[at(ia, i)], y = b[at(ib, i)]; c[i] = EXPR; } \
+extern "C" __global__ void NAME##4(const float4* a, const float4* b, float4* c, long long n4) { \
+    long long i = gid(); if (i >= n4) return; const float4 u = a[i], w = b[i]; float4 r; float x, y; \
+    x = u.x; y = w.x; r.x = EXPR; x = u.y; y = w.y; r.y = EXPR; x = u.z; y = w.z; r.z = EXPR; \
+    x = u.w; y = w.w; r.w = EXPR; c[i] = r; }
 BINARY(b_add, x + y)
 BINARY(b_sub, x - y)
 BINARY(b_mul, x * y)
@@ -247,6 +268,15 @@ extern "C" __global__ void k_accumulate(float* g, const void* a, int da, long lo
     long long i = gid(); if (i >= n) return;
     const float v = ldf(a, da, at(ix, i));
     g[i] = assign ? v : g[i] + v;
+}
+// float32 gradients, contiguous, four at a time
+extern "C" __global__ void k_accumulate4(float4* g, const float4* a, long long n4, int assign) {
+    long long i = gid(); if (i >= n4) return;
+    const float4 v = a[i];
+    if (assign) { g[i] = v; return; }
+    float4 o = g[i];
+    o.x += v.x; o.y += v.y; o.z += v.z; o.w += v.w;
+    g[i] = o;
 }
 extern "C" __global__ void k_fill(float* y, long long n, float v) {
     long long i = gid(); if (i >= n) return;
@@ -364,6 +394,7 @@ const void* base(const TensorPtr& t) {
 
 void attach(const TensorPtr& out, vector<TensorPtr> inputs, const char* name,
             function<vector<TensorPtr>(const TensorPtr&, const TensorPtr&)> graph) {
+    if (!grad_enabled()) return;              // no_grad: no node, nothing kept for a backward
     bool need = false;
     for (auto& t : inputs) need = need || (t && t->requires_grad());
     if (!need) return;
@@ -414,6 +445,7 @@ TensorPtr f32(const TensorPtr& t, const char* op) {
 // layer's op form) when the gradient is recorded
 void attach_fused(const TensorPtr& out, vector<TensorPtr> inputs, const char* name, Reference reference,
                          function<vector<TensorPtr>(const TensorPtr& G)> fused) {
+    if (!grad_enabled()) return;
     bool need = false;
     for (auto& t : inputs) need = need || (t && t->requires_grad());
     if (!need) return;
@@ -494,6 +526,21 @@ static TensorPtr unary_backward(int op, const TensorPtr& x0, const TensorPtr& y0
     return dx;
 }
 
+// The four-at-a-time kernels apply: contiguous operands (nd < 0), a count
+// divisible by four, and 16-byte aligned buffers.
+static bool vec4(long long n, const Index& ix, const void* a, const void* y) {
+    return n >= 4 && n % 4 == 0 && ix.nd < 0 && ((uintptr_t)a & 15) == 0 && ((uintptr_t)y & 15) == 0;
+}
+// "u_exp" -> "u_exp4", names kept for the process (Kernel holds the pointer)
+static const char* kernel4_name(const char* kernel) {
+    static std::mutex mu;
+    static auto& names = *new std::unordered_map<string, string>();
+    std::lock_guard<std::mutex> lock(mu);
+    auto it = names.find(kernel);
+    if (it == names.end()) it = names.emplace(kernel, string(kernel) + "4").first;
+    return it->second.c_str();
+}
+
 TensorPtr unary(const char* kernel, const char* name, const TensorPtr& a0, float p0, float p1,
                 dispatch::Graph1 graph) {
     if (a0->dtype() != F32 && is_floating(a0->dtype()) && a0->dtype() != DType::Bool &&
@@ -506,8 +553,14 @@ TensorPtr unary(const char* kernel, const char* name, const TensorPtr& a0, float
     const void* pa = base(a);
     void* py = out->storage()->data();
     long long n = out->numel();
-    void* args[] = {&pa, &py, &n, &ix, &p0, &p1};
-    cuda::launch(K(kernel, UNARY_SRC()), n, args);
+    if (vec4(n, ix, pa, py)) {
+        long long n4 = n / 4;
+        void* args[] = {&pa, &py, &n4, &p0, &p1};
+        cuda::launch(K(kernel4_name(kernel), UNARY_SRC()), n4, args);
+    } else {
+        void* args[] = {&pa, &py, &n, &ix, &p0, &p1};
+        cuda::launch(K(kernel, UNARY_SRC()), n, args);
+    }
     const bool is_gelu = string(kernel) == "u_gelu";
     const int back = unary_backward_code(kernel);
     attach(out, {a}, name, [a, graph, is_gelu, back, p0, p1](const TensorPtr& out, const TensorPtr& G) -> vector<TensorPtr> {
@@ -533,8 +586,15 @@ TensorPtr binary(int op, const char* name, const TensorPtr& a0, const TensorPtr&
     const void* pb = base(b);
     void* pc = out->storage()->data();
     long long n = out->numel();
-    void* args[] = {&pa, &pb, &pc, &n, &ia, &ib};
-    cuda::launch(K(names[op], BINARY_SRC()), n, args);
+    if (vec4(n, ia, pa, pc) && vec4(n, ib, pb, pc)) {
+        static const char* const names4[] = {"b_add4", "b_sub4", "b_mul4", "b_div4"};
+        long long n4 = n / 4;
+        void* args[] = {&pa, &pb, &pc, &n4};
+        cuda::launch(K(names4[op], BINARY_SRC()), n4, args);
+    } else {
+        void* args[] = {&pa, &pb, &pc, &n, &ia, &ib};
+        cuda::launch(K(names[op], BINARY_SRC()), n, args);
+    }
     attach(out, {a, b}, name, [a, b, op](const TensorPtr&, const TensorPtr& G) -> vector<TensorPtr> {
         TensorPtr ga, gb;
         switch (op) {
@@ -690,6 +750,12 @@ void accumulate(void* grad, int64_t n, const TensorPtr& g0, bool assign) {
     int da = (int)g->dtype();
     long long nn = n;
     int as = assign ? 1 : 0;
+    if (da == 0 && vec4(nn, ix, pa, pg)) {
+        long long n4 = nn / 4;
+        void* args[] = {&pg, &pa, &n4, &as};
+        cuda::launch(K("k_accumulate4", CAST_SRC()), n4, args);
+        return;
+    }
     void* args[] = {&pg, &pa, &da, &nn, &ix, &as};
     cuda::launch(K("k_accumulate", CAST_SRC()), nn, args);
 }
@@ -1223,28 +1289,24 @@ static Operand operand(const TensorPtr& t) {
     return {contiguous(t), false, (int)c};
 }
 
-TensorPtr matmul(const TensorPtr& a0, const TensorPtr& b0) {
-    // Two float16 (or, on compute 8.0+, bfloat16) operands multiply as they
-    // are, through GemmEx: float32 accumulation, tensor cores where present.
-    // Anything else multiplies in float32; a half result is rounded back.
-    const DType d = result_type(a0, b0);
-    const bool half_out = d == DType::Float16 || d == DType::BFloat16;
-    const bool half_in = half_out && a0->dtype() == d && b0->dtype() == d &&
-                         (d == DType::Float16 || cuda::has_bf16());
-    auto a = half_in ? on_device(a0, "matmul") : f32(a0, "matmul");
-    auto b = half_in ? on_device(b0, "matmul") : f32(b0, "matmul");
+// The product alone, no gradient node. half: a and b are both of half dtype d
+// and multiply through GemmEx, the result in float32 or (out_half) in d.
+static TensorPtr matmul_raw(const TensorPtr& a, const TensorPtr& b, bool half, DType d, bool out_half) {
     Operand A = operand(a), B = operand(b);
     const size_t es = dtype_size(a->dtype());
+    const DType od = out_half ? d : F32;
+    const size_t os = dtype_size(od);
     auto gemm = [&](int m_, int n_, int k_, const void* pa, long long sa, const void* pb, long long sb,
-                    float* pc, long long sc, int batch) {
-        if (half_in)
-            cuda::gemm_half(A.trans, B.trans, m_, n_, k_, d, pa, A.ld, sa, pb, B.ld, sb, pc, n_, sc, batch);
+                    void* pc, long long sc, int batch) {
+        if (half)
+            cuda::gemm_half(A.trans, B.trans, m_, n_, k_, d, pa, A.ld, sa, pb, B.ld, sb, pc, n_, sc, batch, out_half);
         else if (batch == 1)
             cuda::sgemm(A.trans, B.trans, m_, n_, k_, 1.0f, static_cast<const float*>(pa), A.ld,
-                        static_cast<const float*>(pb), B.ld, 0.0f, pc, n_);
+                        static_cast<const float*>(pb), B.ld, 0.0f, static_cast<float*>(pc), n_);
         else
             cuda::sgemm_batched(A.trans, B.trans, m_, n_, k_, 1.0f, static_cast<const float*>(pa), A.ld, sa,
-                                static_cast<const float*>(pb), B.ld, sb, 0.0f, pc, n_, sc, batch);
+                                static_cast<const float*>(pb), B.ld, sb, 0.0f, static_cast<float*>(pc), n_, sc,
+                                batch);
     };
     auto at = [&](const TensorPtr& t, int64_t elems) {
         return static_cast<const void*>(static_cast<const unsigned char*>(base(t)) + elems * es);
@@ -1255,10 +1317,9 @@ TensorPtr matmul(const TensorPtr& a0, const TensorPtr& b0) {
         // every leading dimension of a folds into the rows: one gemm
         Shape out_shape = a->shape();
         out_shape.back() = n;
-        out = make_shared<Tensor>(out_shape, F32, Device::CUDA);
+        out = make_shared<Tensor>(out_shape, od, Device::CUDA);
         if (k > 0)
-            gemm((int)(a->numel() / k), (int)n, (int)k, base(A.t), 0, base(B.t), 0,
-                 static_cast<float*>(out->storage()->data()), 0, 1);
+            gemm((int)(a->numel() / k), (int)n, (int)k, base(A.t), 0, base(B.t), 0, out->storage()->data(), 0, 1);
     } else {
         if (b->dim() == 2) A = {contiguous(a), false, (int)k};    // a transposed N-D a cannot fold
         const Shape batch_a(a->shape().begin(), a->shape().end() - 2);
@@ -1267,10 +1328,10 @@ TensorPtr matmul(const TensorPtr& a0, const TensorPtr& b0) {
         Shape out_shape = batch;
         out_shape.push_back(m);
         out_shape.push_back(n);
-        out = make_shared<Tensor>(out_shape, F32, Device::CUDA);
+        out = make_shared<Tensor>(out_shape, od, Device::CUDA);
         int64_t nb = 1;
         for (int64_t v : batch) nb *= v;
-        float* pc = static_cast<float*>(out->storage()->data());
+        unsigned char* pc = static_cast<unsigned char*>(out->storage()->data());
         if (k > 0 && batch_a == batch && batch_b == batch) {
             gemm((int)m, (int)n, (int)k, base(A.t), m * k, base(B.t), k * n, pc, m * n, (int)nb);
         } else if (k > 0) {
@@ -1279,10 +1340,27 @@ TensorPtr matmul(const TensorPtr& a0, const TensorPtr& b0) {
             broadcast_walk(batch, broadcast_strides(batch_a, batch), broadcast_strides(batch_b, batch), false,
                            [&](int64_t i, int64_t x, int64_t y) { ia[i] = x; ib[i] = y; });
             for (int64_t q = 0; q < nb; q++)
-                gemm((int)m, (int)n, (int)k, at(A.t, ia[q] * m * k), 0, at(B.t, ib[q] * k * n), 0, pc + q * m * n, 0, 1);
+                gemm((int)m, (int)n, (int)k, at(A.t, ia[q] * m * k), 0, at(B.t, ib[q] * k * n), 0,
+                     pc + q * m * n * os, 0, 1);
         }
     }
-    attach(out, {a, b}, "matmul", [a, b](const TensorPtr&, const TensorPtr& G) -> vector<TensorPtr> {
+    return out;
+}
+
+TensorPtr matmul(const TensorPtr& a0, const TensorPtr& b0) {
+    // Two float16 (or, on compute 8.0+, bfloat16) operands multiply as they
+    // are, through GemmEx: float32 accumulation, tensor cores where present,
+    // the half result written by the gemm itself. Anything else multiplies in
+    // float32; a half result is rounded back.
+    const DType d = result_type(a0, b0);
+    const bool half_out = d == DType::Float16 || d == DType::BFloat16;
+    const bool half_in = half_out && a0->dtype() == d && b0->dtype() == d &&
+                         (d == DType::Float16 || cuda::has_bf16());
+    auto a = half_in ? on_device(a0, "matmul") : f32(a0, "matmul");
+    auto b = half_in ? on_device(b0, "matmul") : f32(b0, "matmul");
+    auto out = matmul_raw(a, b, half_in, d, half_in);
+    // the op form: any dtype, and what higher-order gradients differentiate
+    auto graph = [a, b](const TensorPtr&, const TensorPtr& G) -> vector<TensorPtr> {
         TensorPtr gb;
         if (b->requires_grad()) {
             if (b->dim() == 2 && a->dim() > 2) {
@@ -1295,8 +1373,32 @@ TensorPtr matmul(const TensorPtr& a0, const TensorPtr& b0) {
             }
         }
         return {a->requires_grad() ? sum_to(::matmul(G, transpose(b)), a->shape()) : nullptr, gb};
+    };
+    if (!half_in) {
+        attach(out, {a, b}, "matmul", graph);
+        return half_out ? cast_op(out, d) : out;
+    }
+    // half inputs: the backward multiplies in half too -- the incoming float32
+    // gradient rounded to d once, both products through GemmEx, float32 out.
+    // (Multiplying the float32 gradient by the half operands would promote
+    // them back to float32: the backward of a mixed-precision step at full
+    // float32 cost.)
+    attach(out, {a, b}, "matmul", [graph, a, b, d](const TensorPtr& o, const TensorPtr& G0) -> vector<TensorPtr> {
+        if (grad_enabled()) return graph(o, G0);
+        auto G = G0->dtype() == d ? on_device(G0, "matmul") : cast(contiguous_on_device(G0), d);
+        TensorPtr ga, gb;
+        if (a->requires_grad()) ga = sum_to(matmul_raw(G, transpose(b), true, d, false), a->shape());
+        if (b->requires_grad()) {
+            if (b->dim() == 2 && a->dim() > 2) {
+                const int64_t kk = a->size(-1), rows = a->numel() / kk;
+                gb = matmul_raw(transpose(reshape(a, {rows, kk})), reshape(G, {rows, G->size(-1)}), true, d, false);
+            } else {
+                gb = sum_to(matmul_raw(transpose(a), G, true, d, false), b->shape());
+            }
+        }
+        return {ga, gb};
     });
-    return half_out ? cast_op(out, d) : out;
+    return out;
 }
 
 // ── fused LayerNorm forward, dropout masks, optimizer updates ─────────────────

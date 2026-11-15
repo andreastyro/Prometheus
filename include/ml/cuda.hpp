@@ -118,13 +118,19 @@ void sgemm_pointers(bool trans_a, bool trans_b, int m, int n, int k, float alpha
                     const float* const* a, int lda, const float* const* b, int ldb, float beta,
                     float* const* c, int ldc, int batch);
 
-/// The same with float16 / bfloat16 inputs (both of `dtype`) and a float32
-/// result, accumulated in float32 -- on tensor cores where the GPU has them.
-/// bfloat16 needs has_bf16(). `batch` products as sgemm_batched.
+/// The same with float16 / bfloat16 inputs (both of `dtype`), accumulated in
+/// float32 -- on tensor cores where the GPU has them -- and the result in
+/// float32, or with half_c in `dtype` itself (rounded once, from the float32
+/// sums). bfloat16 needs has_bf16(). `batch` products as sgemm_batched.
 void gemm_half(bool trans_a, bool trans_b, int m, int n, int k, DType dtype,
                const void* a, int lda, long long stride_a,
                const void* b, int ldb, long long stride_b,
-               float* c, int ldc, long long stride_c, int batch);
+               void* c, int ldc, long long stride_c, int batch, bool half_c = false);
+
+/// sgemm_pointers with half operands (both of `dtype`), as gemm_half.
+void gemm_half_pointers(bool trans_a, bool trans_b, int m, int n, int k, DType dtype,
+                        const void* const* a, int lda, const void* const* b, int ldb,
+                        void* const* c, int ldc, int batch, bool half_c = false);
 
 // ── cuDNN (optional) ─────────────────────────────────────────────────────────
 //
@@ -167,6 +173,31 @@ struct ProfEntry {
 std::vector<ProfEntry> profile_entries();
 /// A table of the `top` slowest (all when 0), with each one's share.
 std::string profile_report(int top = 0);
+
+/// Work issued to the GPU since the last reset_launch_counts(): our kernels,
+/// cuBLAS / cuDNN calls (each may run more than one kernel of its own) and
+/// memory copies. Counted always, at the cost of an atomic increment.
+/// The GPU attention kernels: "math" (scores as S x S buffers through cuBLAS:
+/// fastest at ordinary lengths), "flash" (tiled, online softmax, the scores
+/// never stored: memory linear in the sequence length; head size <= 128), or
+/// "auto" (default; flash once the S x S buffers would pass 512 MB).
+/// PROMETHEUS_ATTENTION sets it at startup.
+void set_attention_backend(const std::string& mode);
+std::string attention_backend();
+
+/// The GPU's multiprocessors (0 without a GPU).
+int multiprocessor_count();
+/// How many blocks of kernel `k` (block threads, dynamic shared bytes) are
+/// resident on the whole GPU at once; 0 when the driver cannot say. A kernel
+/// launched with no more blocks than this, alone on the stream, has them all
+/// running together -- what a grid-wide barrier needs.
+int resident_blocks(const Kernel& k, unsigned block, unsigned shared);
+
+struct LaunchCounts {
+    long long kernels, library, copies;
+};
+LaunchCounts launch_counts();
+void reset_launch_counts();
 
 /// Times what is queued between its construction and destruction, when
 /// profiling. For the library's own calls into cuBLAS / cuDNN / kernels.

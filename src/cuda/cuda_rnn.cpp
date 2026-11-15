@@ -4,6 +4,7 @@
 #include "ml/autograd.hpp"
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <limits>
@@ -141,10 +142,219 @@ extern "C" __global__ void r_gruA_back(const float* g, const float* h_prev, cons
     dhh[o + j] = drp; dhh[o + H + j] = dzp; dhh[o + 2 * H + j] = dn * r;
     dh[i] = d * z;
 }
+
+// ── the recurrence in one launch ──
+// Block x owns hidden units [x*U, x*U + U) -- every gate of them -- for the
+// whole batch; thread i < B*U is (batch b = i / U, unit u0 + i % U). Steps are
+// separated by a grid-wide barrier, so every block must be resident at once:
+// the host launches no more blocks than resident_blocks() allows.
+// bar[0] counts arrivals, bar[1] is the generation.
+__device__ void grid_sync(unsigned* bar, unsigned nb) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        volatile unsigned* vgen = bar + 1;
+        const unsigned gen = *vgen;
+        __threadfence();
+        if (atomicAdd(bar, 1u) == nb - 1) {
+            atomicExch(bar, 0u);
+            __threadfence();
+            atomicAdd(bar + 1, 1u);
+        } else {
+            while (*vgen == gen) { }
+        }
+        __threadfence();
+    }
+    __syncthreads();
+}
+// cell 0 RNN (tanh), 1 LSTM (i f o g), 3 GRU reset-after (r z n). gates holds
+// each step's input projection plus bias and becomes the activated gates, as
+// the per-step kernels leave it. hs: h_{t-1} for the batch, in shared memory.
+extern "C" __global__ void r_persist_fwd(int cell, int S, int B, int H, int G, int U, float* gates,
+                                         const float* W, const float* h_init, const float* c_init, float* OUT,
+                                         float* cs, float* HN, const float* bhn, unsigned* bar) {
+    extern __shared__ float hs[];
+    const int GH = G * H, BH = B * H;
+    const int idx = threadIdx.x, b = idx / U, u = blockIdx.x * U + idx % U;
+    const bool active = idx < B * U && u < H;
+    for (int t = 0; t < S; t++) {
+        const float* hp = t ? OUT + (long long)(t - 1) * BH : h_init;
+        for (int i = threadIdx.x; i < BH; i += blockDim.x) hs[i] = __ldcg(hp + i);
+        __syncthreads();
+        if (active) {
+            float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+            const float* hb = hs + b * H;
+            const float* w = W + u;
+            if (G == 1) {
+                for (int k = 0; k < H; k++) acc0 += hb[k] * __ldg(w + (long long)k * GH);
+            } else if (G == 3) {
+                for (int k = 0; k < H; k++) {
+                    const float hk = hb[k];
+                    const float* wk = w + (long long)k * GH;
+                    acc0 += hk * __ldg(wk); acc1 += hk * __ldg(wk + H); acc2 += hk * __ldg(wk + 2 * H);
+                }
+            } else {
+                for (int k = 0; k < H; k++) {
+                    const float hk = hb[k];
+                    const float* wk = w + (long long)k * GH;
+                    acc0 += hk * __ldg(wk); acc1 += hk * __ldg(wk + H);
+                    acc2 += hk * __ldg(wk + 2 * H); acc3 += hk * __ldg(wk + 3 * H);
+                }
+            }
+            float* ar = gates + ((long long)t * B + b) * GH;
+            const int i = b * H + u;
+            float* ht = OUT + (long long)t * BH;
+            if (cell == 0) {
+                const float v = th(ar[u] + acc0);
+                ar[u] = v; ht[i] = v;
+            } else if (cell == 1) {
+                const float ig = sg(ar[u] + acc0), fg = sg(ar[H + u] + acc1);
+                const float og = sg(ar[2 * H + u] + acc2), gg = th(ar[3 * H + u] + acc3);
+                ar[u] = ig; ar[H + u] = fg; ar[2 * H + u] = og; ar[3 * H + u] = gg;
+                const float cp = t ? cs[(long long)(t - 1) * BH + i] : c_init[i];
+                const float ct = fg * cp + ig * gg;
+                cs[(long long)t * BH + i] = ct;
+                ht[i] = og * th(ct);
+            } else {
+                const float r = sg(ar[u] + acc0), z = sg(ar[H + u] + acc1);
+                const float hn = acc2 + bhn[u];
+                const float n = th(ar[2 * H + u] + r * hn);
+                ar[u] = r; ar[H + u] = z; ar[2 * H + u] = n;
+                HN[(long long)t * BH + i] = hn;
+                ht[i] = (1.0f - z) * n + z * hb[u];
+            }
+        }
+        if (t + 1 < S) grid_sync(bar, gridDim.x);
+    }
+}
+// Backward through time, the same ownership. The product back through W_h
+// for unit u needs row u of W_h (kept in shared memory, [U][GH + 1]) and the
+// whole batch's gradient row from the step after, staged through shared
+// memory `chunk` columns at a time ([B][chunk + 1]; the +1s keep the threads
+// of a warp on different banks). src is dA (RNN, LSTM) or dHH (GRU).
+// dh: out, the gradient for h_0; dc: in dc_n, out dc_0.
+__device__ float back_product(const float* srow, const float* wr, float* sc, int B, int GH, int chunk, bool active,
+                              int b, int uu) {
+    float acc = 0.0f;
+    for (int c0 = 0; c0 < GH; c0 += chunk) {
+        const int cn = min(chunk, GH - c0);
+        __syncthreads();
+        for (int q = threadIdx.x; q < B * cn; q += blockDim.x) {
+            const int bb = q / cn, c = q % cn;
+            sc[bb * (chunk + 1) + c] = __ldcg(srow + (long long)bb * GH + c0 + c);
+        }
+        __syncthreads();
+        if (active) {
+            const float* s = sc + b * (chunk + 1);
+            const float* w = wr + uu * (GH + 1) + c0;
+            for (int c = 0; c < cn; c++) acc += s[c] * w[c];
+        }
+    }
+    return acc;
+}
+extern "C" __global__ void r_persist_bwd(int cell, int S, int B, int H, int G, int U, int chunk,
+                                         const float* gates, const float* W, const float* OUT, const float* h_init,
+                                         const float* cs, const float* c_init, const float* HN, const float* dOUT,
+                                         float* dA, float* dHH, float* dh, float* dc, unsigned* bar) {
+    extern __shared__ float sm[];
+    const int GH = G * H, BH = B * H, u0 = blockIdx.x * U;
+    float* wr = sm;                                  // [U][GH + 1]
+    float* sc = sm + U * (GH + 1);                   // [B][chunk + 1]
+    for (int q = threadIdx.x; q < U * GH; q += blockDim.x) {
+        const int r = q / GH, c = q % GH;
+        wr[r * (GH + 1) + c] = u0 + r < H ? W[(long long)(u0 + r) * GH + c] : 0.0f;
+    }
+    const int idx = threadIdx.x, b = idx / U, uu = idx % U, u = u0 + uu;
+    const bool active = idx < B * U && u < H;
+    const int i = b * H + u;
+    float own = 0.0f;                                // GRU: the part of dh not through W_h
+    float dcr = active && cell == 1 ? dc[i] : 0.0f;
+    const float* src = cell == 3 ? dHH : dA;
+    for (int s = S - 1; s >= 0; s--) {
+        // the gradient reaching h_s from step s + 1
+        float dht = 0.0f;
+        if (s < S - 1) {
+            grid_sync(bar, gridDim.x);               // step s + 1 written by every block
+            dht = back_product(src + (long long)(s + 1) * B * GH, wr, sc, B, GH, chunk, active, b, uu) + own;
+        }
+        if (active) {
+            const long long o = ((long long)s * B + b) * GH;
+            const float d = dht + dOUT[(long long)s * BH + i];
+            if (cell == 0) {
+                const float v = gates[o + u];
+                dA[o + u] = d * (1.0f - v * v);
+            } else if (cell == 1) {
+                const float ig = gates[o + u], fg = gates[o + H + u], og = gates[o + 2 * H + u];
+                const float gg = gates[o + 3 * H + u];
+                const float ct = cs[(long long)s * BH + i];
+                const float cp = s ? cs[(long long)(s - 1) * BH + i] : c_init[i];
+                const float tc = th(ct);
+                const float dct = dcr + d * og * (1.0f - tc * tc);
+                dA[o + u]         = dct * gg * ig * (1.0f - ig);
+                dA[o + H + u]     = dct * cp * fg * (1.0f - fg);
+                dA[o + 2 * H + u] = d * tc * og * (1.0f - og);
+                dA[o + 3 * H + u] = dct * ig * (1.0f - gg * gg);
+                dcr = dct * fg;
+            } else {
+                const float r = gates[o + u], z = gates[o + H + u], n = gates[o + 2 * H + u];
+                const float hp = s ? OUT[(long long)(s - 1) * BH + i] : h_init[i];
+                const float hn = HN[(long long)s * BH + i];
+                const float dn = d * (1.0f - z) * (1.0f - n * n);
+                const float dzp = d * (hp - n) * z * (1.0f - z);
+                const float drp = dn * hn * r * (1.0f - r);
+                dA[o + u] = drp; dA[o + H + u] = dzp; dA[o + 2 * H + u] = dn;
+                dHH[o + u] = drp; dHH[o + H + u] = dzp; dHH[o + 2 * H + u] = dn * r;
+                own = d * z;
+            }
+        }
+    }
+    // the gradient for h_0: through step 0's product
+    grid_sync(bar, gridDim.x);
+    const float d0 = back_product(src, wr, sc, B, GH, chunk, active, b, uu) + own;
+    if (active) {
+        dh[i] = d0;
+        if (cell == 1) dc[i] = dcr;
+    }
+}
 )");
     return s;
 }
 cuda::Kernel RK(const char* name) { return K(name, RNN_SRC()); }
+
+// The persistent path's shape: U units per block, one block per slice, the
+// batch's h in shared memory (forward), W_h rows and a gradient chunk
+// (backward). ok = false when it does not fit or the GPU cannot keep every
+// block resident; PROMETHEUS_PERSISTENT_RNN=0 turns it off.
+struct Persist {
+    bool ok = false;
+    int U = 0, blocks = 0, threads = 0, chunk = 0;
+    unsigned fwd_shared = 0, bwd_shared = 0;
+};
+Persist persist_plan(int cell, int B, int H, int G) {
+    Persist p;
+    static const bool on = [] {
+        const char* e = std::getenv("PROMETHEUS_PERSISTENT_RNN");
+        return !(e && e[0] == '0');
+    }();
+    const int sms = cuda::multiprocessor_count();
+    if (!on || cell == 2 || sms <= 0 || B <= 0 || H <= 0) return p;
+    const unsigned limit = 48 * 1024;
+    p.U = (H + sms - 1) / sms;
+    p.blocks = (H + p.U - 1) / p.U;
+    p.threads = (B * p.U + 31) / 32 * 32;
+    if (p.threads > 1024) return p;
+    const size_t fsh = (size_t)B * H * sizeof(float);
+    const size_t wr = (size_t)p.U * (G * H + 1) * sizeof(float);
+    if (fsh > limit || wr + (size_t)B * 33 * sizeof(float) > limit) return p;
+    p.chunk = (int)std::min<size_t>((size_t)G * H, (limit - wr) / ((size_t)B * sizeof(float)) - 1);
+    if (p.chunk < 32) return p;
+    p.fwd_shared = (unsigned)fsh;
+    p.bwd_shared = (unsigned)(wr + (size_t)B * (p.chunk + 1) * sizeof(float));
+    if (cuda::resident_blocks(RK("r_persist_fwd"), p.threads, p.fwd_shared) < p.blocks ||
+        cuda::resident_blocks(RK("r_persist_bwd"), p.threads, p.bwd_shared) < p.blocks)
+        return p;
+    p.ok = true;
+    return p;
+}
 
 const float* cf(const TensorPtr& t) { return static_cast<const float*>(base(t)); }
 float* mf(const TensorPtr& t) { return static_cast<float*>(t->storage()->data()); }
@@ -220,8 +430,22 @@ TensorPtr rnn(int cell, const TensorPtr& input0, const TensorPtr& h00, const Ten
     float* OUT = mf(packed);
     int b_ = B, h_ = H, bh = BH;
 
-    // 2. the recurrence
-    for (int t = 0; t < S; t++) {
+    // 2. the recurrence: in one launch where it fits (a launch a step left
+    // the fast GPUs waiting on the CPU), else a gemm and a kernel a step
+    const Persist plan = persist_plan(cell, B, H, G);
+    if (plan.ok && S > 0) {
+        auto bar = make_shared<Tensor>(Shape{2}, DType::Int32, Device::CUDA);          // zeroed
+        int c_ = cell, s_ = S, g_ = G, u_ = plan.U;
+        float* pg = mf(gates);
+        const float* pw = cf(Whp);
+        float* pcs = lstm ? mf(cs) : nullptr;
+        float* phn = after ? mf(HN) : nullptr;
+        const float* pbn = after ? cf(bhn) : nullptr;
+        void* pbar = bar->storage()->data();
+        void* a[] = {&c_, &s_, &b_, &h_, &g_, &u_, &pg, &pw, &h_init, &c_init, &OUT, &pcs, &phn, &pbn, &pbar};
+        cuda::launch(RK("r_persist_fwd"), (unsigned)plan.blocks, 1, 1, (unsigned)plan.threads, 1, 1, plan.fwd_shared, a);
+    }
+    for (int t = 0; t < (plan.ok ? 0 : S); t++) {
         const float* hp = t ? OUT + (size_t)(t - 1) * BH : h_init;
         float* at = mf(gates) + (size_t)t * B * GH;
         float* ht = OUT + (size_t)t * BH;
@@ -276,8 +500,25 @@ TensorPtr rnn(int cell, const TensorPtr& input0, const TensorPtr& h00, const Ten
         if (lstm) cuda::copy_device(mf(dc), dOUT + SB * H, (size_t)BH * sizeof(float));
         int b2 = B, h2 = H, bh2 = BH;
 
-        // 3. backward through time
-        for (int t = S - 1; t >= 0; t--) {
+        // 3. backward through time: one launch, or a kernel and a gemm a step
+        if (plan.ok && S > 0) {
+            auto bar = make_shared<Tensor>(Shape{2}, DType::Int32, Device::CUDA);      // zeroed
+            int c_ = cell, s_ = S, g_ = G, u_ = plan.U, ch = plan.chunk;
+            const float* pg = cf(gates);
+            const float* pw = cf(Whp);
+            const float* pcs = lstm ? cf(cs) : nullptr;
+            const float* phn = after ? cf(HN) : nullptr;
+            float* pda = mf(dA);
+            float* pdq = after ? mf(dHH) : nullptr;
+            float* pdh = mf(dh);
+            float* pdc = lstm ? mf(dc) : nullptr;
+            void* pbar = bar->storage()->data();
+            void* a[] = {&c_, &s_, &b2, &h2, &g_, &u_, &ch, &pg, &pw, &OUTd, &hi, &pcs, &ci, &phn, &dOUT,
+                         &pda, &pdq, &pdh, &pdc, &pbar};
+            cuda::launch(RK("r_persist_bwd"), (unsigned)plan.blocks, 1, 1, (unsigned)plan.threads, 1, 1,
+                         plan.bwd_shared, a);
+        }
+        for (int t = (plan.ok ? -1 : S - 1); t >= 0; t--) {
             const float* hp = t ? OUTd + (size_t)(t - 1) * BH : hi;
             const float* gt = cf(gates) + (size_t)t * B * GH;
             float* da = mf(dA) + (size_t)t * B * GH;

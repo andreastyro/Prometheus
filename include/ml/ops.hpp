@@ -271,6 +271,15 @@ DType autocast_dtype();
 /// Autocast scope below is the usual way.
 DType set_autocast_dtype(DType dtype);
 
+/// Mixed precision without a scope: GPU matmuls (and the fused layers
+/// around them) run in `dtype` everywhere, as if every step were inside
+/// autocast(dtype); float32 turns it off (the default -- results stay
+/// bit-for-bit those of float32 unless asked). CPU tensors are left in
+/// float32. An explicit Autocast scope still overrides it, Autocast(Float32)
+/// included. Returns the previous default.
+DType set_default_autocast(DType dtype);
+DType default_autocast();
+
 struct Autocast {
     DType previous;
     explicit Autocast(DType dtype = DType::BFloat16);

@@ -31,6 +31,10 @@
 
 using namespace std;
 
+#include <atomic>
+// launch counters (launch_counts()): kernels, cuBLAS / cuDNN calls, copies
+static std::atomic<long long> g_n_kernels{0}, g_n_library{0}, g_n_copies{0};
+
 namespace cuda {
 namespace {
 
@@ -86,6 +90,8 @@ struct Driver {
     CUresult (*cuGraphDestroy)(void*);
     CUresult (*cuMemHostAlloc)(void**, size_t, unsigned);
     CUresult (*cuMemFreeHost)(void*);
+    // optional: occupancy, for kernels that keep every block resident
+    CUresult (*cuOccupancyMaxActiveBlocksPerMultiprocessor)(int*, CUfunction, int, size_t);
 };
 
 // NVRTC: the runtime compiler
@@ -119,6 +125,7 @@ struct State {
     CUstream    stream = nullptr;
     string      name;
     int         cc = 0;
+    int         sms = 0;            // multiprocessors
     size_t      mem = 0;
     bool        nvrtc_tried = false, nvrtc_ok = false;
     string      nvrtc_why;
@@ -250,6 +257,7 @@ void init_locked() {
     bind(lib, d.cuGraphDestroy, "cuGraphDestroy");
     bind(lib, d.cuMemHostAlloc, "cuMemHostAlloc");
     bind(lib, d.cuMemFreeHost, "cuMemFreeHost");
+    bind(lib, d.cuOccupancyMaxActiveBlocksPerMultiprocessor, "cuOccupancyMaxActiveBlocksPerMultiprocessor");
     CUresult r = d.cuInit(0);
     if (r != 0) { g.why = "cuInit failed: " + err(r); return; }
     int count = 0;
@@ -271,6 +279,7 @@ void init_locked() {
     d.cuDeviceGetAttribute(&major, ATTR_CC_MAJOR, g.dev);
     d.cuDeviceGetAttribute(&minor, ATTR_CC_MINOR, g.dev);
     g.cc = major * 10 + minor;
+    d.cuDeviceGetAttribute(&g.sms, 16 /* MULTIPROCESSOR_COUNT */, g.dev);
     d.cuDeviceTotalMem(&g.mem, g.dev);
     if ((r = d.cuDevicePrimaryCtxRetain(&g.ctx, g.dev)) != 0) { g.why = "no CUDA context: " + err(r); return; }
     if ((r = d.cuCtxSetCurrent(g.ctx)) != 0 || (r = d.cuStreamCreate(&g.stream, 1 /* non-blocking */)) != 0) {
@@ -717,12 +726,14 @@ void copy_to_device(void* dst, const void* src, size_t nbytes) {
                 throw runtime_error("cuda: cannot stage a host-to-device copy during graph capture");
             std::memcpy(pinned, src, nbytes);
             g_capture->pinned.push_back(pinned);
-            check(g.d.cuMemcpyHtoDAsync((CUdeviceptr)dst, pinned, nbytes, g.stream), "cuMemcpyHtoD (captured)");
+            g_n_copies.fetch_add(1, std::memory_order_relaxed);
+    check(g.d.cuMemcpyHtoDAsync((CUdeviceptr)dst, pinned, nbytes, g.stream), "cuMemcpyHtoD (captured)");
             return;
         }
     }
     // from pageable memory this returns once the bytes are staged, so the
     // caller may free its buffer straight away
+    g_n_copies.fetch_add(1, std::memory_order_relaxed);
     check(g.d.cuMemcpyHtoDAsync((CUdeviceptr)dst, src, nbytes, g.stream), "cuMemcpyHtoD");
 }
 
@@ -734,6 +745,7 @@ void copy_to_host(void* dst, const void* src, size_t nbytes) {
                             "the CPU (item(), .data, printing, clip_grad_norm's returned norm, GradScaler's "
                             "overflow check); move it out of the captured step");
     // the CPU needs the bytes: wait for the stream, and only it
+    g_n_copies.fetch_add(1, std::memory_order_relaxed);
     check(g.d.cuMemcpyDtoHAsync(dst, (CUdeviceptr)src, nbytes, g.stream), "cuMemcpyDtoH");
     check(g.d.cuStreamSynchronize(g.stream), "cuStreamSynchronize");
 }
@@ -741,6 +753,7 @@ void copy_to_host(void* dst, const void* src, size_t nbytes) {
 void copy_device(void* dst, const void* src, size_t nbytes) {
     if (!nbytes) return;
     bind_context();
+    g_n_copies.fetch_add(1, std::memory_order_relaxed);
     check(g.d.cuMemcpyDtoDAsync((CUdeviceptr)dst, (CUdeviceptr)src, nbytes, g.stream), "cuMemcpyDtoD");
 }
 
@@ -772,6 +785,9 @@ struct Cublas {
     // cublasSgemmBatched: operands found through device arrays of pointers
     int (*sgemm_pointers)(cublasHandle_t, int, int, int, int, int, const float*, const float* const*, int,
                           const float* const*, int, const float*, float* const*, int, int);
+    // optional: cublasGemmBatchedEx, the same with typed (half) operands
+    int (*gemm_pointers_ex)(cublasHandle_t, int, int, int, int, int, const void*, const void* const*, int, int,
+                            const void* const*, int, int, const void*, void* const*, int, int, int, int, int);
 };
 Cublas         g_blas{};
 cublasHandle_t g_handle = nullptr;
@@ -798,6 +814,7 @@ void init_blas_locked() {
         return;
     }
     bind(lib, g_blas.set_math_mode, "cublasSetMathMode");
+    bind(lib, g_blas.gemm_pointers_ex, "cublasGemmBatchedEx");
     // the handle belongs to the current context
     if (g.d.cuCtxSetCurrent(g.ctx) != 0 || g_blas.create(&g_handle) != 0 ||
         g_blas.set_stream(g_handle, g.stream) != 0) {
@@ -850,6 +867,7 @@ void sgemm(bool ta, bool tb, int m, int n, int k, float alpha, const float* a, i
            const float* b, int ldb, float beta, float* c, int ldc) {
     if (m == 0 || n == 0) return;
     auto h = blas_handle();
+    g_n_library.fetch_add(1, std::memory_order_relaxed);
     ProfScope p(profiling() ? string("sgemm ") + (ta ? "T" : "N") + (tb ? "T" : "N") + " " + to_string(m) + "x" + to_string(n) + "x" + to_string(k) : string());
     check_blas(g_blas.sgemm(h, tb ? 1 : 0, ta ? 1 : 0, n, m, k, &alpha, b, ldb, a, lda, &beta, c, ldc), "sgemm");
 }
@@ -858,9 +876,24 @@ void sgemm_pointers(bool ta, bool tb, int m, int n, int k, float alpha, const fl
                     const float* const* b, int ldb, float beta, float* const* c, int ldc, int batch) {
     if (m == 0 || n == 0 || batch == 0) return;
     auto h = blas_handle();
+    g_n_library.fetch_add(1, std::memory_order_relaxed);
     ProfScope p(profiling() ? string("sgemm_pointers ") + (ta ? "T" : "N") + (tb ? "T" : "N") + " " + to_string(m) + "x" + to_string(n) + "x" + to_string(k) + " *" + to_string(batch) : string());
     check_blas(g_blas.sgemm_pointers(h, tb ? 1 : 0, ta ? 1 : 0, n, m, k, &alpha, b, ldb, a, lda, &beta, c, ldc,
                                      batch), "sgemm (pointer batch)");
+}
+
+void gemm_half_pointers(bool ta, bool tb, int m, int n, int k, DType dtype, const void* const* a, int lda,
+                        const void* const* b, int ldb, void* const* c, int ldc, int batch, bool half_c) {
+    if (m == 0 || n == 0 || batch == 0) return;
+    const int type = dtype == DType::Float16 ? 2 : dtype == DType::BFloat16 ? 14 : -1;
+    if (type < 0) throw runtime_error("gemm_half_pointers: inputs must be float16 or bfloat16");
+    auto h = blas_handle();
+    g_n_library.fetch_add(1, std::memory_order_relaxed);
+    if (!g_blas.gemm_pointers_ex) throw runtime_error("cuBLAS has no cublasGemmBatchedEx");
+    const float alpha = 1.0f, beta = 0.0f;
+    ProfScope p(profiling() ? string("gemm_half_pointers ") + (ta ? "T" : "N") + (tb ? "T" : "N") + " " + to_string(m) + "x" + to_string(n) + "x" + to_string(k) + " *" + to_string(batch) : string());
+    check_blas(g_blas.gemm_pointers_ex(h, tb ? 1 : 0, ta ? 1 : 0, n, m, k, &alpha, b, type, ldb, a, type, lda,
+                                       &beta, c, half_c ? type : 0, ldc, batch, 68, -1), "GemmBatchedEx");
 }
 
 void sgemm_batched(bool ta, bool tb, int m, int n, int k, float alpha, const float* a, int lda,
@@ -868,6 +901,7 @@ void sgemm_batched(bool ta, bool tb, int m, int n, int k, float alpha, const flo
                    long long sc, int batch) {
     if (m == 0 || n == 0 || batch == 0) return;
     auto h = blas_handle();
+    g_n_library.fetch_add(1, std::memory_order_relaxed);
     ProfScope p(profiling() ? string("sgemm_batched ") + (ta ? "T" : "N") + (tb ? "T" : "N") + " " + to_string(m) + "x" + to_string(n) + "x" + to_string(k) + " *" + to_string(batch) : string());
     check_blas(g_blas.sgemm_batched(h, tb ? 1 : 0, ta ? 1 : 0, n, m, k, &alpha, b, ldb, sb, a, lda, sa,
                                     &beta, c, ldc, sc, batch), "sgemm (batched)");
@@ -978,7 +1012,7 @@ string float32_matmul_precision() { return g_tf32 ? "high" : "highest"; }
 bool has_bf16()         { return available() && state().cc >= 80; }
 
 void gemm_half(bool ta, bool tb, int m, int n, int k, DType dtype, const void* a, int lda, long long sa,
-               const void* b, int ldb, long long sb, float* c, int ldc, long long sc, int batch) {
+               const void* b, int ldb, long long sb, void* c, int ldc, long long sc, int batch, bool half_c) {
     if (m == 0 || n == 0 || batch == 0) return;
     // cudaDataType: CUDA_R_32F 0, CUDA_R_16F 2, CUDA_R_16BF 14; CUBLAS_COMPUTE_32F 68
     const int type = dtype == DType::Float16 ? 2 : dtype == DType::BFloat16 ? 14 : -1;
@@ -986,10 +1020,11 @@ void gemm_half(bool ta, bool tb, int m, int n, int k, DType dtype, const void* a
     if (type == 14 && !has_bf16())
         throw runtime_error("gemm_half: bfloat16 matmuls need compute 8.0 or newer");
     auto h = blas_handle();
+    g_n_library.fetch_add(1, std::memory_order_relaxed);
     const float alpha = 1.0f, beta = 0.0f;
     ProfScope p(profiling() ? string("gemm_half ") + (ta ? "T" : "N") + (tb ? "T" : "N") + " " + to_string(m) + "x" + to_string(n) + "x" + to_string(k) + " *" + to_string(batch) : string());
     check_blas(g_blas.gemm_ex(h, tb ? 1 : 0, ta ? 1 : 0, n, m, k, &alpha, b, type, ldb, sb, a, type, lda, sa,
-                              &beta, c, 0, ldc, sc, batch, 68, -1), "GemmEx");
+                              &beta, c, half_c ? type : 0, ldc, sc, batch, 68, -1), "GemmEx");
 }
 
 // ── cuDNN ────────────────────────────────────────────────────────────────────
@@ -1224,6 +1259,7 @@ void dnn_conv_forward(const ConvShape& s, const float* x, const float* w, float*
     Workspace ws(p.fwd_ws);
     const float one = 1.0f, zero = 0.0f;
     ProfScope ps("cudnn conv forward");
+    g_n_library.fetch_add(1, std::memory_order_relaxed);
     check_dnn(g_dnn.fwd(g_dnn_handle, &one, p.x, x, p.w, w, p.conv, p.fwd_algo, ws.p, ws.n, &zero, p.y, y),
               "convolution forward");
 }
@@ -1234,6 +1270,7 @@ void dnn_conv_backward_data(const ConvShape& s, const float* w, const float* dy,
     Workspace ws(p.data_ws);
     const float one = 1.0f, zero = 0.0f;
     ProfScope ps("cudnn conv backward data");
+    g_n_library.fetch_add(1, std::memory_order_relaxed);
     check_dnn(g_dnn.bwd_data(g_dnn_handle, &one, p.w, w, p.y, dy, p.conv, p.data_algo, ws.p, ws.n, &zero, p.x, dx),
               "convolution backward data");
 }
@@ -1244,6 +1281,7 @@ void dnn_conv_backward_filter(const ConvShape& s, const float* x, const float* d
     Workspace ws(p.filter_ws);
     const float one = 1.0f, zero = 0.0f;
     ProfScope ps("cudnn conv backward filter");
+    g_n_library.fetch_add(1, std::memory_order_relaxed);
     check_dnn(g_dnn.bwd_filter(g_dnn_handle, &one, p.x, x, p.y, dy, p.conv, p.filter_algo, ws.p, ws.n, &zero, p.w, dw),
               "convolution backward filter");
 }
@@ -1340,6 +1378,36 @@ string profile_report(int top) {
     return out;
 }
 
+LaunchCounts launch_counts() {
+    return {g_n_kernels.load(), g_n_library.load(), g_n_copies.load()};
+}
+void reset_launch_counts() {
+    g_n_kernels = 0;
+    g_n_library = 0;
+    g_n_copies = 0;
+}
+
+static std::string g_attention_backend = [] {
+    const char* e = std::getenv("PROMETHEUS_ATTENTION");
+    return std::string(e && *e ? e : "auto");
+}();
+void set_attention_backend(const std::string& mode) {
+    if (mode != "auto" && mode != "math" && mode != "flash")
+        throw std::runtime_error("set_attention_backend: \"auto\", \"math\" or \"flash\", got \"" + mode + "\"");
+    g_attention_backend = mode;
+}
+std::string attention_backend() { return g_attention_backend; }
+
+int multiprocessor_count() { return available() ? state().sms : 0; }
+
+int resident_blocks(const Kernel& k, unsigned block, unsigned shared) {
+    if (!available() || !g.d.cuOccupancyMaxActiveBlocksPerMultiprocessor || g.sms <= 0) return 0;
+    CUfunction fn = function(k);
+    int per = 0;
+    if (g.d.cuOccupancyMaxActiveBlocksPerMultiprocessor(&per, fn, (int)block, shared) != 0) return 0;
+    return per * g.sms;
+}
+
 void launch(const Kernel& k, int64_t n, void** args, unsigned block) {
     if (n <= 0) return;
     const int64_t grid = (n + block - 1) / block;
@@ -1350,6 +1418,7 @@ void launch(const Kernel& k, unsigned gx, unsigned gy, unsigned gz, unsigned bx,
             unsigned bz, unsigned shared, void** args) {
     CUfunction fn = function(k);
     ProfScope p(k.name);
+    g_n_kernels.fetch_add(1, std::memory_order_relaxed);
     check(g.d.cuLaunchKernel(fn, gx, gy, gz, bx, by, bz, shared, g.stream, args, nullptr),
           (string("launching ") + k.name).c_str());
 }

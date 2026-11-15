@@ -319,6 +319,11 @@ PYBIND11_MODULE(_C, m) {
     m.def("remainder",    static_cast<TensorPtr (*)(TensorPtr, TensorPtr)>(&remainder));
     m.def("autocast_dtype",     &autocast_dtype);
     m.def("_set_autocast_dtype", &set_autocast_dtype);
+    m.def("set_default_autocast", &set_default_autocast, py::arg("dtype"),
+          "Mixed precision without a scope: GPU matmuls and the fused layers run in dtype (float16 or "
+          "bfloat16) as if inside autocast(dtype); float32 (the default) turns it off. CPU tensors stay "
+          "float32. Returns the previous default.");
+    m.def("default_autocast", &default_autocast);
     // Where pip and conda put shared libraries, so `pip install mkl` is found
     // with no configuration: <prefix>/Library/bin on Windows, <prefix>/lib
     // elsewhere, for both the interpreter's prefix and the user base.
@@ -389,6 +394,19 @@ PYBIND11_MODULE(_C, m) {
               return out;
           },
           "The profile as (name, ms, calls), slowest first.");
+    m.def("set_attention_backend", &cuda::set_attention_backend, py::arg("mode"),
+          "GPU attention: \"math\" (S x S scores through cuBLAS), \"flash\" (tiled, memory linear in the "
+          "length), or \"auto\" (flash once the score buffers would pass 512 MB).");
+    m.def("get_attention_backend", &cuda::attention_backend);
+    m.def("cuda_launch_counts", []() {
+              auto c = cuda::launch_counts();
+              py::dict d;
+              d["kernels"] = c.kernels;
+              d["library"] = c.library;
+              d["copies"] = c.copies;
+              return d;
+          }, "Work issued to the GPU since cuda_reset_launch_counts(): kernels, cuBLAS / cuDNN calls, copies.");
+    m.def("cuda_reset_launch_counts", &cuda::reset_launch_counts);
     m.def("cuda_cudnn_available", &cuda::dnn_available,
           "True when cuDNN loaded (pip install nvidia-cudnn-cu12); convolutions then run on it.");
     m.def("cuda_cudnn_status", &cuda::dnn_status,

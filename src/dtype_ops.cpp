@@ -140,6 +140,7 @@ double apply(dispatch::Bin op, double x, double y) {
 }
 
 DType g_autocast = DType::Float32;
+DType g_default_autocast = DType::Float32;     // set_default_autocast: the dtype outside any scope
 
 } // namespace
 
@@ -203,11 +204,26 @@ DType set_autocast_dtype(DType d) {
     return previous;
 }
 
+DType default_autocast() { return g_default_autocast; }
+
+DType set_default_autocast(DType d) {
+    if (!is_half(d) && d != F32)
+        throw runtime_error(string("set_default_autocast: dtype must be float16, bfloat16 or float32, got ") +
+                            dtype_name(d));
+    const DType previous = g_default_autocast;
+    if (g_autocast == previous) g_autocast = d;   // outside any scope: takes effect now
+    g_default_autocast = d;
+    return previous;
+}
+
 Autocast::Autocast(DType d) : previous(set_autocast_dtype(d)) {}
 Autocast::~Autocast() { g_autocast = previous; }
 
 TensorPtr autocast_input(TensorPtr t) {
     if (!t || g_autocast == F32 || !is_floating(t->dtype()) || t->dtype() == F64) return t;
+    // the default (set_default_autocast) is for the GPU's tensor cores; CPU
+    // tensors keep float32 unless a scope asks otherwise
+    if (g_default_autocast != F32 && g_autocast == g_default_autocast && t->device() != Device::CUDA) return t;
     return cast_op(t, g_autocast);
 }
 

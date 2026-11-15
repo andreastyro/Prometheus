@@ -320,7 +320,33 @@ for batch in data:
 Inside a capture nothing may read a value back (`.item()`, printing,
 `clip_grad_norm(..., return_norm=False)` instead); Adam and AdamW keep their
 step count on the GPU so replays stay correct. On an A100 graphs make the LSTM
-and GRU steps 1.5x faster, ahead of PyTorch's cuDNN. `cuda_memory_stats()` reports
+and GRU steps 1.5x faster, ahead of PyTorch's cuDNN.
+
+Under `autocast(p.bfloat16)` (or `float16`) the GPU path stays in the half
+dtype end to end: the gemms write their half results themselves, the backward
+gemms run in the half dtype too, attention keeps its probabilities in it, and
+the fused bias + GELU, bias + residual and residual + LayerNorm kernels read
+and write it directly -- parameters, the residual stream and gradients stay
+float32. A 12-layer GPT step on an A100 takes 21.2 ms this way, against
+PyTorch's 35.7 ms (eager). `p.set_default_autocast(p.bfloat16)` turns this on
+for every GPU matmul without a scope (CPU tensors stay float32, an explicit
+`autocast(p.float32)` still wins); it is off by default, so results are those
+of float32 unless asked.
+
+Attention has two GPU paths, picked by `p.set_attention_backend(...)` (or
+`PROMETHEUS_ATTENTION`): `"math"`, the scores as S x S buffers through cuBLAS,
+fastest at ordinary lengths, and `"flash"`, tiled with an online softmax so the
+scores are never stored -- memory linear in the sequence length, the backward
+recomputing them from each row's log-sum-exp (head size up to 128). The default
+`"auto"` switches to flash once the S x S buffers would pass 512 MB. The
+recurrent layers (RNN, LSTM, GRU with `reset_after=True`) run their whole
+recurrence in one kernel when the batch's hidden state fits in shared memory:
+each block owns a slice of the hidden units, with a barrier across the GPU
+between steps, instead of a gemm and a kernel launched per step
+(`PROMETHEUS_PERSISTENT_RNN=0` turns it off). `p.cuda_launch_counts()` counts
+the kernels, cuBLAS / cuDNN calls and copies issued since
+`p.cuda_reset_launch_counts()`; the GPU benchmarks print them per step.
+`cuda_memory_stats()` reports
 memory held by tensors, its peak and the allocator's cache; running out names
 the sizes involved. `cuda_set_device(i)` or `PROMETHEUS_CUDA_DEVICE` picks a
 GPU. `PROMETHEUS_PROFILE_BACKWARD=1` prints the backward pass's time by op.

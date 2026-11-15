@@ -672,6 +672,118 @@ int main() {
         CHECK_NEAR("GPT: every parameter's gradient matches the CPU", (float)(m / std::max(s, 1e-12)), 0.0f, 1e-4f);
     }
 
+    // ── the half-precision path: attention and a GPT step under autocast ──
+    {
+        const DType hd = cuda::has_bf16() ? DType::BFloat16 : DType::Float16;
+        const float tol = hd == DType::BFloat16 ? 3e-2f : 1e-2f;
+        auto rel = [](const std::vector<double>& a, const std::vector<double>& b) {
+            double m = 0, s = 0;
+            for (size_t j = 0; j < b.size() && j < a.size(); j++) {
+                m = std::max(m, std::fabs(a[j] - b[j]));
+                s = std::max(s, std::fabs(b[j]));
+            }
+            return a.size() == b.size() ? (float)(m / std::max(s, 1e-12)) : INFINITY;
+        };
+        for (int rope = 0; rope < 2; rope++) {
+            auto q0 = random_tensor({2, 16, 32}, 401 + rope);
+            auto w = G(random_tensor({2, 16, 32}, 403));
+            Tensor::manual_seed(9);
+            MultiHeadAttention m32(32, 4, true, rope);
+            Tensor::manual_seed(9);
+            MultiHeadAttention mh(32, 4, true, rope);
+            m32.to(Device::CUDA);
+            mh.to(Device::CUDA);
+            auto q32 = G(q0), qh = G(q0);
+            q32->set_requires_grad(true);
+            qh->set_requires_grad(true);
+            auto o32 = m32.forward(q32);
+            TensorPtr oh;
+            {
+                Autocast ac(hd);
+                oh = mh.forward(qh);
+            }
+            CHECK_TRUE("attention under autocast returns the half dtype", oh->dtype() == hd);
+            sum(multiply(o32, w), -1)->backward();
+            sum(multiply(cast_op(oh, DType::Float32), w), -1)->backward();
+            auto ov32 = o32->to(Device::CPU)->to_vector(), ovh = cast_op(oh, DType::Float32)->to(Device::CPU)->to_vector();
+            CHECK_NEAR(rope ? "half attention output (RoPE)" : "half attention output",
+                       rel(std::vector<double>(ovh.begin(), ovh.end()), std::vector<double>(ov32.begin(), ov32.end())),
+                       0.0f, tol);
+            CHECK_NEAR(rope ? "half attention gradient (RoPE)" : "half attention gradient",
+                       rel(qh->grad_doubles(), q32->grad_doubles()), 0.0f, 2 * tol);
+        }
+
+        // flash attention against the S x S path: output and input gradient
+        for (int variant = 0; variant < 4; variant++) {
+            const bool causal = variant != 1, rp = variant == 2, half = variant == 3;
+            auto x0 = random_tensor({2, 70, 64}, 421 + variant);        // 70: a partial tile
+            auto w = G(random_tensor({2, 70, 64}, 425));
+            TensorPtr outs[2], grads[2];
+            for (int f = 0; f < 2; f++) {
+                cuda::set_attention_backend(f ? "flash" : "math");
+                Tensor::manual_seed(11);
+                MultiHeadAttention m(64, 4, causal, rp);
+                m.to(Device::CUDA);
+                auto x = G(x0);
+                x->set_requires_grad(true);
+                TensorPtr o;
+                if (half) {
+                    Autocast ac(hd);
+                    o = m.forward(x);
+                } else {
+                    o = m.forward(x);
+                }
+                o = cast_op(o, DType::Float32);
+                sum(multiply(o, w), -1)->backward();
+                outs[f] = o->to(Device::CPU);
+                std::vector<double> g = x->grad_doubles();
+                std::vector<float> gf(g.begin(), g.end());
+                grads[f] = std::make_shared<Tensor>(Shape{(int64_t)gf.size()}, gf);
+            }
+            cuda::set_attention_backend("auto");
+            const float t = half ? tol : 1e-4f;
+            auto ref = [](const TensorPtr& v) {
+                float s = 0; for (float e : v->to_vector()) s = std::max(s, std::fabs(e)); return std::max(s, 1e-12f);
+            };
+            const char* names[] = {"flash attention, causal", "flash attention, not causal",
+                                   "flash attention, causal + RoPE", "flash attention under autocast"};
+            CHECK_NEAR(names[variant], max_diff(outs[1], outs[0]) / ref(outs[0]), 0.0f, t);
+            CHECK_NEAR((std::string(names[variant]) + ": gradient").c_str(), max_diff(grads[1], grads[0]) / ref(grads[0]),
+                       0.0f, 2 * t);
+        }
+
+        Tensor::manual_seed(5);
+        GPT a(50, 16, 64, 4, 2);
+        Tensor::manual_seed(5);
+        GPT b(50, 16, 64, 4, 2);
+        a.to(Device::CUDA);
+        b.to(Device::CUDA);
+        auto ids = std::make_shared<Tensor>(Shape{2, 16}, DType::Int64);
+        std::vector<float> v(32);
+        std::vector<int> targets(32);
+        for (int i = 0; i < 32; i++) { v[i] = (float)((i * 7 + 3) % 50); targets[i] = (i * 11 + 5) % 50; }
+        ids->set_data(v);
+        auto idg = ids->to(Device::CUDA);
+        auto l32 = cross_entropy_sparse_seq(a.forward(idg), targets);
+        TensorPtr lh;
+        {
+            Autocast ac(hd);
+            lh = cross_entropy_sparse_seq(b.forward(idg), targets);
+        }
+        CHECK_NEAR("GPT loss under autocast tracks float32",
+                   (float)std::fabs(lh->item_double() - l32->item_double()) / (float)l32->item_double(), 0.0f, tol);
+        l32->backward();
+        lh->backward();
+        std::vector<double> g32, gh;
+        for (auto& p : a.parameters()) { auto g = p->grad_doubles(); g32.insert(g32.end(), g.begin(), g.end()); }
+        for (auto& p : b.parameters()) { auto g = p->grad_doubles(); gh.insert(gh.end(), g.begin(), g.end()); }
+        double dot = 0, n32 = 0, nh = 0;
+        for (size_t j = 0; j < g32.size(); j++) { dot += g32[j] * gh[j]; n32 += g32[j] * g32[j]; nh += gh[j] * gh[j]; }
+        CHECK_NEAR("GPT gradients under autocast point the float32 way (cosine)",
+                   (float)(1.0 - dot / std::sqrt(n32 * nh + 1e-30)), 0.0f, 1e-2f);
+        CHECK_NEAR("GPT gradients under autocast: size", (float)std::fabs(std::sqrt(nh / n32) - 1.0), 0.0f, 5e-2f);
+    }
+
     // ── optimizers on the GPU ──
     {
         // run `steps` updates with fixed gradients on both devices, compare weights
@@ -1017,6 +1129,40 @@ int main() {
         bool finite = !lg.empty();
         for (double v : lg) finite = finite && std::isfinite(v);
         CHECK_TRUE("autocast: float32 weights on the GPU get finite gradients", finite);
+
+        // mixed precision as the default, no scope: GPU matmuls in the half
+        // dtype, CPU tensors untouched, an explicit float32 scope still wins
+        {
+            const DType hd = cuda::has_bf16() ? DType::BFloat16 : DType::Float16;
+            Linear lc(16, 8);
+            const DType before = set_default_autocast(hd);
+            auto yg = lin.forward(G(x0));
+            auto yc = lc.forward(x0);
+            TensorPtr yoff;
+            {
+                Autocast off(DType::Float32);
+                yoff = lin.forward(G(x0));
+            }
+            set_default_autocast(before);
+            auto yback = lin.forward(G(x0));
+            CHECK_TRUE("default autocast: a GPU Linear runs in the half dtype", yg->dtype() == hd);
+            CHECK_TRUE("default autocast: a CPU Linear stays float32", yc->dtype() == DType::Float32);
+            CHECK_TRUE("default autocast: an explicit float32 scope overrides it", yoff->dtype() == DType::Float32);
+            CHECK_TRUE("default autocast: off again after resetting it", yback->dtype() == DType::Float32 &&
+                                                                         autocast_dtype() == DType::Float32);
+        }
+
+        // launch counts: what one op issues
+        {
+            auto a = G(random_tensor({64, 64}, 431));
+            cuda::synchronize();
+            cuda::reset_launch_counts();
+            auto c = matmul(add(a, a), a);
+            cuda::synchronize();
+            const auto n = cuda::launch_counts();
+            CHECK_TRUE("launch counts: an add is one kernel, a matmul one cuBLAS call",
+                       n.kernels == 1 && n.library == 1);
+        }
 
         // GradScaler with GPU parameters
         auto p1 = G(random_tensor({100}, 87));
