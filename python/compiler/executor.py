@@ -72,27 +72,126 @@ def _run_region(graph, root, env):
     return _C._fused_map(fwd, bwd, mask, ins, higher)
 
 
-def _run_reduction(v, env):
-    x = env[v.args[0].id]
-    ax = v.attrs["axis"] % len(x.shape)
-    fn = _C.sum if v.op == "sum" else _C.mean
-    return fn(x, ax, v.attrs["keepdim"])
+# ── backend selection ─────────────────────────────────────────────────────────
+#
+# Which implementation runs each part of a graph, decided here, from the IR:
+#   matmul                      -> cuBLAS (the library's matmul, TF32 / bf16 as set)
+#   softmax, sum / mean         -> the library's kernels (row-wise, warp-per-row)
+#   reshape, transpose          -> views: no kernel
+#   an element-wise region      -> one generated kernel (codegen + NVRTC)
+#     ... of a single op whose inputs all have the output's shape
+#                               -> the library's own kernel (vectorised float4
+#                                  loads, nothing to compile) instead
+_SINGLE = {"add": "add", "sub": "subtract", "mul": "multiply", "div": "divide",
+           "exp": "exp_op", "log": "log_op", "sqrt": "sqrt_op", "abs": "abs_op", "tanh": "tanh_op",
+           "sigmoid": "sigmoid", "relu": "relu", "gelu": "gelu"}
+
+
+def backend(graph, v):
+    """The implementation chosen for value v (see the table above)."""
+    if v.op == "matmul":
+        return "cublas"
+    if v.op in ("softmax", "sum", "mean"):
+        return "library"
+    if v.op in ("reshape", "transpose"):
+        return "view"
+    if v.elementwise:
+        if (v.op in _SINGLE and all(a.op not in ("const",) and a.shape == v.shape for a in v.args)
+                and all(not a.elementwise for a in v.args)):
+            return "library-elementwise"
+        return "generated"
+    return "none"
+
+
+def _run_library(v, env):
+    a = [env[x.id] for x in v.args]
+    if v.op == "matmul":
+        return _C.matmul(a[0], a[1])
+    if v.op == "softmax":
+        return _C.softmax(a[0])
+    if v.op == "transpose":
+        return _C.transpose(a[0])
+    if v.op == "reshape":
+        return _C.reshape(a[0], list(v.attrs["shape"]))
+    if v.op in ("sum", "mean"):
+        ax = v.attrs["axis"] % len(a[0].shape)
+        return (_C.sum if v.op == "sum" else _C.mean)(a[0], ax, v.attrs["keepdim"])
+    if v.op in _SINGLE:
+        return getattr(_C, _SINGLE[v.op])(*a)
+    raise ValueError("executor: no library op for " + v.op)
+
+
+# ── memory: lifetimes ─────────────────────────────────────────────────────────
+#
+# Every computed tensor is dropped from the executor's environment right after
+# its last reader runs, so its block goes back to the caching allocator and
+# the next intermediate of that size class reuses it within the same call
+# (tensors autograd keeps for the backward stay alive through their nodes).
+
+def _reads(graph, v):
+    """The computed tensors v's implementation reads: a generated region its
+    leaves (inputs, reduction / library results), anything else its arguments."""
+    return _region(graph, v) if v.elementwise else list(v.args)
+
+
+def _last_use(graph, order):
+    last = {}
+    for step, v in enumerate(order):
+        for a in _reads(graph, v):
+            last[a.id] = step
+    for o in graph.outputs:
+        last[o.id] = len(order)
+    return last
+
+
+def _materialised(graph):
+    """The values a run computes as tensors, in order: library ops,
+    reductions, views, and the element-wise values they or the outputs read
+    (each the root of one generated region)."""
+    live = graph.live()
+    roots = set(o.id for o in graph.outputs if o.elementwise)
+    for v in live:
+        if not v.elementwise and v.op not in ("input", "const"):
+            roots.update(a.id for a in v.args if a.elementwise)
+    return [v for v in live if (not v.elementwise and v.op not in ("input", "const")) or v.id in roots]
+
+
+def plan(graph, shapes):
+    """The memory plan: (peak bytes held by intermediates with release at
+    last use, the same without release), from the inferred shapes."""
+    graph.infer(shapes)
+    order = _materialised(graph)
+    last = _last_use(graph, order)
+    size = {v.id: 4 * _numel(v.shape) for v in order if v.op not in ("reshape", "transpose")}
+    held, peak, total = set(), 0, 0
+    for step, v in enumerate(order):
+        held.add(v.id)
+        total += size.get(v.id, 0)
+        peak = max(peak, sum(size.get(i, 0) for i in held))
+        held = {i for i in held if last.get(i, -1) > step}
+    return peak, total
+
+
+def _numel(shape):
+    n = 1
+    for d in shape:
+        n *= d
+    return n
 
 
 def run(graph, tensors):
     """The graph's outputs on these tensors (one per input)."""
     graph.infer([tuple(t.shape) for t in tensors])
     env = {v.id: t for v, t in zip(graph.inputs, tensors)}
-    for v in graph.live():
-        if v.id in env or v.op in ("input", "const") or v.elementwise:
-            continue
-        a = v.args[0]
-        if a.id not in env:
-            env[a.id] = _run_region(graph, a, env)
-        env[v.id] = _run_reduction(v, env)
-    outs = []
-    for o in graph.outputs:
-        if o.id not in env:
-            env[o.id] = _run_region(graph, o, env) if o.elementwise or o.op == "const" else env[o.id]
-        outs.append(env[o.id])
-    return outs
+    order = _materialised(graph)
+    last = _last_use(graph, order)
+    for step, v in enumerate(order):
+        b = backend(graph, v)
+        if b == "generated" or (b == "library-elementwise" and any(a.id not in env for a in v.args)):
+            env[v.id] = _run_region(graph, v, env)
+        else:
+            env[v.id] = _run_library(v, env)
+        for a in _reads(graph, v):             # release what nothing later reads
+            if last.get(a.id, -1) <= step and a.id in env and a.op != "input":
+                del env[a.id]
+    return [env[o.id] for o in graph.outputs]

@@ -8,14 +8,16 @@ axis) as generated GPU kernels.
 
 The first call traces the function on symbols into the compiler's IR
 (prometheus.compiler): arithmetic operators and the p.fx functions -- exp,
-log, sqrt, abs, tanh, sigmoid, relu, gelu, pow, maximum, minimum, and the
-reductions sum and mean along an axis. Each element-wise region between
-reductions becomes one kernel forward and one backward, generated from the
-IR's reverse-mode derivative (a gradient that is itself recorded is built
-as fused kernels in turn, so to any order); reductions run as the library's
-ops. Inputs broadcast. On CPU tensors the same function runs as ordinary
-ops. No Python control flow on values, no shape changes other than the
-reductions.
+log, sqrt, abs, tanh, sigmoid, relu, gelu, pow, maximum, minimum, the
+reductions sum and mean along an axis, and whole ops: `@` (matmul),
+softmax, reshape, transpose, layernorm. A whole forward pass can be traced:
+each element-wise region between library ops becomes one kernel forward and
+one backward, generated from the IR's reverse-mode derivative (a gradient
+that is itself recorded is built as fused kernels in turn, so to any order);
+matmuls, softmax and reductions run as the library's ops (see
+compiler/executor.py: backend selection, and intermediates released at their
+last use). Inputs broadcast. On CPU tensors the same function runs as
+ordinary ops. No Python control flow on tensor values.
 """
 from . import _C
 from .compiler import executor
@@ -41,6 +43,8 @@ class Sym:
     def __truediv__(self, o): return Sym(self.g, self.g.div(self.v, self._o(o)))
     def __rtruediv__(self, o): return Sym(self.g, self.g.div(self._o(o), self.v))
     def __neg__(self): return Sym(self.g, self.g.neg(self.v))
+    def __matmul__(self, o): return Sym(self.g, self.g.library("matmul", (self.v, self._o(o))))
+    def __rmatmul__(self, o): return Sym(self.g, self.g.library("matmul", (self._o(o), self.v)))
 
     def __pow__(self, e):
         if not isinstance(e, (int, float)):
@@ -74,6 +78,29 @@ def _reduction(name, real):
     return staticmethod(f)
 
 
+def _softmax(x):
+    return Sym(x.g, x.g.library("softmax", (x.v,))) if isinstance(x, Sym) else _C.softmax(x)
+
+
+def _reshape(x, shape):
+    if isinstance(x, Sym):
+        return Sym(x.g, x.g.library("reshape", (x.v,), shape=tuple(int(d) for d in shape)))
+    return _C.reshape(x, list(shape))
+
+
+def _transpose(x):
+    return Sym(x.g, x.g.library("transpose", (x.v,))) if isinstance(x, Sym) else _C.transpose(x)
+
+
+def _layernorm(x, gamma, beta, eps=1e-5):
+    """LayerNorm over the last axis, written as reductions and element-wise
+    ops: under p.fuse three generated kernels around two means."""
+    m = fx.mean(x)
+    d = x - m
+    var = fx.mean(d * d)
+    return d / fx.sqrt(var + eps) * gamma + beta
+
+
 def _pow(x, e):
     return x ** e if isinstance(x, Sym) else _C.pow_op(x, float(e))
 
@@ -95,6 +122,10 @@ class fx:
     minimum = _binary("min", lambda a, b: _C.where(a <= b, a, b))
     sum = _reduction("sum", _C.sum)
     mean = _reduction("mean", _C.mean)
+    softmax = staticmethod(_softmax)
+    reshape = staticmethod(_reshape)
+    transpose = staticmethod(_transpose)
+    layernorm = staticmethod(_layernorm)
 
 
 class Fused:

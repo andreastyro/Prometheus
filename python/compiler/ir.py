@@ -22,6 +22,8 @@ ELEMENTWISE_UNARY = ("neg", "exp", "log", "sqrt", "abs", "tanh", "sigmoid", "rel
                      "sign", "step", "gelu_d")
 ELEMENTWISE_BINARY = ("add", "sub", "mul", "div", "max", "min", "ge", "le")
 REDUCTIONS = ("sum", "mean")
+# whole ops the runtime library runs (cuBLAS, its fused kernels, views)
+LIBRARY = ("matmul", "softmax", "reshape", "transpose")
 
 
 class Value:
@@ -137,6 +139,10 @@ class Graph:
         assert op in ELEMENTWISE_BINARY, op
         return getattr(self, op)(a, b) if op in ("add", "sub", "mul", "div") else self.make(op, (a, b))
 
+    def library(self, op, args, **attrs):
+        assert op in LIBRARY, op
+        return self.make(op, args, attrs or None)
+
     def reduce(self, op, a, axis=-1, keepdim=True):
         assert op in REDUCTIONS, op
         return self.make(op, (a,), {"axis": int(axis), "keepdim": bool(keepdim)})
@@ -156,6 +162,28 @@ class Graph:
                 continue
             if v.op == "const":
                 v.shape, v.dtype = (), "float32"
+            elif v.op == "matmul":
+                a, b = v.args[0].shape, v.args[1].shape
+                if len(a) < 2 or len(b) < 2 or a[-1] != b[-2]:
+                    raise ValueError("matmul: %s @ %s" % (a, b))
+                v.shape, v.dtype = _broadcast(a[:-2], b[:-2]) + (a[-2], b[-1]), "float32"
+            elif v.op == "softmax":
+                v.shape, v.dtype = v.args[0].shape, "float32"
+            elif v.op == "transpose":
+                s = list(v.args[0].shape)
+                s[-1], s[-2] = s[-2], s[-1]
+                v.shape, v.dtype = tuple(s), "float32"
+            elif v.op == "reshape":
+                s, want = v.args[0].shape, list(v.attrs["shape"])
+                n = 1
+                for d in s:
+                    n *= d
+                if -1 in want:
+                    k = 1
+                    for d in want:
+                        k *= d if d != -1 else 1
+                    want[want.index(-1)] = n // k
+                v.shape, v.dtype = tuple(want), "float32"
             elif v.op in REDUCTIONS:
                 s = v.args[0].shape
                 ax = v.attrs["axis"] % len(s) if s else 0

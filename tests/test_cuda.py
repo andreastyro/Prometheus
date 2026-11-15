@@ -200,6 +200,29 @@ def test_fuse():
     check("fuse: reductions inside (mean, sum along an axis)", np.abs(lo["cuda"][0] - lo["cpu"][0]).max() < 1e-4)
     check("fuse: gradient through the reductions", np.abs(lo["cuda"][1] - lo["cpu"][1]).max() < 1e-4)
 
+    # a whole block traced: LayerNorm, two matmuls, GELU, residual -- library
+    # ops and generated kernels; every parameter's gradient against the CPU
+    def block(x, g, b, w1, b1, w2, b2):
+        h = p.fx.layernorm(x, g, b)
+        h = p.fx.gelu(h @ w1 + b1)
+        return h @ w2 + b2 + x
+    bf = p.fuse(block)
+    shapes = [(6, 16), (16,), (16,), (16, 24), (24,), (24, 16), (16,)]
+    vals = [rng.standard_normal(s).astype(np.float32) * 0.5 for s in shapes]
+    res = {}
+    for dev in ("cpu", "cuda"):
+        ts = [T(v) for v in vals]
+        if dev == "cuda":
+            ts = [t.cuda() for t in ts]
+        for t in ts:
+            t.requires_grad = True
+        y = (bf if dev == "cuda" else block)(*ts)
+        p.sum(p.reshape(y * y, [-1]), -1).backward()
+        res[dev] = [(y.cpu() if dev == "cuda" else y).numpy()] + [np.array(t.grad).reshape(-1) for t in ts]
+    check("fuse: a whole block (LayerNorm, matmuls, GELU, residual)", np.abs(res["cuda"][0] - res["cpu"][0]).max() < 1e-4)
+    check("fuse: every parameter's gradient through the block",
+          max(np.abs(a - b).max() / max(np.abs(b).max(), 1e-6) for a, b in zip(res["cuda"][1:], res["cpu"][1:])) < 1e-4)
+
     # second derivative through a fused function: its gradient is fused again
     swish = p.fuse(lambda x: x * p.fx.sigmoid(x) + p.fx.tanh(x) * x)
     hs = {}
