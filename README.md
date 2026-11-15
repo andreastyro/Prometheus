@@ -200,6 +200,47 @@ PyTorch runs its convolutions through oneDNN's direct-convolution kernels;
 against its own im2col path (oneDNN off) the convolutions here are 1.3-1.6x. Benchmark with
 [tests/benchmark_matmul.cpp](tests/benchmark_matmul.cpp).
 
+### On the GPU
+
+One full training step (forward, backward, optimizer), ms, against PyTorch 2.15
+eager and `torch.compile` on the same model in the same session, interleaved
+([tests/bench_gpu_all.py](tests/bench_gpu_all.py), run on Modal with
+[tests/modal_gpu.py](tests/modal_gpu.py)). A100, float32:
+
+| Model | Prometheus | PyTorch eager | torch.compile |
+|---|---|---|---|
+| GPT 4 x 256, batch 8 x 128, AdamW | **4.6** | 8.9 (1.9x slower) | 5.1 |
+| GPT, with gradient clipping | **5.2** | 9.6 | 5.2 |
+| CNN, batch 64 of 32x32 | **1.1** | 1.4 | 1.5 |
+| GPT 12 x 768, batch 8 x 256 | **79.1** | 86.2 | 81.3 (max-autotune) |
+| the same, TF32 matmuls | **24.5** | 30.6 | 24.7 (max-autotune) |
+
+With the step replayed from a CUDA Graph (`p.CUDAGraph`), against PyTorch
+eager in the same run:
+
+| Model | Prometheus, graph | PyTorch eager |
+|---|---|---|
+| CNN | **0.8** | 1.2 |
+| LSTM, 64 x 32 x 128 -> 256 | **2.2** | 2.3 |
+| GRU (`reset_after=True`) | **2.0** | 2.4 |
+| GPT 4 x 256 | 4.6 | 5.8 (`reduce-overhead` 4.2) |
+
+GTX 970, float32, against PyTorch 2.14 eager: GPT 16.5 vs 19.4 ms, with
+clipping 16.9 vs 20.1, CNN 4.4 vs 4.9, RNN 2.6 vs 3.2.
+
+Where it is behind, and why:
+
+| Model | Prometheus | PyTorch eager | torch.compile | Why |
+|---|---|---|---|---|
+| RNN, A100 | 2.7 (graph 1.7) | 0.8 | 0.8 | 64 small sequential steps: launch-bound, cuDNN runs the recurrence in one persistent kernel |
+| LSTM / GRU, A100, no graph | 3.3 / 3.2 | 2.5 / 2.4 | 2.5 / 2.5 | the same; a graph closes it (above) |
+| LSTM / GRU, GTX 970 | 5.2 / 5.0 | 5.0 / 4.4 | | the same |
+| GPT 12 x 768, bf16 autocast, A100 | 71.2 | 35.3 | 16.7 (max-autotune) | only the matmuls run in bf16; every fused kernel casts in and out of float32 |
+| GPT 4 x 256, bf16 autocast, A100 | 5.9 | 11.4 | 2.5 | the same |
+
+A real bf16 path (fused kernels reading and writing bf16) and a persistent
+recurrent kernel are the next pieces of work.
+
 ---
 
 ## Install
