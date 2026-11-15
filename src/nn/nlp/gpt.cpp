@@ -3,6 +3,7 @@
 #include "ml/ops.hpp"
 #include "ml/autograd.hpp"
 #include "ml/matmul_backend.hpp"
+#include "ml/cuda.hpp"
 #include <cmath>
 #include <string>
 #include <stdexcept>
@@ -118,7 +119,9 @@ TensorPtr GPT::forward(TensorPtr token_ids) {
         auto h = add(cuda_ops::embedding_device(tok_emb.weight, ids_dev, 0, (long long)B * S, xshape),
                      cuda_ops::embedding_device(pw, nullptr, S, (long long)B * S, xshape));
         for (auto& blk : blocks) h = blk.forward(h);
-        h = ln_f.forward(h);
+        const DType ac = autocast_dtype();
+        const DType lo = (ac == DType::BFloat16 && cuda::has_bf16()) || ac == DType::Float16 ? ac : DType::Float32;
+        h = ln_f.forward_as(h, lo);                         // feeds only the output gemm
         return matmul(h, transpose(tok_emb.weight));       // weight-tied output projection
     }
 

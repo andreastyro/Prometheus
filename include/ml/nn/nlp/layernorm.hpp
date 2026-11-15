@@ -30,6 +30,9 @@ public:
 
     /// Normalise each row independently over its last dimension.
     TensorPtr forward(TensorPtr input) override;
+    /// The same, the result written in out_dtype on the GPU (a half dtype when
+    /// it only feeds a gemm under autocast -- no conversion pass); float32 on the CPU.
+    TensorPtr forward_as(TensorPtr input, DType out_dtype);
 
     std::vector<TensorPtr> parameters() override; ///< Returns {gamma, beta}
 };

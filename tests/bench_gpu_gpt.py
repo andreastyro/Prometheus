@@ -5,8 +5,11 @@
 Run the two one after the other on the same machine; each prints tokens/s for
 forward + backward + AdamW. The PyTorch model mirrors Prometheus's GPT: learned
 token and position embeddings, pre-LayerNorm blocks with plain causal
-attention (matmul, mask, softmax -- not a fused kernel), a 4x GELU MLP, a final
-LayerNorm and an output projection tied to the token embedding.
+attention, a 4x GELU MLP, a final
+LayerNorm and an output projection tied to the token embedding. Its
+attention is F.scaled_dot_product_attention (flash / memory-efficient kernels
+where the GPU has them) -- PyTorch's best; --manual-attn takes the matmul,
+mask, softmax form instead.
 """
 import argparse
 import time
@@ -29,6 +32,8 @@ ap.add_argument("--tf32", action="store_true", help="float32 matmuls on TF32 ten
 ap.add_argument("--amp", choices=["bf16", "fp16"], help="mixed precision: autocast to bf16 / fp16 (fp16 with a GradScaler)")
 ap.add_argument("--compile-mode", default="default", help="torch.compile mode: default, max-autotune, reduce-overhead")
 ap.add_argument("--clip-norm", action="store_true", help="with --clip, read the norm back (Prometheus; a sync each step)")
+ap.add_argument("--manual-attn", action="store_true",
+                help="PyTorch: attention as matmul / mask / softmax instead of scaled_dot_product_attention")
 ap.add_argument("--issue", action="store_true", help="also time how long the CPU takes to issue a step (before waiting for the GPU)")
 args = ap.parse_args()
 
@@ -105,9 +110,14 @@ else:
             b, s, e = x.shape
             y = self.n1(x)
             q, k, v = (m(y).view(b, s, self.h, e // self.h).transpose(1, 2) for m in (self.q, self.k, self.v))
-            att = (q @ k.transpose(-2, -1)) / (e // self.h) ** 0.5
-            att = att.masked_fill(torch.triu(torch.ones(s, s, device=x.device, dtype=torch.bool), 1), float("-inf"))
-            y = (F.softmax(att, -1) @ v).transpose(1, 2).reshape(b, s, e)
+            if args.manual_attn:
+                att = (q @ k.transpose(-2, -1)) / (e // self.h) ** 0.5
+                att = att.masked_fill(torch.triu(torch.ones(s, s, device=x.device, dtype=torch.bool), 1),
+                                      float("-inf"))
+                y = F.softmax(att, -1) @ v
+            else:
+                y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            y = y.transpose(1, 2).reshape(b, s, e)
             x = x + self.o(y)
             return x + self.f2(F.gelu(self.f1(self.n2(x)), approximate="tanh"))
 

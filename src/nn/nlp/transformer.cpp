@@ -1,6 +1,7 @@
 #include "../../ops_internal.hpp"
 #include "ml/nn/nlp/transformer.hpp"
 #include "ml/ops.hpp"
+#include "ml/cuda.hpp"
 
 using namespace std;
 
@@ -19,7 +20,10 @@ TensorPtr TransformerBlock::forward(TensorPtr input) {
     if (input->device() == Device::CUDA) {
         // the same block with the work between gemms fused: residual + norm2,
         // bias + GELU, bias + residual -- one kernel each
-        auto [x, h2] = cuda_ops::add_layernorm(input, attn.forward(norm1.forward(input)),
+        // under autocast the first norm's output only feeds the qkv gemm: in its dtype
+        const DType ac = autocast_dtype();
+        const DType n1 = (ac == DType::BFloat16 && cuda::has_bf16()) || ac == DType::Float16 ? ac : DType::Float32;
+        auto [x, h2] = cuda_ops::add_layernorm(input, attn.forward(norm1.forward_as(input, n1)),
                                                norm2.gamma, norm2.beta, norm2.eps);
         auto h = cuda_ops::bias_gelu(matmul(h2, ff1.weights), ff1.bias);
         return cuda_ops::add_bias_residual(matmul(h, ff2.weights), ff2.bias, x);

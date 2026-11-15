@@ -31,10 +31,12 @@ static TensorPtr layernorm_ops(const TensorPtr& x, const TensorPtr& g, const Ten
     return add(multiply(xh, g), b);
 }
 
-TensorPtr LayerNorm::forward(TensorPtr input) {
+TensorPtr LayerNorm::forward(TensorPtr input) { return forward_as(input, DType::Float32); }
+
+TensorPtr LayerNorm::forward_as(TensorPtr input, DType out_dtype) {
     if (input->device() == Device::CUDA || gamma->device() == Device::CUDA) {
         // one fused kernel forward; the gradient differentiates the op form
-        auto out = cuda_ops::layernorm(input, gamma, beta, eps);
+        auto out = cuda_ops::layernorm(input, gamma, beta, eps, out_dtype);
         if (input->requires_grad() || gamma->requires_grad() || beta->requires_grad()) {
             auto node = make_node(out, {input, gamma, beta});
             node->name = "LayerNorm::forward";

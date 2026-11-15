@@ -145,10 +145,11 @@ extern "C" __global__ void r_gruA_back(const float* g, const float* h_prev, cons
 
 // ── the recurrence in one launch ──
 // Block x owns hidden units [x*U, x*U + U) -- every gate of them -- for the
-// whole batch; thread i < B*U is (batch b = i / U, unit u0 + i % U). Steps are
-// separated by a grid-wide barrier, so every block must be resident at once:
-// the host launches no more blocks than resident_blocks() allows.
-// bar[0] counts arrivals, bar[1] is the generation.
+// whole batch. Steps are separated by a grid-wide barrier, so every block
+// must be resident at once: the host launches no more blocks than
+// resident_blocks() allows. Everything a step reads repeatedly is in shared
+// memory: the block's columns of W_h and h_{t-1} (forward), its rows of W_h
+// and the next step's gradient (backward). bar[0] arrivals, bar[1] generation.
 __device__ void grid_sync(unsigned* bar, unsigned nb) {
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -167,89 +168,112 @@ __device__ void grid_sync(unsigned* bar, unsigned nb) {
     __syncthreads();
 }
 // cell 0 RNN (tanh), 1 LSTM (i f o g), 3 GRU reset-after (r z n). gates holds
-// each step's input projection plus bias and becomes the activated gates, as
-// the per-step kernels leave it. hs: h_{t-1} for the batch, in shared memory.
+// each step's input projection plus bias and becomes the activated gates.
+// Shared: ws [H][G*U] (column g*U + uu is W_h's column g*H + u0 + uu),
+// hs [B][H], pre [B][G*U] (the step's products).
 extern "C" __global__ void r_persist_fwd(int cell, int S, int B, int H, int G, int U, float* gates,
                                          const float* W, const float* h_init, const float* c_init, float* OUT,
                                          float* cs, float* HN, const float* bhn, unsigned* bar) {
-    extern __shared__ float hs[];
-    const int GH = G * H, BH = B * H;
-    const int idx = threadIdx.x, b = idx / U, u = blockIdx.x * U + idx % U;
-    const bool active = idx < B * U && u < H;
+    extern __shared__ float sm[];
+    const int GH = G * H, BH = B * H, GU = G * U, u0 = blockIdx.x * U;
+    float* ws = sm;
+    float* hs = ws + H * GU;
+    float* pre = hs + BH;
+    for (int q = threadIdx.x; q < H * GU; q += blockDim.x) {
+        const int k = q / GU, col = q % GU, g = col / U, u = u0 + col % U;
+        ws[q] = u < H ? W[(long long)k * GH + g * H + u] : 0.0f;
+    }
     for (int t = 0; t < S; t++) {
         const float* hp = t ? OUT + (long long)(t - 1) * BH : h_init;
-        for (int i = threadIdx.x; i < BH; i += blockDim.x) hs[i] = __ldcg(hp + i);
+        if ((BH & 3) == 0 && ((H * GU) & 3) == 0) {
+            const float4* h4 = reinterpret_cast<const float4*>(hp);
+            float4* s4 = reinterpret_cast<float4*>(hs);
+            #pragma unroll 4
+            for (int q = threadIdx.x; q < BH / 4; q += blockDim.x) s4[q] = __ldcg(h4 + q);
+        } else {
+            for (int q = threadIdx.x; q < BH; q += blockDim.x) hs[q] = __ldcg(hp + q);
+        }
         __syncthreads();
-        if (active) {
-            float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+        // B * G*U products of length H, a thread each: consecutive threads
+        // take consecutive columns (no bank conflicts on ws; hs broadcast)
+        for (int o = threadIdx.x; o < B * GU; o += blockDim.x) {
+            const int b = o / GU, col = o % GU;
             const float* hb = hs + b * H;
-            const float* w = W + u;
-            if (G == 1) {
-                for (int k = 0; k < H; k++) acc0 += hb[k] * __ldg(w + (long long)k * GH);
-            } else if (G == 3) {
-                for (int k = 0; k < H; k++) {
-                    const float hk = hb[k];
-                    const float* wk = w + (long long)k * GH;
-                    acc0 += hk * __ldg(wk); acc1 += hk * __ldg(wk + H); acc2 += hk * __ldg(wk + 2 * H);
-                }
-            } else {
-                for (int k = 0; k < H; k++) {
-                    const float hk = hb[k];
-                    const float* wk = w + (long long)k * GH;
-                    acc0 += hk * __ldg(wk); acc1 += hk * __ldg(wk + H);
-                    acc2 += hk * __ldg(wk + 2 * H); acc3 += hk * __ldg(wk + 3 * H);
-                }
-            }
+            float a0 = 0.0f, a1 = 0.0f;
+            int k = 0;
+            for (; k + 1 < H; k += 2) { a0 += hb[k] * ws[k * GU + col]; a1 += hb[k + 1] * ws[(k + 1) * GU + col]; }
+            if (k < H) a0 += hb[k] * ws[k * GU + col];
+            pre[o] = a0 + a1;
+        }
+        __syncthreads();
+        float* ht = OUT + (long long)t * BH;
+        for (int o = threadIdx.x; o < B * U; o += blockDim.x) {
+            const int b = o / U, uu = o % U, u = u0 + uu;
+            if (u >= H) continue;
+            const float* pr = pre + b * GU + uu;           // gate g at pr[g * U]
             float* ar = gates + ((long long)t * B + b) * GH;
             const int i = b * H + u;
-            float* ht = OUT + (long long)t * BH;
             if (cell == 0) {
-                const float v = th(ar[u] + acc0);
+                const float v = th(ar[u] + pr[0]);
                 ar[u] = v; ht[i] = v;
             } else if (cell == 1) {
-                const float ig = sg(ar[u] + acc0), fg = sg(ar[H + u] + acc1);
-                const float og = sg(ar[2 * H + u] + acc2), gg = th(ar[3 * H + u] + acc3);
+                const float ig = sg(ar[u] + pr[0]), fg = sg(ar[H + u] + pr[U]);
+                const float og = sg(ar[2 * H + u] + pr[2 * U]), gg = th(ar[3 * H + u] + pr[3 * U]);
                 ar[u] = ig; ar[H + u] = fg; ar[2 * H + u] = og; ar[3 * H + u] = gg;
                 const float cp = t ? cs[(long long)(t - 1) * BH + i] : c_init[i];
                 const float ct = fg * cp + ig * gg;
                 cs[(long long)t * BH + i] = ct;
                 ht[i] = og * th(ct);
             } else {
-                const float r = sg(ar[u] + acc0), z = sg(ar[H + u] + acc1);
-                const float hn = acc2 + bhn[u];
+                const float r = sg(ar[u] + pr[0]), z = sg(ar[H + u] + pr[U]);
+                const float hn = pr[2 * U] + bhn[u];
                 const float n = th(ar[2 * H + u] + r * hn);
                 ar[u] = r; ar[H + u] = z; ar[2 * H + u] = n;
                 HN[(long long)t * BH + i] = hn;
-                ht[i] = (1.0f - z) * n + z * hb[u];
+                ht[i] = (1.0f - z) * n + z * hs[b * H + u];
             }
         }
         if (t + 1 < S) grid_sync(bar, gridDim.x);
     }
 }
-// Backward through time, the same ownership. The product back through W_h
-// for unit u needs row u of W_h (kept in shared memory, [U][GH + 1]) and the
-// whole batch's gradient row from the step after, staged through shared
-// memory `chunk` columns at a time ([B][chunk + 1]; the +1s keep the threads
-// of a warp on different banks). src is dA (RNN, LSTM) or dHH (GRU).
-// dh: out, the gradient for h_0; dc: in dc_n, out dc_0.
-__device__ float back_product(const float* srow, const float* wr, float* sc, int B, int GH, int chunk, bool active,
-                              int b, int uu) {
-    float acc = 0.0f;
+// Backward through time, the same ownership. dh for unit u is row u of W_h
+// against the batch's gradient row from the step after (src: dA, or dHH for
+// the GRU): a warp per (batch, unit) product, lanes across the columns, the
+// gradient staged through shared memory `chunk` columns at a time.
+// Shared: wr [U][GH], sc [B][chunk], acc [B*U].
+__device__ void back_products(const float* srow, const float* wr, float* sc, float* acc, int B, int U, int GH,
+                              int chunk) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    for (int q = threadIdx.x; q < B * U; q += blockDim.x) acc[q] = 0.0f;
     for (int c0 = 0; c0 < GH; c0 += chunk) {
         const int cn = min(chunk, GH - c0);
         __syncthreads();
-        for (int q = threadIdx.x; q < B * cn; q += blockDim.x) {
-            const int bb = q / cn, c = q % cn;
-            sc[bb * (chunk + 1) + c] = __ldcg(srow + (long long)bb * GH + c0 + c);
+        if ((GH & 3) == 0 && (cn & 3) == 0 && (chunk & 3) == 0) {
+            const int c4 = cn / 4;
+            #pragma unroll 4
+            for (int q = threadIdx.x; q < B * c4; q += blockDim.x) {
+                const int bb = q / c4, c = q % c4;
+                reinterpret_cast<float4*>(sc + bb * chunk)[c] =
+                    __ldcg(reinterpret_cast<const float4*>(srow + (long long)bb * GH + c0) + c);
+            }
+        } else {
+            for (int q = threadIdx.x; q < B * cn; q += blockDim.x) {
+                const int bb = q / cn, c = q % cn;
+                sc[bb * chunk + c] = __ldcg(srow + (long long)bb * GH + c0 + c);
+            }
         }
         __syncthreads();
-        if (active) {
-            const float* s = sc + b * (chunk + 1);
-            const float* w = wr + uu * (GH + 1) + c0;
-            for (int c = 0; c < cn; c++) acc += s[c] * w[c];
+        for (int o = warp; o < B * U; o += nw) {
+            const int b = o / U, uu = o % U;
+            const float* s = sc + b * chunk;
+            const float* w = wr + uu * GH + c0;
+            float a = 0.0f;
+            for (int c = lane; c < cn; c += 32) a += s[c] * w[c];
+            for (int off = 16; off > 0; off >>= 1) a += __shfl_xor_sync(0xffffffffu, a, off);
+            if (lane == 0) acc[o] += a;
         }
     }
-    return acc;
+    __syncthreads();
 }
 extern "C" __global__ void r_persist_bwd(int cell, int S, int B, int H, int G, int U, int chunk,
                                          const float* gates, const float* W, const float* OUT, const float* h_init,
@@ -257,11 +281,12 @@ extern "C" __global__ void r_persist_bwd(int cell, int S, int B, int H, int G, i
                                          float* dA, float* dHH, float* dh, float* dc, unsigned* bar) {
     extern __shared__ float sm[];
     const int GH = G * H, BH = B * H, u0 = blockIdx.x * U;
-    float* wr = sm;                                  // [U][GH + 1]
-    float* sc = sm + U * (GH + 1);                   // [B][chunk + 1]
+    float* wr = sm;                                  // [U][GH]
+    float* acc = wr + U * GH;                        // [B * U], padded to a multiple of 4
+    float* sc = acc + ((B * U + 3) & ~3);            // [B][chunk]
     for (int q = threadIdx.x; q < U * GH; q += blockDim.x) {
         const int r = q / GH, c = q % GH;
-        wr[r * (GH + 1) + c] = u0 + r < H ? W[(long long)(u0 + r) * GH + c] : 0.0f;
+        wr[q] = u0 + r < H ? W[(long long)(u0 + r) * GH + c] : 0.0f;
     }
     const int idx = threadIdx.x, b = idx / U, uu = idx % U, u = u0 + uu;
     const bool active = idx < B * U && u < H;
@@ -274,7 +299,8 @@ extern "C" __global__ void r_persist_bwd(int cell, int S, int B, int H, int G, i
         float dht = 0.0f;
         if (s < S - 1) {
             grid_sync(bar, gridDim.x);               // step s + 1 written by every block
-            dht = back_product(src + (long long)(s + 1) * B * GH, wr, sc, B, GH, chunk, active, b, uu) + own;
+            back_products(src + (long long)(s + 1) * B * GH, wr, sc, acc, B, U, GH, chunk);
+            if (active) dht = acc[idx] + own;
         }
         if (active) {
             const long long o = ((long long)s * B + b) * GH;
@@ -309,9 +335,9 @@ extern "C" __global__ void r_persist_bwd(int cell, int S, int B, int H, int G, i
     }
     // the gradient for h_0: through step 0's product
     grid_sync(bar, gridDim.x);
-    const float d0 = back_product(src, wr, sc, B, GH, chunk, active, b, uu) + own;
+    back_products(src, wr, sc, acc, B, U, GH, chunk);
     if (active) {
-        dh[i] = d0;
+        dh[i] = acc[idx] + own;
         if (cell == 1) dc[i] = dcr;
     }
 }
@@ -331,28 +357,30 @@ struct Persist {
 };
 Persist persist_plan(int cell, int B, int H, int G) {
     Persist p;
-    static const bool on = [] {
-        // off by default: on an A100 it is slower than a gemm + kernel a step
-        // (LSTM 13.4 vs 3.3 ms) -- W_h is read from global memory, a thread
-        // at a time, latency-bound; needs W_h in shared memory and the dot
-        // products split across threads
+    // where it is the faster path (A100, 64 x 32, 128 -> 256): RNN 2.3 ms in
+    // one launch vs 2.6 per step; LSTM 4.8 vs 3.3 and GRU 3.8 vs 3.4 -- there
+    // every block re-reads the whole batch's 4H- / 3H-wide gradient from L2
+    // each step. PROMETHEUS_PERSISTENT_RNN=1 forces it for every cell, =0 off.
+    static const int mode = [] {
         const char* e = std::getenv("PROMETHEUS_PERSISTENT_RNN");
-        return e && e[0] == '1';
+        return !e || !*e ? -1 : e[0] == '1' ? 1 : 0;
     }();
+    const bool on = mode == 1 || (mode == -1 && cell == 0);
     const int sms = cuda::multiprocessor_count();
     if (!on || cell == 2 || sms <= 0 || B <= 0 || H <= 0) return p;
-    const unsigned limit = 48 * 1024;
+    const size_t limit = 48 * 1024;
     p.U = (H + sms - 1) / sms;
     p.blocks = (H + p.U - 1) / p.U;
-    p.threads = (B * p.U + 31) / 32 * 32;
-    if (p.threads > 1024) return p;
-    const size_t fsh = (size_t)B * H * sizeof(float);
-    const size_t wr = (size_t)p.U * (G * H + 1) * sizeof(float);
-    if (fsh > limit || wr + (size_t)B * 33 * sizeof(float) > limit) return p;
-    p.chunk = (int)std::min<size_t>((size_t)G * H, (limit - wr) / ((size_t)B * sizeof(float)) - 1);
+    if (B * p.U > 1024) return p;
+    p.threads = std::max(512, (B * p.U + 31) / 32 * 32);
+    const size_t GH = (size_t)G * H, GU = (size_t)G * p.U, f = sizeof(float);
+    const size_t fsh = ((size_t)H * GU + (size_t)B * H + (size_t)B * GU) * f;
+    const size_t fixed = ((size_t)p.U * GH + (((size_t)B * p.U + 3) & ~(size_t)3)) * f;
+    if (fsh > limit || fixed + (size_t)B * 32 * f > limit) return p;
+    p.chunk = (int)std::min<size_t>(GH, (limit - fixed) / ((size_t)B * f) / 32 * 32);
     if (p.chunk < 32) return p;
     p.fwd_shared = (unsigned)fsh;
-    p.bwd_shared = (unsigned)(wr + (size_t)B * (p.chunk + 1) * sizeof(float));
+    p.bwd_shared = (unsigned)(fixed + (size_t)B * p.chunk * f);
     if (cuda::resident_blocks(RK("r_persist_fwd"), p.threads, p.fwd_shared) < p.blocks ||
         cuda::resident_blocks(RK("r_persist_bwd"), p.threads, p.bwd_shared) < p.blocks)
         return p;
