@@ -14,6 +14,7 @@ ap.add_argument("lib", choices=["prometheus", "torch"])
 ap.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
 ap.add_argument("--batch", type=int, default=64)
 ap.add_argument("--steps", type=int, default=20)
+ap.add_argument("--compile", action="store_true", help="PyTorch only: torch.compile the model (Inductor; Triton needs compute 7.0+)")
 args = ap.parse_args()
 
 import numpy as np
@@ -61,6 +62,8 @@ else:
         nn.Conv2d(64, 128, 3, 1, 1), nn.ReLU(), nn.AvgPool2d(2),
         nn.Flatten(), nn.Linear(128 * 4 * 4, 10)).to(dev)
     opt = torch.optim.SGD(model.parameters(), 0.01, 0.9)
+    if args.compile:      # compiled during the warm-up steps, before timing
+        model = torch.compile(model)
     x = torch.tensor(x_np, device=dev)
     y = torch.tensor(y_np, device=dev)
     print("torch:", torch.__version__, torch.cuda.get_device_name(0) if args.device == "cuda" else "cpu")

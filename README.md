@@ -305,7 +305,12 @@ forward and gradient; CI has no GPU, so there they build and skip. On a GPU
 machine, `python tests/build_gpu_tests.py --run` builds the C++ suite from the
 objects pip already compiled for the module (one compiler, one compile of the
 library) and runs it. `pip install .` itself rebuilds only the sources whose
-code or included headers changed, in parallel.
+code or included headers changed, in parallel. Without a local GPU,
+[tests/modal_gpu.py](tests/modal_gpu.py) runs the same on a rented one with
+[Modal](https://modal.com) (`modal run tests/modal_gpu.py --gpu A100`): it
+builds the library in a Linux container, runs both GPU suites and
+[tests/bench_gpu_all.py](tests/bench_gpu_all.py) against PyTorch, eager and
+`torch.compile`.
 `p.clip_grad_norm(params, max_norm, return_norm=False)` clips on the GPU
 without reading the norm back, so the step never waits for the GPU; the GradScaler
 reads one overflow flag a step.

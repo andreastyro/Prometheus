@@ -1,11 +1,13 @@
 """Every GPU benchmark against PyTorch in one run, each pair interleaved and
 repeated, medians reported as one markdown table.
 
-    python tests/bench_gpu_all.py [--rounds N]
+    python tests/bench_gpu_all.py [--rounds N] [--compile]
 
 Runs tests/bench_gpu_gpt.py, bench_gpu_cnn.py and bench_gpu_lstm.py as
 subprocesses (each in a fresh process, as a user would), Prometheus and
-PyTorch alternating so drift in the GPU's clocks hits both.
+PyTorch alternating so drift in the GPU's clocks hits both. --compile adds
+PyTorch with torch.compile (Inductor's GPU backend is Triton: Linux, compute
+capability 7.0 or newer).
 """
 import argparse
 import os
@@ -16,6 +18,7 @@ import sys
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--rounds", type=int, default=2)
+ap.add_argument("--compile", action="store_true", help="also PyTorch with torch.compile")
 args = ap.parse_args()
 here = os.path.dirname(os.path.abspath(__file__))
 
@@ -33,28 +36,54 @@ cases = [
 
 def median_ms(script, lib, extra):
     out = subprocess.run([sys.executable, os.path.join(here, script), lib] + extra,
-                         capture_output=True, text=True).stdout
-    m = re.search(r"median ([0-9.]+) ms", out)
-    return float(m.group(1)) if m else float("nan")
+                         capture_output=True, text=True)
+    m = re.search(r"median ([0-9.]+) ms", out.stdout)
+    if not m:
+        tail = (out.stderr or out.stdout).strip().splitlines()[-1:] or ["no output"]
+        print("  %s %s %s failed: %s" % (script, lib, " ".join(extra), tail[0]), flush=True)
+        return float("nan")
+    return float(m.group(1))
+
+
+def med(v):
+    v = [x for x in v if x == x]
+    return statistics.median(v) if v else None
 
 
 rows = []
 for name, script, ours, theirs in cases:
-    p_ms, t_ms = [], []
+    p_ms, t_ms, c_ms = [], [], []
     for _ in range(args.rounds):
         p_ms.append(median_ms(script, "prometheus", ours))
         if theirs is not None:
             t_ms.append(median_ms(script, "torch", theirs))
-    p = statistics.median(p_ms)
-    t = statistics.median(t_ms) if t_ms else None
-    rows.append((name, p, t))
-    print("%-34s prometheus %6.1f ms   torch %s" % (name, p, "%6.1f ms" % t if t else "    --"), flush=True)
+            if args.compile:
+                c_ms.append(median_ms(script, "torch", theirs + ["--compile"]))
+    p, t, c = med(p_ms), med(t_ms), med(c_ms)
+    rows.append((name, p, t, c))
+    fmt = lambda v: "%6.1f ms" % v if v else "    --"
+    print("%-34s prometheus %s   torch %s   compiled %s" % (name, fmt(p), fmt(t), fmt(c)), flush=True)
 
-print("\n| Training step | Prometheus | PyTorch | |\n|---|---|---|---|")
-for name, p, t in rows:
-    if t:
-        ratio = t / p
-        note = "%.2fx faster" % ratio if ratio >= 1.0 else "%.2fx slower" % (1.0 / ratio)
-        print("| %s | %.1f ms | %.1f ms | %s |" % (name, p, t, note))
-    else:
-        print("| %s | %.1f ms | -- | |" % (name, p))
+
+def ms(v):
+    return "%.1f ms" % v if v else "--"
+
+
+def vs(p, t):
+    if not p or not t:
+        return "--"
+    r = t / p
+    return "%.2fx faster" % r if r >= 1.0 else "%.2fx slower" % (1.0 / r)
+
+
+print()
+if args.compile:
+    print("| Training step | Prometheus | PyTorch | torch.compile | vs PyTorch | vs torch.compile |")
+    print("|---|---|---|---|---|---|")
+    for name, p, t, c in rows:
+        print("| %s | %s | %s | %s | %s | %s |" % (name, ms(p), ms(t), ms(c), vs(p, t), vs(p, c)))
+else:
+    print("| Training step | Prometheus | PyTorch | |")
+    print("|---|---|---|---|")
+    for name, p, t, c in rows:
+        print("| %s | %s | %s | %s |" % (name, ms(p), ms(t), vs(p, t)))

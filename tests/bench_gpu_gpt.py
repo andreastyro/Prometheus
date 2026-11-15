@@ -20,6 +20,7 @@ ap.add_argument("--heads", type=int, default=4)
 ap.add_argument("--layers", type=int, default=4)
 ap.add_argument("--batch", type=int, default=8)
 ap.add_argument("--steps", type=int, default=20)
+ap.add_argument("--compile", action="store_true", help="PyTorch only: torch.compile the model (Inductor; Triton needs compute 7.0+)")
 ap.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
 ap.add_argument("--rope", action="store_true", help="RoPE instead of learned positions (Prometheus only; PyTorch keeps its learned positions)")
 ap.add_argument("--clip", action="store_true", help="clip_grad_norm(1.0) every step, as real training loops do")
@@ -110,6 +111,8 @@ else:
 
     model = GPT().to(dev)
     opt = torch.optim.AdamW(model.parameters(), 3e-4)
+    if args.compile:      # compiled during the warm-up steps, before timing
+        model = torch.compile(model)
     x = torch.tensor(ids, device=dev)
     tg = torch.tensor(targets, device=dev)
 

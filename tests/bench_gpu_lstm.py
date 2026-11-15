@@ -19,6 +19,7 @@ ap.add_argument("--batch", type=int, default=32)
 ap.add_argument("--input", type=int, default=128)
 ap.add_argument("--hidden", type=int, default=256)
 ap.add_argument("--steps", type=int, default=20)
+ap.add_argument("--compile", action="store_true", help="PyTorch only: torch.compile the model (Inductor; Triton needs compute 7.0+)")
 ap.add_argument("--reset-after", action="store_true",
                 help="GRU in PyTorch's form (reset_after=True); PyTorch's GRU always is")
 args = ap.parse_args()
@@ -63,6 +64,8 @@ else:
     x = torch.tensor(x_np, device=dev)
     y = torch.tensor(y_np, device=dev)
     opt = torch.optim.SGD(model.parameters(), 0.01)
+    if args.compile:      # compiled during the warm-up steps, before timing
+        model = torch.compile(model)
     print("torch:", torch.__version__, torch.cuda.get_device_name(0) if args.device == "cuda" else "cpu")
 
     def step():

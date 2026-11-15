@@ -57,8 +57,9 @@ test_obj = cc.object_filenames([test_src], output_dir=out_dir)
 if setup_globals["_stale"](test_src, test_obj[0]):        # setup.py's own dependency check
     test_obj = cc.compile([test_src], output_dir=out_dir, macros=ext.define_macros, include_dirs=ext.include_dirs,
                           extra_postargs=ext.extra_compile_args)
+# target_lang: link with the C++ driver (gcc alone leaves out libstdc++)
 cc.link_executable(test_obj + objects, "test_cuda", output_dir=out_dir, libraries=ext.libraries,
-                   library_dirs=ext.library_dirs, extra_postargs=ext.extra_link_args)
+                   library_dirs=ext.library_dirs, extra_postargs=ext.extra_link_args, target_lang="c++")
 exe = os.path.join(out_dir, "test_cuda" + (".exe" if sys.platform == "win32" else ""))
 print("built", exe)
 if run_after:
