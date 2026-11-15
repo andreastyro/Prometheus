@@ -6,6 +6,7 @@ benchmarks against PyTorch (eager and torch.compile) there.
     modal run tests/modal_gpu.py --gpu H100
     modal run tests/modal_gpu.py --gpu T4 --no-bench
     modal run tests/modal_gpu.py --rounds 3 --no-compile
+    modal run tests/modal_gpu.py --wide            # GPT 12 x 768: float32, TF32, bf16; max-autotune
 
 Each run starts a fresh Linux container with the GPU, uploads this checkout
 (source only), builds the Python module and the C++ GPU suite, runs both
@@ -36,7 +37,8 @@ app = modal.App("prometheus-gpu", image=image)
 
 
 @app.function(gpu="A100", timeout=3600)
-def run(bench: bool = True, rounds: int = 2, compile_: bool = True) -> str:
+def run(bench: bool = True, rounds: int = 2, compile_: bool = True, wide: bool = False,
+        graphs: bool = False) -> str:
     import glob
     import subprocess
     import sys
@@ -81,15 +83,20 @@ def run(bench: bool = True, rounds: int = 2, compile_: bool = True) -> str:
         cmd = [sys.executable, "tests/bench_gpu_all.py", "--rounds", str(rounds)]
         if compile_:
             cmd.append("--compile")
-        step("benchmarks against PyTorch", cmd)
+        if wide:
+            cmd.append("--wide")
+        if graphs:
+            cmd.append("--graphs")
+        step("benchmarks against PyTorch" + (" (large models, TF32, bf16)" if wide else ""), cmd)
     return "\n".join(log)
 
 
 @app.local_entrypoint()
-def main(gpu: str = "A100", bench: bool = True, rounds: int = 2, compile: bool = True):
+def main(gpu: str = "A100", bench: bool = True, rounds: int = 2, compile: bool = True, wide: bool = False,
+         graphs: bool = False):
     print("running on", gpu)
-    out = run.with_options(gpu=gpu).remote(bench=bench, rounds=rounds, compile_=compile)
-    stamp = gpu.replace(":", "_")
+    out = run.with_options(gpu=gpu).remote(bench=bench, rounds=rounds, compile_=compile, wide=wide, graphs=graphs)
+    stamp = gpu.replace(":", "_") + ("_wide" if wide else "") + ("_graphs" if graphs else "")
     path = os.path.join(ROOT, "build", "modal_%s.log" % stamp)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:

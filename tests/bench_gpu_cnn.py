@@ -14,6 +14,8 @@ ap.add_argument("lib", choices=["prometheus", "torch"])
 ap.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
 ap.add_argument("--batch", type=int, default=64)
 ap.add_argument("--steps", type=int, default=20)
+ap.add_argument("--graph", action="store_true", help="Prometheus: capture the step in a CUDA Graph and time replays")
+ap.add_argument("--compile-mode", default="default", help="torch.compile mode: default, max-autotune, reduce-overhead")
 ap.add_argument("--compile", action="store_true", help="PyTorch only: torch.compile the model (Inductor; Triton needs compute 7.0+)")
 args = ap.parse_args()
 
@@ -63,7 +65,7 @@ else:
         nn.Flatten(), nn.Linear(128 * 4 * 4, 10)).to(dev)
     opt = torch.optim.SGD(model.parameters(), 0.01, 0.9)
     if args.compile:      # compiled during the warm-up steps, before timing
-        model = torch.compile(model)
+        model = torch.compile(model, mode=None if args.compile_mode == "default" else args.compile_mode)
     x = torch.tensor(x_np, device=dev)
     y = torch.tensor(y_np, device=dev)
     print("torch:", torch.__version__, torch.cuda.get_device_name(0) if args.device == "cuda" else "cpu")
@@ -82,6 +84,17 @@ else:
 for _ in range(3):
     step()
 sync()
+if args.graph and args.lib == "prometheus":
+    # one captured step, replayed: the host work and the launches go
+    graph = p.CUDAGraph()
+    with graph.capture():
+        captured_loss = step()
+
+    def step():
+        graph.replay()
+        return captured_loss
+    step()
+    sync()
 times = []
 for _ in range(args.steps):
     t0 = time.perf_counter()

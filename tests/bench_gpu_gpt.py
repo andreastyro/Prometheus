@@ -20,10 +20,14 @@ ap.add_argument("--heads", type=int, default=4)
 ap.add_argument("--layers", type=int, default=4)
 ap.add_argument("--batch", type=int, default=8)
 ap.add_argument("--steps", type=int, default=20)
+ap.add_argument("--graph", action="store_true", help="Prometheus: capture the step in a CUDA Graph and time replays")
 ap.add_argument("--compile", action="store_true", help="PyTorch only: torch.compile the model (Inductor; Triton needs compute 7.0+)")
 ap.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
 ap.add_argument("--rope", action="store_true", help="RoPE instead of learned positions (Prometheus only; PyTorch keeps its learned positions)")
 ap.add_argument("--clip", action="store_true", help="clip_grad_norm(1.0) every step, as real training loops do")
+ap.add_argument("--tf32", action="store_true", help="float32 matmuls on TF32 tensor cores (set_float32_matmul_precision('high'))")
+ap.add_argument("--amp", choices=["bf16", "fp16"], help="mixed precision: autocast to bf16 / fp16 (fp16 with a GradScaler)")
+ap.add_argument("--compile-mode", default="default", help="torch.compile mode: default, max-autotune, reduce-overhead")
 ap.add_argument("--clip-norm", action="store_true", help="with --clip, read the norm back (Prometheus; a sync each step)")
 ap.add_argument("--issue", action="store_true", help="also time how long the CPU takes to issue a step (before waiting for the GPU)")
 args = ap.parse_args()
@@ -39,6 +43,8 @@ if args.lib == "prometheus":
     import prometheus as p
     print("prometheus:", p.cuda_status() if args.device == "cuda" else p.backend())
     p.Tensor.manual_seed(0)
+    if args.tf32:
+        p.set_float32_matmul_precision("high")
     model = p.GPT(args.vocab, args.seq, args.embed, args.heads, args.layers, rope=args.rope)
     if args.device == "cuda":
         model.cuda()
@@ -52,9 +58,23 @@ if args.lib == "prometheus":
     if args.device == "cuda":
         tg = tg.cuda()
 
+    amp = {"bf16": p.bfloat16, "fp16": p.float16}.get(args.amp)
+    scaler = p.GradScaler() if args.amp == "fp16" else None
+
     def step():
         opt.zero_grad()
-        loss = p.cross_entropy_sparse_seq(model.forward(x), tg)
+        if amp is not None:
+            with p.autocast(amp):
+                loss = p.cross_entropy_sparse_seq(model.forward(x), tg)
+        else:
+            loss = p.cross_entropy_sparse_seq(model.forward(x), tg)
+        if scaler is not None:
+            scaler.scale_loss(loss).backward()
+            ok = scaler.unscale(model.parameters())
+            if ok:
+                opt.step()
+            scaler.update(not ok)
+            return loss
         loss.backward()
         if args.clip:
             p.clip_grad_norm(model.parameters(), 1.0, return_norm=args.clip_norm)
@@ -109,16 +129,27 @@ else:
                 x = b(x)
             return self.ln(x) @ self.tok.weight.t()
 
+    if args.tf32:
+        torch.set_float32_matmul_precision("high")
     model = GPT().to(dev)
     opt = torch.optim.AdamW(model.parameters(), 3e-4)
     if args.compile:      # compiled during the warm-up steps, before timing
-        model = torch.compile(model)
+        model = torch.compile(model, mode=None if args.compile_mode == "default" else args.compile_mode)
     x = torch.tensor(ids, device=dev)
     tg = torch.tensor(targets, device=dev)
 
+    amp = {"bf16": torch.bfloat16, "fp16": torch.float16}.get(args.amp)
+    scaler = torch.amp.GradScaler("cuda") if args.amp == "fp16" else None
+
     def step():
         opt.zero_grad()
-        loss = F.cross_entropy(model(x).view(-1, args.vocab), tg)
+        with torch.autocast("cuda", dtype=amp, enabled=amp is not None):
+            loss = F.cross_entropy(model(x).view(-1, args.vocab).float(), tg)
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+            return loss
         loss.backward()
         if args.clip:
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -132,6 +163,17 @@ else:
 for _ in range(3):          # warm-up: kernel compilation, allocator, cuBLAS heuristics
     step()
 sync()
+if args.graph and args.lib == "prometheus":
+    # one captured step, replayed: the host work and the launches go
+    graph = p.CUDAGraph()
+    with graph.capture():
+        captured_loss = step()
+
+    def step():
+        graph.replay()
+        return captured_loss
+    step()
+    sync()
 times, issue = [], []
 for _ in range(args.steps):
     t0 = time.perf_counter()
