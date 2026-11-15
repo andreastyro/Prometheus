@@ -692,6 +692,9 @@ struct Cublas {
                    long long, const void*, int, int, long long, const void*, void*, int, int,
                    long long, int, int, int);
     int (*set_stream)(cublasHandle_t, void*);
+    // cublasSgemmBatched: operands found through device arrays of pointers
+    int (*sgemm_pointers)(cublasHandle_t, int, int, int, int, int, const float*, const float* const*, int,
+                          const float* const*, int, const float*, float* const*, int, int);
 };
 Cublas         g_blas{};
 cublasHandle_t g_handle = nullptr;
@@ -712,7 +715,8 @@ void init_blas_locked() {
     if (!bind(lib, g_blas.create, "cublasCreate_v2") || !bind(lib, g_blas.sgemm, "cublasSgemm_v2") ||
         !bind(lib, g_blas.sgemm_batched, "cublasSgemmStridedBatched") ||
         !bind(lib, g_blas.gemm_ex, "cublasGemmStridedBatchedEx") ||
-        !bind(lib, g_blas.set_stream, "cublasSetStream_v2")) {
+        !bind(lib, g_blas.set_stream, "cublasSetStream_v2") ||
+        !bind(lib, g_blas.sgemm_pointers, "cublasSgemmBatched")) {
         g_blas_why = "cuBLAS is missing an entry point";
         return;
     }
@@ -760,6 +764,15 @@ void sgemm(bool ta, bool tb, int m, int n, int k, float alpha, const float* a, i
     auto h = blas_handle();
     ProfScope p(profiling() ? string("sgemm ") + (ta ? "T" : "N") + (tb ? "T" : "N") + " " + to_string(m) + "x" + to_string(n) + "x" + to_string(k) : string());
     check_blas(g_blas.sgemm(h, tb ? 1 : 0, ta ? 1 : 0, n, m, k, &alpha, b, ldb, a, lda, &beta, c, ldc), "sgemm");
+}
+
+void sgemm_pointers(bool ta, bool tb, int m, int n, int k, float alpha, const float* const* a, int lda,
+                    const float* const* b, int ldb, float beta, float* const* c, int ldc, int batch) {
+    if (m == 0 || n == 0 || batch == 0) return;
+    auto h = blas_handle();
+    ProfScope p(profiling() ? string("sgemm_pointers ") + (ta ? "T" : "N") + (tb ? "T" : "N") + " " + to_string(m) + "x" + to_string(n) + "x" + to_string(k) + " *" + to_string(batch) : string());
+    check_blas(g_blas.sgemm_pointers(h, tb ? 1 : 0, ta ? 1 : 0, n, m, k, &alpha, b, ldb, a, lda, &beta, c, ldc,
+                                     batch), "sgemm (pointer batch)");
 }
 
 void sgemm_batched(bool ta, bool tb, int m, int n, int k, float alpha, const float* a, int lda,

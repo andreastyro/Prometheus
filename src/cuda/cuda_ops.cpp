@@ -1680,6 +1680,17 @@ extern "C" __global__ void a_rope(const float* qkv, float* Q, float* K, long lon
     Q[r * E + col] = q0 * c - q1 * s;  Q[r * E + col + 1] = q0 * s + q1 * c;
     K[r * E + col] = k0 * c - k1 * s;  K[r * E + col + 1] = k0 * s + k1 * c;
 }
+// pointers for a two-level batch: matrix (b, h) of X starts at
+// X + b * sb + h * sh; three operands, B * H matrices, written into ptr[3][B*H]
+extern "C" __global__ void a_ptrs(const float* x, long long xb, long long xh, const float* y, long long yb,
+                                  long long yh, float* z, long long zb, long long zh, int H, int n,
+                                  unsigned long long* ptr) {
+    int i = (int)gid(); if (i >= n) return;
+    const long long b = i / H, h = i % H;
+    ptr[i] = (unsigned long long)(x + b * xb + h * xh);
+    ptr[n + i] = (unsigned long long)(y + b * yb + h * yh);
+    ptr[2 * n + i] = (unsigned long long)(z + b * zb + h * zh);
+}
 // the inverse rotation, in place on the Q and K thirds of dqkv [rows, 3E]
 extern "C" __global__ void a_rope_back(float* g, long long rows, int S, int E, int D) {
     long long n = gid(); const int half = E / 2; if (n >= rows * half) return;
@@ -1696,6 +1707,29 @@ extern "C" __global__ void a_rope_back(float* g, long long rows, int S, int E, i
 }
 )");
     return s;
+}
+
+// One cuBLAS call for every (sequence, head) pair: matrix (b, h) of each
+// operand starts at base + b * stride_b + h * stride_h, a layout no single
+// stride describes. Calling per sequence left 4 small products per call --
+// too few to fill the GPU, 192 calls a GPT step.
+struct Op2 { const float* p; long long sb, sh; int ld; };
+static void gemm_bh(bool ta, bool tb, int m, int n, int k, Op2 a, Op2 b, float beta, float* c, long long csb,
+                    long long csh, int ldc, int B, int H) {
+    const int nb = B * H;
+    if (!nb) return;
+    auto ptr = empty_cuda({3LL * nb}, DType::Int64);
+    unsigned long long* pp = static_cast<unsigned long long*>(ptr->storage()->data());
+    const float* x = a.p;
+    const float* y = b.p;
+    float* z = c;
+    long long xb = a.sb, xh = a.sh, yb = b.sb, yh = b.sh, zb = csb, zh = csh;
+    int h_ = H, n_ = nb;
+    void* args[] = {&x, &xb, &xh, &y, &yb, &yh, &z, &zb, &zh, &h_, &n_, &pp};
+    cuda::launch(K("a_ptrs", ROPE_SRC()), nb, args);
+    auto P = reinterpret_cast<const float* const*>(pp);
+    cuda::sgemm_pointers(ta, tb, m, n, k, 1.0f, P, a.ld, P + nb, b.ld, beta,
+                         reinterpret_cast<float* const*>(pp + 2 * nb), ldc, nb);
 }
 
 TensorPtr attention_qkv(const TensorPtr& qkv0, int heads, bool causal, bool rope) {
@@ -1729,18 +1763,18 @@ TensorPtr attention_qkv(const TensorPtr& qkv0, int heads, bool causal, bool rope
     float* pp = static_cast<float*>(P->storage()->data());
     float* po = static_cast<float*>(O->storage()->data());
     const int s_ = (int)S, d_ = (int)D, e_ = (int)E, h_ = (int)H, lq = (int)lqk, l3 = (int)E3;
-    for (int64_t b = 0; b < B; b++)       // scores = Q K^T, every head of sequence b
-        cuda::sgemm_batched(false, true, s_, s_, d_, 1.0f, pq + b * S * lqk, lq, D, pk + b * S * lqk, lq, D,
-                            0.0f, pp + b * H * S * S, s_, S * S, h_);
+    // scores = Q K^T for every head of every sequence, one call
+    gemm_bh(false, true, s_, s_, d_, {pq, S * lqk, D, lq}, {pk, S * lqk, D, lq}, 0.0f, pp, H * S * S, S * S, s_,
+            (int)B, h_);
     long long cols = S;
     int cz = causal ? 1 : 0;
     float sc = scale;
     long long nrows = B * H * S;
     void* a1[] = {&pp, &cols, &sc, &cz, &nrows};
     if (B * H * S) cuda::launch(K("a_softmax", ATTN_SRC()), (unsigned)((B * H * S + 7) / 8), 1, 1, 256, 1, 1, 0, a1);
-    for (int64_t b = 0; b < B; b++)       // O = P V, written into the heads' columns
-        cuda::sgemm_batched(false, false, s_, d_, s_, 1.0f, pp + b * H * S * S, s_, S * S, pv + b * S * E3, l3, D,
-                            0.0f, po + b * S * E, e_, D, h_);
+    // O = P V, written into the heads' columns
+    gemm_bh(false, false, s_, d_, s_, {pp, H * S * S, S * S, s_}, {pv, S * E3, D, l3}, 0.0f, po, S * E, D, e_,
+            (int)B, h_);
 
     if (qkv->requires_grad()) {
         auto node = make_node(O, {qkv});
@@ -1799,27 +1833,21 @@ TensorPtr attention_qkv(const TensorPtr& qkv0, int heads, bool causal, bool rope
             float* pdk = pdq + E;
             float* pdv = pdq + 2 * E;
             const int s_ = (int)S, d_ = (int)D, e_ = (int)E, h_ = (int)H, lq = (int)lqk, l3 = (int)E3;
-            for (int64_t b = 0; b < B; b++) {
-                const int64_t gb = b * S * E, xb = b * S * E3, pb = b * H * S * S;
-                // dV = P^T dO;  dP = dO V^T
-                cuda::sgemm_batched(true, false, s_, d_, s_, 1.0f, pp + pb, s_, S * S, pg + gb, e_, D,
-                                    0.0f, pdv + xb, l3, D, h_);
-                cuda::sgemm_batched(false, true, s_, s_, d_, 1.0f, pg + gb, e_, D, pv + xb, l3, D,
-                                    0.0f, pdp + pb, s_, S * S, h_);
-            }
+            // dV = P^T dO;  dP = dO V^T  -- each one call over every (sequence, head)
+            gemm_bh(true, false, s_, d_, s_, {pp, H * S * S, S * S, s_}, {pg, S * E, D, e_}, 0.0f, pdv, S * E3, D,
+                    l3, (int)B, h_);
+            gemm_bh(false, true, s_, s_, d_, {pg, S * E, D, e_}, {pv, S * E3, D, l3}, 0.0f, pdp, H * S * S, S * S,
+                    s_, (int)B, h_);
             long long cols = S;
             float sc = scale;
             long long nrows = B * H * S;
             void* a2[] = {&pp, &pdp, &cols, &sc, &nrows};
             if (B * H * S) cuda::launch(K("a_softmax_back", ATTN_SRC()), (unsigned)((B * H * S + 7) / 8), 1, 1, 256, 1, 1, 0, a2);
-            for (int64_t b = 0; b < B; b++) {
-                const int64_t xb = b * S * E3, qb = b * S * lqk, pb = b * H * S * S;
-                // dQ = dS K;  dK = dS^T Q   (in the rotated space under RoPE)
-                cuda::sgemm_batched(false, false, s_, d_, s_, 1.0f, pdp + pb, s_, S * S, pk + qb, lq, D,
-                                    0.0f, pdq + xb, l3, D, h_);
-                cuda::sgemm_batched(true, false, s_, d_, s_, 1.0f, pdp + pb, s_, S * S, pq + qb, lq, D,
-                                    0.0f, pdk + xb, l3, D, h_);
-            }
+            // dQ = dS K;  dK = dS^T Q   (in the rotated space under RoPE)
+            gemm_bh(false, false, s_, d_, s_, {pdp, H * S * S, S * S, s_}, {pk, S * lqk, D, lq}, 0.0f, pdq, S * E3,
+                    D, l3, (int)B, h_);
+            gemm_bh(true, false, s_, d_, s_, {pdp, H * S * S, S * S, s_}, {pq, S * lqk, D, lq}, 0.0f, pdk, S * E3,
+                    D, l3, (int)B, h_);
             if (rope) {
                 long long rr = B * S;
                 int s2 = (int)S, e2 = (int)E, d2 = (int)D;

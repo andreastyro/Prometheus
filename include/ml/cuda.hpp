@@ -103,6 +103,13 @@ void sgemm_batched(bool trans_a, bool trans_b, int m, int n, int k, float alpha,
                    const float* b, int ldb, long long stride_b, float beta,
                    float* c, int ldc, long long stride_c, int batch);
 
+/// `batch` products whose operands are found through arrays of pointers that
+/// live on the device: a[i], b[i], c[i]. For batches no single stride
+/// describes (every head of every sequence in attention).
+void sgemm_pointers(bool trans_a, bool trans_b, int m, int n, int k, float alpha,
+                    const float* const* a, int lda, const float* const* b, int ldb, float beta,
+                    float* const* c, int ldc, int batch);
+
 /// The same with float16 / bfloat16 inputs (both of `dtype`) and a float32
 /// result, accumulated in float32 -- on tensor cores where the GPU has them.
 /// bfloat16 needs has_bf16(). `batch` products as sgemm_batched.
