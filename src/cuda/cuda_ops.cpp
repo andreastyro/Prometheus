@@ -290,6 +290,28 @@ extern "C" __global__ void r_dim_chunk(const float* a, float* y, long long outer
     for (long long k = k0; k < k1; k++) acc += p[k * inner];
     atomicAdd(&y[oi], acc * scale);
 }
+// The same as a tiled column sum: a block of 32 x 8 threads takes 32 columns
+// of 128 rows (16 per thread, stride 8), folds its 8 partials in shared
+// memory and adds one value per column -- reads stay coalesced across the
+// columns, and there are enough blocks to fill the GPU. y starts at zero.
+// grid: (ceil(inner / 32), ceil(len / 128), outer)
+extern "C" __global__ void r_cols(const float* a, float* y, long long len, long long inner, float scale) {
+    __shared__ float part[8][33];
+    const int tx = threadIdx.x & 31, ty = threadIdx.x >> 5;
+    const long long j = (long long)blockIdx.x * 32 + tx;
+    const long long r0 = (long long)blockIdx.y * 128;
+    const float* p = a + (long long)blockIdx.z * len * inner;
+    float acc = 0.0f;
+    if (j < inner)
+        for (long long r = r0 + ty; r < len && r < r0 + 128; r += 8) acc += p[r * inner + j];
+    part[ty][tx] = acc;
+    __syncthreads();
+    if (ty == 0 && j < inner) {
+        float t = 0.0f;
+        for (int k = 0; k < 8; k++) t += part[k][tx];
+        atomicAdd(&y[(long long)blockIdx.z * inner + j], t * scale);
+    }
+}
 // one partial sum per block, tree-reduced in shared memory
 extern "C" __global__ void r_partial(const float* a, float* part, long long n) {
     __shared__ float s[256];
@@ -590,6 +612,14 @@ TensorPtr reduce(const char* name, const TensorPtr& a0, int dim, bool keepdim, b
         long long o1 = 1;
         void* a2[] = {&pp, &py, &one, &nb, &o1, &s};
         cuda::launch(K("r_dim", REDUCE_SRC()), 1, a2);
+    } else if (outer * inner < 16384 && len >= 64 && inner >= 32 && outer < 65536) {
+        // few outputs, long sums over contiguous columns (bias gradients)
+        cuda::memset_zero(py, (size_t)out->numel() * sizeof(float));
+        long long l = len, in = inner;
+        float s = scale;
+        void* args[] = {&pa, &py, &l, &in, &s};
+        cuda::launch(K("r_cols", REDUCE_SRC()), (unsigned)((inner + 31) / 32), (unsigned)((len + 127) / 128),
+                     (unsigned)outer, 256, 1, 1, 0, args);
     } else if (outer * inner < 16384 && len >= 64) {
         cuda::memset_zero(py, (size_t)out->numel() * sizeof(float));
         long long o = outer, l = len, in = inner, ch = 32;

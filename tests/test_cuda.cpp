@@ -128,6 +128,21 @@ int main() {
     CHECK_NEAR("mean over dim 2, keepdim", max_diff(mean(r3g, 2, true), mean(r3, 2, true)), 0.0f, 1e-6f);
     CHECK_NEAR("sum of everything", max_diff(sum(r3g, -1), sum(r3, -1)), 0.0f, 1e-3f);
     CHECK_NEAR("sum of 1M (two-pass)", max_diff(sum(G(big), -1), sum(big, -1)), 0.0f, 2.0f);
+    {
+        // column sums (bias gradients): partial tiles of rows and columns, and
+        // more than one outer slice; mean scales inside the same kernel
+        auto cs = random_tensor({1000, 300}, 70), cs3 = random_tensor({3, 200, 40}, 71);
+        // summation order differs from the CPU's: relative to the largest sum
+        auto rd = [](const TensorPtr& gpu, const TensorPtr& cpu) {
+            const auto a = gpu->to_vector(), b = cpu->to_vector();
+            float m = 0.0f, s = 0.0f;
+            for (size_t i = 0; i < b.size(); i++) { m = std::max(m, std::fabs(a[i] - b[i])); s = std::max(s, std::fabs(b[i])); }
+            return a.size() == b.size() ? m / std::max(s, 1e-12f) : INFINITY;
+        };
+        CHECK_NEAR("column sum [1000, 300] over dim 0", rd(sum(G(cs), 0), sum(cs, 0)), 0.0f, 1e-5f);
+        CHECK_NEAR("sum [3, 200, 40] over dim 1", rd(sum(G(cs3), 1), sum(cs3, 1)), 0.0f, 1e-5f);
+        CHECK_NEAR("mean [1000, 300] over dim 0", rd(mean(G(cs), 0), mean(cs, 0)), 0.0f, 1e-5f);
+    }
     CHECK_NEAR("softmax", max_diff(softmax(r3g), softmax(r3)), 0.0f, 1e-6f);
     auto wide = random_tensor({3, 1000}, 8);
     CHECK_NEAR("softmax, 1000 columns", max_diff(softmax(G(wide)), softmax(wide)), 0.0f, 1e-7f);
