@@ -7,6 +7,7 @@ benchmarks against PyTorch (eager and torch.compile) there.
     modal run tests/modal_gpu.py --gpu T4 --no-bench
     modal run tests/modal_gpu.py --rounds 3 --no-compile
     modal run tests/modal_gpu.py --wide            # GPT 12 x 768: float32, TF32, bf16; max-autotune
+    modal run tests/modal_gpu.py --no-bench --no-suites --script tests/probe_cublaslt_epilogues.py
 
 Each run starts a fresh Linux container with the GPU, uploads this checkout
 (source only), builds the Python module and the C++ GPU suite, runs both
@@ -38,7 +39,7 @@ app = modal.App("prometheus-gpu", image=image)
 
 @app.function(gpu="A100", timeout=3600)
 def run(bench: bool = True, rounds: int = 2, compile_: bool = True, wide: bool = False,
-        graphs: bool = False) -> str:
+        graphs: bool = False, script: str = "", suites: bool = True) -> str:
     import glob
     import subprocess
     import sys
@@ -54,7 +55,7 @@ def run(bench: bool = True, rounds: int = 2, compile_: bool = True, wide: bool =
                PROMETHEUS_USE_OPENMP="1")
     log = []
 
-    def step(title, cmd):
+    def step(title, cmd, everything=False):
         t0 = time.time()
         out = subprocess.run(cmd, env=env, capture_output=True, text=True)
         text = (out.stdout + out.stderr).strip()
@@ -65,7 +66,9 @@ def run(bench: bool = True, rounds: int = 2, compile_: bool = True, wide: bool =
             "checks", "FAIL", "failed", "error", "Error", "compiled", "built", "PASS", "|", "prometheus ",
             "torch ", "GPU", "cuda", "cuDNN", "median", "compute"))]
         fails = [l for l in text.splitlines() if "FAIL" in l]
-        body = "\n".join(keep[-60:]) if out.returncode == 0 else "\n".join(fails + text.splitlines()[-25:])
+        if everything:
+            keep = text.splitlines()
+        body = "\n".join(keep if everything else keep[-60:]) if out.returncode == 0 else "\n".join(fails + text.splitlines()[-25:])
         print(body, flush=True)
         log.append(body)
         return out.returncode
@@ -77,8 +80,11 @@ def run(bench: bool = True, rounds: int = 2, compile_: bool = True, wide: bool =
         return "\n".join(log)
     step("Prometheus sees", [sys.executable, "-c", "import prometheus as p; print(p.cuda_status());"
                                                    " print(p.cuda_cudnn_status())"])
-    step("C++ GPU suite", [sys.executable, "tests/build_gpu_tests.py", "--run"])
-    step("Python GPU suite", [sys.executable, "tests/test_cuda.py"])
+    if suites:
+        step("C++ GPU suite", [sys.executable, "tests/build_gpu_tests.py", "--run"])
+        step("Python GPU suite", [sys.executable, "tests/test_cuda.py"])
+    if script:
+        step(script, [sys.executable] + script.split(), everything=True)
     if bench:
         cmd = [sys.executable, "tests/bench_gpu_all.py", "--rounds", str(rounds)]
         if compile_:
@@ -93,10 +99,12 @@ def run(bench: bool = True, rounds: int = 2, compile_: bool = True, wide: bool =
 
 @app.local_entrypoint()
 def main(gpu: str = "A100", bench: bool = True, rounds: int = 2, compile: bool = True, wide: bool = False,
-         graphs: bool = False):
+         graphs: bool = False, script: str = "", suites: bool = True):
     print("running on", gpu)
-    out = run.with_options(gpu=gpu).remote(bench=bench, rounds=rounds, compile_=compile, wide=wide, graphs=graphs)
-    stamp = gpu.replace(":", "_") + ("_wide" if wide else "") + ("_graphs" if graphs else "")
+    out = run.with_options(gpu=gpu).remote(bench=bench, rounds=rounds, compile_=compile, wide=wide, graphs=graphs,
+                                           script=script, suites=suites)
+    stamp = gpu.replace(":", "_") + ("_wide" if wide else "") + ("_graphs" if graphs else "") + \
+        ("_" + os.path.splitext(os.path.basename(script.split()[0]))[0] if script else "")
     path = os.path.join(ROOT, "build", "modal_%s.log" % stamp)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:

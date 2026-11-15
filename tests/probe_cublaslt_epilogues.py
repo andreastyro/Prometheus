@@ -5,8 +5,10 @@
 import ctypes, glob, os
 import torch
 
-bin_dir = os.path.join(os.path.dirname(torch.__file__), "..", "nvidia", "cublas", "bin")
-lt = ctypes.CDLL(glob.glob(os.path.join(bin_dir, "cublasLt64_*.dll"))[0])
+nv = os.path.join(os.path.dirname(torch.__file__), "..", "nvidia", "cublas")
+site = os.path.join(os.path.dirname(torch.__file__), "..")
+found = glob.glob(os.path.join(nv, "bin", "cublasLt64_*.dll")) +     glob.glob(os.path.join(site, "nvidia", "**", "libcublasLt.so*"), recursive=True)
+lt = ctypes.CDLL(found[0])
 V = ctypes.c_void_p
 handle = V()
 assert lt.cublasLtCreate(ctypes.byref(handle)) == 0

@@ -101,6 +101,13 @@ for _ in range(args.steps):
     loss = step()
     sync()
     times.append(time.perf_counter() - t0)
+if args.lib == "prometheus" and args.device == "cuda" and hasattr(p, "cuda_launch_counts"):
+    p.cuda_reset_launch_counts()
+    step()
+    sync()
+    c = p.cuda_launch_counts()
+    print("launches per step: %d kernels, %d cuBLAS / cuDNN calls, %d copies"
+          % (c["kernels"], c["library"], c["copies"]))
 med = sorted(times)[len(times) // 2]
 print("%-10s %-4s %s seq %d x batch %d, %d -> %d: median %.1f ms/step, best %.1f ms (loss %.4f)"
       % (args.lib, args.device, args.cell.upper() + (" reset_after" if args.reset_after else ""), S, B, I, H,

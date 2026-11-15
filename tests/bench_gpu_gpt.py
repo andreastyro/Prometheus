@@ -184,6 +184,14 @@ for _ in range(args.steps):
 if args.issue:
     print("CPU issue time: median %.1f ms of the step (the rest the CPU waits for the GPU)"
           % (sorted(issue)[len(issue) // 2] * 1e3))
+if args.lib == "prometheus" and args.device == "cuda" and hasattr(p, "cuda_launch_counts"):
+    # what one step issues: our kernels, cuBLAS / cuDNN calls, copies
+    p.cuda_reset_launch_counts()
+    step()
+    sync()
+    c = p.cuda_launch_counts()
+    print("launches per step: %d kernels, %d cuBLAS / cuDNN calls, %d copies"
+          % (c["kernels"], c["library"], c["copies"]))
 best, med = min(times), sorted(times)[len(times) // 2]
 print("%-10s %-4s batch %d x seq %d, embed %d, %d layers: median %.1f ms/step, best %.1f ms -> %.0f tokens/s (loss %.3f)"
       % (args.lib, args.device, args.batch, args.seq, args.embed, args.layers, med * 1e3, best * 1e3,
