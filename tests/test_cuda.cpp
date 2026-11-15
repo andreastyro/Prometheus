@@ -819,7 +819,9 @@ int main() {
                    after.in_use == before.in_use && after.cached >= (4u << 20));
         CHECK_TRUE("memory_stats: peak and device totals", during.peak >= during.in_use && during.device_total > 0);
         std::string msg;
-        try { std::make_shared<Tensor>(Shape{100000, 100000}, DType::Float32, Device::CUDA); }   // 40 GB
+        // twice the card's memory, so no GPU can satisfy it (a 40 GB request fit an A100)
+        const int64_t too_many = (int64_t)(during.device_total / 4) * 2;
+        try { std::make_shared<Tensor>(Shape{too_many}, DType::Float32, Device::CUDA); }
         catch (const std::exception& e) { msg = e.what(); }
         std::printf("  out-of-memory message: %s\n", msg.c_str());
         CHECK_TRUE("out of memory says how much and where", msg.find("out of GPU memory") != std::string::npos &&
