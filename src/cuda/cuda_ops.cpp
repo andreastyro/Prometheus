@@ -1238,6 +1238,32 @@ extern "C" __global__ void o_adam(float* w, const float* g, float* m, float* v, 
     v[i] = b2 * v[i] + (1.0f - b2) * gi * gi;
     w[i] = w[i] * decay - lr * (m[i] / bc1) / (sqrtf(v[i] / bc2) + eps);
 }
+// Every parameter in one launch: a table of the tensors and a list of chunks
+// of 8192 elements, a block per chunk. One launch per parameter tensor was
+// ~50 small kernels a GPT step, most too small to fill the GPU.
+struct MultiTensor { float* w; const float* g; float* m; float* v; long long n; };
+extern "C" __global__ void o_adam_multi(const MultiTensor* t, const long long* chunk_start, const int* chunk_tensor,
+                                        float lr, float b1, float b2, float bc1, float bc2, float eps, float decay) {
+    const MultiTensor T = t[chunk_tensor[blockIdx.x]];
+    const long long s = chunk_start[blockIdx.x], e = min(T.n, s + 8192);
+    for (long long i = s + threadIdx.x; i < e; i += blockDim.x) {
+        const float gi = T.g[i];
+        const float mi = b1 * T.m[i] + (1.0f - b1) * gi;
+        const float vi = b2 * T.v[i] + (1.0f - b2) * gi * gi;
+        T.m[i] = mi; T.v[i] = vi;
+        T.w[i] = T.w[i] * decay - lr * (mi / bc1) / (sqrtf(vi / bc2) + eps);
+    }
+}
+// SGD, the same way; m is the velocity (or null for none)
+extern "C" __global__ void o_sgd_multi(const MultiTensor* t, const long long* chunk_start, const int* chunk_tensor,
+                                       float lr, float mu) {
+    const MultiTensor T = t[chunk_tensor[blockIdx.x]];
+    const long long s = chunk_start[blockIdx.x], e = min(T.n, s + 8192);
+    for (long long i = s + threadIdx.x; i < e; i += blockDim.x) {
+        if (T.m) { const float vi = mu * T.m[i] + T.g[i]; T.m[i] = vi; T.w[i] -= lr * vi; }
+        else T.w[i] -= lr * T.g[i];
+    }
+}
 extern "C" __global__ void o_rmsprop(float* w, const float* g, float* v, long long n, float lr, float b, float eps) {
     long long i = gid(); if (i >= n) return;
     float gi = g[i];
@@ -1307,6 +1333,55 @@ void adam_step(float* w, const float* g, float* m, float* v, int64_t n, float lr
     long long nn = n;
     void* args[] = {&w, &g, &m, &v, &nn, &lr, &b1, &b2, &bc1, &bc2, &eps, &decay};
     cuda::launch(K("o_adam", FUSED_SRC()), nn, args);
+}
+
+// the table and chunk list for a multi-tensor update, on the device: one copy
+static TensorPtr multi_table(const vector<OptTensor>& ts, unsigned& chunks) {
+    struct Row { float* w; const float* g; float* m; float* v; long long n; };
+    static_assert(sizeof(Row) == 40, "MultiTensor layout");
+    vector<long long> start;
+    vector<int> owner;
+    for (size_t i = 0; i < ts.size(); i++)
+        for (long long s = 0; s < ts[i].n; s += 8192) { start.push_back(s); owner.push_back((int)i); }
+    chunks = (unsigned)start.size();
+    const size_t rows = ts.size() * sizeof(Row), starts = start.size() * 8, owners = owner.size() * 4;
+    vector<unsigned char> host(rows + starts + owners);
+    for (size_t i = 0; i < ts.size(); i++) {
+        Row r{ts[i].w, ts[i].g, ts[i].m, ts[i].v, ts[i].n};
+        memcpy(host.data() + i * sizeof(Row), &r, sizeof(Row));
+    }
+    if (starts) memcpy(host.data() + rows, start.data(), starts);
+    if (owners) memcpy(host.data() + rows + starts, owner.data(), owners);
+    auto dev = empty_cuda({(long long)((host.size() + 7) / 8)}, DType::Int64);
+    cuda::copy_to_device(dev->storage()->data(), host.data(), host.size());
+    return dev;
+}
+
+void adam_multi(const vector<OptTensor>& ts, float lr, float b1, float b2, float bc1, float bc2, float eps,
+                float decay) {
+    if (ts.empty()) return;
+    unsigned chunks = 0;
+    auto table = multi_table(ts, chunks);
+    if (!chunks) return;
+    unsigned char* base_p = static_cast<unsigned char*>(table->storage()->data());
+    const void* pt = base_p;
+    const void* ps = base_p + ts.size() * 40;
+    const void* po = base_p + ts.size() * 40 + (size_t)chunks * 8;
+    void* args[] = {&pt, &ps, &po, &lr, &b1, &b2, &bc1, &bc2, &eps, &decay};
+    cuda::launch(K("o_adam_multi", FUSED_SRC()), chunks, 1, 1, 256, 1, 1, 0, args);
+}
+
+void sgd_multi(const vector<OptTensor>& ts, float lr, float mu) {
+    if (ts.empty()) return;
+    unsigned chunks = 0;
+    auto table = multi_table(ts, chunks);
+    if (!chunks) return;
+    unsigned char* base_p = static_cast<unsigned char*>(table->storage()->data());
+    const void* pt = base_p;
+    const void* ps = base_p + ts.size() * 40;
+    const void* po = base_p + ts.size() * 40 + (size_t)chunks * 8;
+    void* args[] = {&pt, &ps, &po, &lr, &mu};
+    cuda::launch(K("o_sgd_multi", FUSED_SRC()), chunks, 1, 1, 256, 1, 1, 0, args);
 }
 
 void rmsprop_step(float* w, const float* g, float* v, int64_t n, float lr, float b, float eps) {

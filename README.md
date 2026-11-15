@@ -293,7 +293,7 @@ GPT training step on a GTX 970 (4 layers x 256, batch 8 x 128,
 (62.0k tokens/s), PyTorch 2.14 19.5 ms (52.6k tokens/s), the same step on
 a Ryzen AI 7 350 CPU 208 ms; with RoPE (`--rope`, applied inside the fused
 attention kernel) 19.6-20.6 ms. Attention projects Q, K and V in one gemm. Small-CNN training step, batch 64 of 32x32
-([tests/bench_gpu_cnn.py](tests/bench_gpu_cnn.py)): Prometheus 4.7 ms
+([tests/bench_gpu_cnn.py](tests/bench_gpu_cnn.py)): Prometheus 4.4 ms
 with cuDNN, PyTorch 5.0 ms. Recurrent layers run fused on the GPU (one gemm
 and one gate kernel per step, backward through time on the device); a training
 step over 64 x 32 x 128 -> 256 ([tests/bench_gpu_lstm.py](tests/bench_gpu_lstm.py)):

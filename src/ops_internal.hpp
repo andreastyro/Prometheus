@@ -130,6 +130,13 @@ void sgd_step(float* w, const float* g, float* v, int64_t n, float lr, float mu)
 void adam_step(float* w, const float* g, float* m, float* v, int64_t n, float lr, float b1, float b2,
                float bc1, float bc2, float eps, float decay);
 void rmsprop_step(float* w, const float* g, float* v, int64_t n, float lr, float b, float eps);
+/// One parameter tensor of a multi-tensor update: weights, gradient, state
+/// (m and v for Adam; m the velocity or null for SGD), element count.
+struct OptTensor { float* w; const float* g; float* m; float* v; long long n; };
+/// Every listed tensor's update in one launch.
+void adam_multi(const std::vector<OptTensor>& ts, float lr, float b1, float b2, float bc1, float bc2, float eps,
+                float decay);
+void sgd_multi(const std::vector<OptTensor>& ts, float lr, float mu);
 double sum_squares(const float* a, int64_t n);
 void scale_inplace(float* a, int64_t n, float c);
 /// g /= scale in place, zeroing non-finite entries; false if there were any

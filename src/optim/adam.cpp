@@ -31,14 +31,15 @@ void Adam::step(){
     float bc1 = 1.0f - std::pow(beta1, t);
     float bc2 = 1.0f - std::pow(beta2, t);
 
+    // GPU parameters are gathered and updated together in one launch
+    std::vector<cuda_ops::OptTensor> gpu;
     for (int i = 0; i < (int)parameters.size(); i++){
 
         auto& p = parameters[i];
-        if (p->device() == Device::CUDA) {   // the update runs on the GPU
+        if (p->device() == Device::CUDA) {
             const float* gd = device_grad(p);
             if (!gd) continue;
-            cuda_ops::adam_step(device_weights(p), gd, m_dev.get(i, m[i]), v_dev.get(i, v[i]), p->numel(),
-                                lr, beta1, beta2, bc1, bc2, eps, 1.0f);
+            gpu.push_back({device_weights(p), gd, m_dev.get(i, m[i]), v_dev.get(i, v[i]), (long long)p->numel()});
             continue;
         }
         const int n = p->num_el();
@@ -56,6 +57,7 @@ void Adam::step(){
             p->data()[j] -= lr * m_hat / (sqrt(v_hat) + eps);
         }
     }
+    cuda_ops::adam_multi(gpu, lr, beta1, beta2, bc1, bc2, eps, 1.0f);
 }
 
 void Adam::save_state(const std::string& path) const {

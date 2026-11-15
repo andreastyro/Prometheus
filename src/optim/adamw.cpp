@@ -28,13 +28,14 @@ void AdamW::step() {
     // AdamW does not have.
     const float decay = 1.0f - lr * weight_decay;
 
+    // GPU parameters are gathered and updated together in one launch
+    vector<cuda_ops::OptTensor> gpu;
     for (int i = 0; i < (int)parameters.size(); i++) {
         auto& p = parameters[i];
-        if (p->device() == Device::CUDA) {   // the update runs on the GPU
+        if (p->device() == Device::CUDA) {
             const float* gd = device_grad(p);
             if (!gd) continue;
-            cuda_ops::adam_step(device_weights(p), gd, m_dev.get(i, m[i]), v_dev.get(i, v[i]), p->numel(),
-                                lr_, b1, b2, bc1, bc2, eps_, decay);
+            gpu.push_back({device_weights(p), gd, m_dev.get(i, m[i]), v_dev.get(i, v[i]), (long long)p->numel()});
             continue;
         }
         const int n = (int)p->numel();
@@ -52,6 +53,7 @@ void AdamW::step() {
             w[j] = w[j] * decay - lr_ * m_hat / (std::sqrt(v_hat) + eps_);
         }
     }
+    cuda_ops::adam_multi(gpu, lr_, b1, b2, bc1, bc2, eps_, decay);
 }
 
 void AdamW::save_state(const string& path) const {

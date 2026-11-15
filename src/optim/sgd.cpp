@@ -26,13 +26,15 @@ SGD::SGD(vector<TensorPtr> params, float lr, float momentum){
 // loop used to call num_el() in its condition and index the velocity through
 // a vector of vectors on every element.
 void SGD::step(){
+    // GPU parameters are gathered and updated together in one launch
+    std::vector<cuda_ops::OptTensor> gpu;
     for (int i = 0; i < (int)parameters.size(); i++){
         auto& p = parameters[i];
-        if (p->device() == Device::CUDA) {   // the update runs on the GPU
+        if (p->device() == Device::CUDA) {
             const float* gd = device_grad(p);
             if (!gd) continue;
-            cuda_ops::sgd_step(device_weights(p), gd, momentum != 0.0f ? velocity_dev.get(i, velocity[i]) : nullptr,
-                               p->numel(), lr, momentum);
+            gpu.push_back({device_weights(p), gd, momentum != 0.0f ? velocity_dev.get(i, velocity[i]) : nullptr,
+                           nullptr, (long long)p->numel()});
             continue;
         }
         const int n = (int)p->numel();
@@ -51,4 +53,5 @@ void SGD::step(){
             }
         }
     }
+    cuda_ops::sgd_multi(gpu, lr, momentum);
 }
