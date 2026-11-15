@@ -4,515 +4,159 @@
 
 <p align="center">
   A deep learning framework written from scratch in C++17, with Python bindings.<br>
-  No PyTorch, no TensorFlow, no Eigen — tensors, autograd, layers, and optimizers all implemented by hand.
+  No PyTorch, no TensorFlow, no Eigen — tensors, autograd, layers, optimizers and GPU kernels written by hand.
 </p>
 
 ---
 
 ## What it is
 
-Prometheus is a working deep learning framework, not a teaching toy. It implements reverse-mode
-automatic differentiation over a dynamically-built computation graph, and on top of that a layer
-library that reaches all the way to a GPT-2-style decoder-only transformer with weight tying,
-rotary position embeddings, and KV-cached inference.
-
-The only external dependencies are pybind11 (for the Python module) and an optional BLAS backend
-(OpenBLAS or Intel MKL) for matmul. Everything else — every gradient, every kernel, every weight
-update — is in this repository.
+Reverse-mode autograd over a dynamic graph, a layer library up to a GPT with RoPE and a KV cache,
+and a GPU backend that loads the NVIDIA driver at runtime — one build for machines with and without
+a GPU. The only build dependency is pybind11; BLAS, cuBLAS and cuDNN are optional and found at runtime.
 
 ```python
 import prometheus as p
 
-model = p.Sequential([
-    p.Linear(2, 8),
-    p.ReLU(),
-    p.Linear(8, 1),
-    p.Sigmoid(),
-])
-
-optimizer = p.Adam(model.parameters(), lr=0.01)
-
+model = p.Sequential([p.Linear(2, 8), p.ReLU(), p.Linear(8, 1), p.Sigmoid()])
+opt = p.Adam(model.parameters(), lr=0.01)
 for epoch in range(1000):
-    out  = model.forward(X)
-    loss = p.mse_loss(out, y)
+    loss = p.mse_loss(model.forward(X), y)
     loss.backward()
-    optimizer.step()
-    optimizer.zero_grad()
+    opt.step()
+    opt.zero_grad()
 ```
-
----
 
 ## Training a GPT
 
-The transformer stack is complete enough to train a small language model end to end:
-
 ```python
-import tiktoken
-import prometheus as p
-
 model = p.GPT(vocab_size, max_seq_len, embed_dim=64, num_heads=4, num_layers=2, rope=True)
 opt   = p.AdamW(model.parameters(), lr=3e-3, weight_decay=0.1)
-sched = p.CosineAnnealingLR(base_lr=3e-3, T_max=200, min_lr=3e-4)
-
-ids    = p.Tensor([batch, seq_len], input_ids, p.int64)   # token ids, exact as int64
-logits = model.forward(ids)                            # [batch, seq_len, vocab_size]
-loss   = p.cross_entropy_sparse_seq(logits, target_ids)  # targets flattened, batch * seq_len
-
+ids   = p.Tensor([batch, seq_len], input_ids, p.int64)
+loss  = p.cross_entropy_sparse_seq(model.forward(ids), target_ids)
 loss.backward()
 p.clip_grad_norm(model.parameters(), 1.0)
 opt.step()
-opt.zero_grad()
-opt.lr = sched.step()
 
-# Autoregressive generation with a KV cache — O(n) per token instead of O(n²)
-cache = model.make_kv_cache()
-logits = model.forward_cached(token_id, cache)         # [vocab_size]
+cache  = model.make_kv_cache()                 # generation, O(n) per token
+logits = model.forward_cached(token_id, cache)
 ```
 
-Run the full example:
-
-```bash
-python examples/gpt_shakespeare.py                  # built-in Shakespeare snippet
-python examples/gpt_shakespeare.py path/to/text.txt  # your own corpus
-```
+`python examples/gpt_shakespeare.py [text.txt]` trains one end to end.
 
 ---
 
 ## Implemented
 
-### Core
-
 | | |
 |---|---|
-| **Tensor** | N-dimensional, strided storage with 64-bit shapes; `zeros`, `ones`, `full`, `randn`, `detach`, `half`/`to_float`, NumPy interop via `numpy()` / `from_numpy()` |
-| **dtype / device** | `float32`, `float64`, `float16`, `bfloat16`, `int64`, `int32`, `bool`, with PyTorch's promotion rules (`result_type`, `promote_types`; all 49 pairs checked against PyTorch). float64 computes in double with double gradients (gradcheck to 1e-12); float16/bfloat16 are stored narrow and computed in float32; integer arithmetic is exact. `to` / `cast` are differentiable between float dtypes. The fused layers (conv, norms, recurrent, attention) take float32 and half and refuse float64 by name. Device is `cpu` or `cuda` |
-| **GPU (early)** | NVIDIA GPUs through the driver and NVRTC loaded at runtime -- no CUDA SDK to build, one build for machines with and without a GPU (`pip install nvidia-cuda-nvrtc-cu12`). So far: `cuda_available`, `cuda_status`, `t.cuda()` / `t.cpu()` / `to(cuda)` for every dtype and for views, a caching device allocator; on the GPU: arithmetic with broadcasting, scalar ops, `exp_op` `log_op` `sqrt_op` `pow_op` `abs_op` `clip`, `relu` `gelu` `sigmoid` `tanh_op`, `sum` / `mean`, `max_op` / `min_op` / `argmax`, `softmax`, comparisons, `where`, `masked_fill`, `concat_op`, `gather_flat` / `scatter_add_flat`, casts between every dtype and strided copies, and `matmul` / `matmul_bt` / `linear_op` on cuBLAS (`pip install nvidia-cublas-cu12`) -- with gradients computed on the GPU (to any order) and `to(cuda)` / `to(cpu)` differentiable. Layers on the GPU: `Linear`, `LayerNorm`, `MultiHeadAttention` (causal, RoPE), `Embedding`, `Dropout`, `PositionalEncoding`, a fused `cross_entropy_sparse_seq`, the whole `GPT`, `Conv2D`, `ConvTranspose2D`, `MaxPool2D`, `AvgPool2D`, `BatchNorm`, `GroupNorm`, `Flatten`, `RNN`, `LSTM`, `GRU` and every loss; `model.to(cuda)` moves the parameters in place. Mixed precision on the GPU: float16 / bfloat16 tensors keep their dtype, float16 (and on compute 8.0+, bfloat16) matmuls run through cuBLAS GemmEx with float32 accumulation on tensor cores where present (`cuda_has_tensor_cores`, `cuda_has_bf16`), and `autocast` and `GradScaler` work on the device. Optimizers on the GPU: `SGD`, `Adam`, `AdamW`, `RMSprop` and `clip_grad_norm`, with their state following the model to the GPU. A GPT trains on the GPU with its loss curve tracking the CPU's. Tested on a GTX 970 |
-| **Comparisons and masks** | `eq` `ne` `lt` `le` `gt` `ge` (bool out), `logical_and`, `logical_or`, `logical_xor`, `logical_not`, `any`, `all`, `isnan`, `isinf`, `isfinite`, `where` and `masked_fill` (differentiable), `floor_divide`, `remainder`; Python operators `+ - * / // % ** @ < <= > >= == != & \| ^ ~` on tensors |
-| **Mixed precision** | `autocast(bfloat16 \| float16)`: matmul, `matmul_bt` and `linear_op` (so `Linear`) compute in the half dtype with float32 accumulation; softmax / log / exp / reductions / norms / losses return float32; `GradScaler` for float16 loss scaling |
-| **Views** | `transpose`, `permute`, `reshape`, `contiguous` — O(1), share storage, differentiable; every op accepts a view |
-| **Autograd** | Reverse-mode AD, graph built dynamically on the forward pass, `backward()` via topological sort, per-tensor `requires_grad`; `grad` with create_graph for gradients of gradients (Hessian-vector products, MAML) |
-| **Ops** | `add`, `subtract`, `multiply`, `divide` (numpy broadcasting), `matmul` (batched, broadcast batch dims), `sum`, `mean` (any dim, with keepdim), `pow_op`, `sqrt_op`, `abs_op`, `exp_op`, `log_op`, `clip`, `max_op`, `min_op`, `argmax`, `concat_op`, `linear_op` |
-| **Activations** | `relu`, `gelu`, `sigmoid`, `tanh_op`, `softmax` |
+| **Tensors** | strided N-d tensors; `float32`, `float64`, `float16`, `bfloat16`, `int64`, `int32`, `bool` with PyTorch's promotion rules; views (`transpose`, `permute`, `reshape`); NumPy interop |
+| **Autograd** | dynamic graph, `backward()`, `grad(..., create_graph=True)` for higher-order gradients |
+| **Ops** | arithmetic with broadcasting, `matmul`, reductions, `softmax`, activations, comparisons, `where`, `masked_fill`, `concat_op` |
+| **Layers** | `Linear`, `Dropout`, `BatchNorm`, `GroupNorm`, `Conv2D`, `ConvTranspose2D`, `MaxPool2D`, `AvgPool2D`, `RNN`, `LSTM`, `GRU` (`reset_after=True` is PyTorch's form), `Embedding`, `LayerNorm`, `MultiHeadAttention`, `TransformerBlock`, `GPT` |
+| **Losses** | MSE, MAE, Huber, BCE, cross-entropy (dense, sparse, per sequence), KL, contrastive, L1 / L2 |
+| **Training** | `SGD`, `Adam`, `AdamW`, `RMSprop`; LR schedules; `clip_grad_norm`; `autocast` and `GradScaler` |
+| **I/O** | safetensors save / load (PyTorch-compatible, Hugging Face weights), checkpoints, ONNX export, metrics |
 
-### Layers
-
-| Group | Layers |
-|---|---|
-| **Core** | `Linear`, `Dropout`, `Flatten`, `Sequential`, `BatchNorm`, `GroupNorm` |
-| **Vision** | `Conv2D`, `ConvTranspose2D`, `MaxPool2D`, `AvgPool2D` |
-| **Recurrent** | `RNN`, `LSTM`, `GRU` (all with `forward_with_state`); `GRU(..., reset_after=True)` is PyTorch's `nn.GRU` form -- it loads its weights exactly ([tests/check_gru_vs_pytorch.py](tests/check_gru_vs_pytorch.py)) and needs one hidden product a step instead of two |
-| **NLP** | `Embedding`, `LayerNorm`, `PositionalEncoding`, `MultiHeadAttention` (causal + RoPE), `TransformerBlock`, `GPT` |
-
-Initialisation matches PyTorch's defaults: `Linear`, `Conv2D` and
-`ConvTranspose2D` draw weights and biases from U(±1/√fan_in), attention uses
-Xavier-uniform for Q/K/V, embeddings N(0, 1) and the `GPT`'s embeddings
-N(0, 0.02) as GPT-2. `"xavier"` and `"kaiming"` are available as the last
-argument of `Linear` and the convolutions.
-
-### Losses
-
-`mse_loss` · `mae_loss` · `huber_loss` · `bce_loss` · `cross_entropy_loss` ·
-`cross_entropy_sparse` · `cross_entropy_sparse_seq` · `kl_divergence` ·
-`reconstruction_loss` · `contrastive_loss` · `l1_regularization` · `l2_regularization`
-
-### Optimizers & schedules
-
-`SGD` (with momentum) · `Adam` · `AdamW` (decoupled weight decay) · `RMSprop`
-`StepLR` · `ExponentialLR` · `CosineAnnealingLR`
-`clip_grad_norm` · `GradScaler` (mixed-precision loss scaling with overflow detection)
-
-Adam and AdamW persist their momentum buffers through `save_state()` / `load_state()`.
-
-### Data, metrics, utilities
-
-- `accuracy`, `precision`, `recall`, `f1_score`, `confusion_matrix`, `r2_score`
-- `save_model` / `load_model`, `save_checkpoint` / `load_checkpoint` (weights + epoch + best loss), written as safetensors -- every dtype, readable by PyTorch and numpy; files in the old format still load
-- `save_safetensors` / `load_safetensors` for named tensors, including pretrained weights from the Hugging Face hub
-- `train()` loop helper
-- (C++) `DataLoader` — batching, per-epoch reshuffle; `data_split` for train/val/test
-- (C++) `read_csv`, `load_image` (PNG/JPG → tensor), `EarlyStopping`, `model_summary`
-- ONNX export via [prometheus_onnx.py](prometheus_onnx.py)
+Initialisation matches PyTorch's defaults.
 
 ---
 
-## Performance
-
-`matmul` goes through a BLAS library chosen **at runtime**, not at build time.
-OpenBLAS and Intel MKL both export the standard `cblas_sgemm`, so the module
-loads whichever is selected and calls through it. One build serves every case,
-and switching costs no rebuild:
-
-```python
->>> import prometheus as p
->>> p.backend()
-{'matmul': 'mkl', 'library': '...\\mkl_rt.3.dll', 'blas_threads': 8, 'threads': 16}
->>> p.set_blas("openblas")      # or "mkl", "tiled", "auto"
-```
-
-| Backend | Where it comes from |
-|---|---|
-| **Intel MKL** | `pip install mkl` (or `pip install prometheus[mkl]`) |
-| **OpenBLAS** | system package, or `libopenblas` next to the module |
-| **Tiled** | built in: cache-friendly tiling, parallel with OpenMP |
-
-By default (`"auto"`) MKL is tried first, then OpenBLAS, then the built-in
-kernel. `PROMETHEUS_BLAS=mkl|openblas|tiled` picks one at startup, and
-`PROMETHEUS_BLAS_PATH` names the exact library file. Asking for a library that
-cannot be loaded raises an error rather than quietly falling back: always
-check `backend()` before trusting a benchmark.
-
-Measured on a 16.8M-parameter GPT (vocab 16000, embed 384, 6 heads, 6 layers),
-batch 8, sequence 128, one full training step including backward and Adam, on
-a Ryzen AI 7 350. PyTorch 2.15 CPU was run on the identical architecture, in
-the same session, interleaved with Prometheus:
-
-| | tok/s |
-|---|---|
-| Prometheus, tiled + OpenMP | 218 |
-| Prometheus, OpenBLAS | 1523 |
-| Prometheus, MKL | 1532-1681 |
-| PyTorch 2.15 (MKL) | 1917-1976 |
-
-Absolute numbers on a laptop move with power and thermal state by as much as
-40%, which is why the comparison is interleaved.
-
-Per layer, forward + backward, against PyTorch 2.15 on the same shapes
-(best of three to five interleaved rounds; rows measured in different sessions
-differ in absolute time with the laptop's power state, so compare the ratios):
-
-| Layer | Shape | Prometheus | PyTorch | |
-|---|---|---|---|---|
-| Conv2D | [16,32,32,32] -> 64, k3 | 9.13 ms | 2.91 ms | 3.1x slower |
-| ConvTranspose2D | [16,64,16,16] -> 32, k4 s2 | 4.07 ms | 1.48 ms | 2.8x slower |
-| MaxPool2D | [16,64,32,32], k2 | 0.72 ms | 1.03 ms | 1.4x faster |
-| AvgPool2D | [16,64,32,32], k2 | 0.24 ms | 0.52 ms | 2.2x faster |
-| BatchNorm | [16,64,32,32] | 0.81 ms | 1.38 ms | 1.7x faster |
-| GroupNorm | [16,64,32,32], 8 groups | 0.44 ms | 0.65 ms | 1.5x faster |
-| RNN | seq 64, batch 32, 128 -> 256 | 10.92 ms | 9.58 ms | 1.1x slower |
-| LSTM | seq 64, batch 32, 128 -> 256 | 31.28 ms | 17.47 ms | 1.8x slower |
-| GRU | seq 64, batch 32, 128 -> 256 | 20.91 ms | 30.04 ms | 1.4x faster |
-| Embedding | [32,128] ids, 16000 x 384 | 0.89 ms | 2.82 ms | 3.2x faster |
-| SGD (momentum) | 16.8M parameters | 5.60 ms | 8.07 ms | 1.4x faster |
-| AdamW | 16.8M parameters | 8.06 ms | 22.89 ms | 2.8x faster |
-| RMSprop | 16.8M parameters | 5.53 ms | 14.81 ms | 2.7x faster |
-
-PyTorch runs its convolutions through oneDNN's direct-convolution kernels;
-against its own im2col path (oneDNN off) the convolutions here are 1.3-1.6x. Benchmark with
-[tests/benchmark_matmul.cpp](tests/benchmark_matmul.cpp).
-
-### On the GPU
-
-One full training step (forward, backward, optimizer), ms, against PyTorch 2.15
-eager and `torch.compile` on the same model in the same session, interleaved
-([tests/bench_gpu_all.py](tests/bench_gpu_all.py), run on Modal with
-[tests/modal_gpu.py](tests/modal_gpu.py)). PyTorch's attention is
-`F.scaled_dot_product_attention` (flash kernels on this card) -- its fastest.
-A100:
-
-| Model | Prometheus | PyTorch eager | torch.compile |
-|---|---|---|---|
-| GPT 4 x 256, batch 8 x 128, AdamW | **5.1** | 7.2 (1.4x slower) | 4.8 |
-| GPT, with gradient clipping | **5.2** | 7.5 | 5.3 |
-| GPT 4 x 256, bf16 autocast | **2.8** | 7.8 (2.8x slower) | 2.2 |
-| GPT 12 x 768, batch 8 x 256, TF32 matmuls | **24.2** | 29.1 | 24.4 (max-autotune) |
-| the same, bf16 autocast | **20.4** | 26.3 | 17.0 (max-autotune) |
-| the same, float32 | 78.7 | 77.5 | 79.0 (max-autotune) |
-| CNN, batch 64 of 32x32 | **1.0** | 1.6 | 1.8 |
-
-With the step replayed from a CUDA Graph (`p.CUDAGraph`, or `p.compile`),
-against PyTorch eager in the same run (an earlier run; PyTorch with its
-matmul / softmax attention):
-
-| Model | Prometheus, graph | PyTorch eager |
-|---|---|---|
-| CNN | **0.8** | 1.2 |
-| LSTM, 64 x 32 x 128 -> 256 | **2.2** | 2.3 |
-| GRU (`reset_after=True`) | **2.0** | 2.4 |
-
-GTX 970, float32, against PyTorch 2.14 eager: GPT 16.5 vs 19.4 ms, with
-clipping 16.9 vs 20.1, CNN 4.4 vs 4.9, RNN 2.6 vs 3.2.
-
-Where it is behind, and why:
-
-| Model | Prometheus | PyTorch eager | torch.compile | Why |
-|---|---|---|---|---|
-| RNN, A100 | 2.0 (one launch) | 0.9 | 1.0 | 64 short sequential steps; cuDNN's persistent kernel keeps more on chip |
-| LSTM / GRU, A100, no graph | 3.2 / 3.2 | 2.7 / 2.9 | 2.8 / 2.8 | launch-bound: a gemm and a kernel per step; a graph closes it (above) |
-| LSTM / GRU, GTX 970 | 5.2 / 5.0 | 5.0 / 4.4 | | the same |
-| GPT 12 x 768, bf16, against torch.compile | 20.4 | | 17.0 | compile fuses across ops (and into its gemms); here the fusions are hand-written per layer |
-
----
-
-## Install
-
-### Python
+## GPU
 
 ```bash
-pip install -e . --no-build-isolation
-```
-
-Parallelise across cores with OpenMP:
-
-```bash
-PROMETHEUS_USE_OPENMP=1 pip install -e . --no-build-isolation
-pip install mkl                  # optional: fastest matmul, picked up automatically
-```
-
-The BLAS library is not a build option; see [Performance](#performance).
-
-Builds are portable by default. `PROMETHEUS_NATIVE=1` tunes for the building
-machine's CPU (`-march=native`, or `/arch:AVX2` with MSVC) — fine for a local
-build, wrong for a wheel, which would crash on older CPUs.
-
-The package bundles the pure-Python models alongside the compiled core:
-
-```python
-import prometheus as p                 # the C++ core
-from prometheus.models import MLP, CNN, ResNet, UNet, VAE, GAN
-from prometheus.gpt import GPT         # a GPT written in Python on the C++ ops
-```
-
-Prebuilt wheels for Windows, Linux, and macOS are produced by
-[.github/workflows/build_wheels.yml](.github/workflows/build_wheels.yml).
-
-### GPU
-
-Nothing CUDA is needed to build. With an NVIDIA driver installed, two pip
-packages switch the GPU on -- the runtime compiler and cuBLAS -- and the same
-build finds them:
-
-```bash
-pip install nvidia-cuda-nvrtc-cu12 nvidia-cublas-cu12
+pip install nvidia-cuda-nvrtc-cu12 nvidia-cublas-cu12      # nvidia-cudnn-cu12 optional
 ```
 
 ```python
-import prometheus as p
-print(p.cuda_status())                 # "NVIDIA GeForce GTX 970, compute 5.2, 4095 MB"
-model = p.GPT(2048, 128, 256, 4, 4)
-model.cuda()                           # parameters move in place
-opt = p.AdamW(model.parameters(), 3e-4)
-ids = p.Tensor([8, 128], ids_list, p.int64).cuda()
+model.cuda()
+ids = ids.cuda()
 loss = p.cross_entropy_sparse_seq(model.forward(ids), targets)
-loss.backward()
-opt.step()
 ```
 
-Kernels are compiled for the GPU actually present the first time each is used,
-so one build serves every generation; CUDA 12 covers Maxwell (GTX 900) onward,
-CUDA 13 Turing onward. Mixed precision uses tensor cores where the card has
-them (`cuda_has_tensor_cores`, `cuda_has_bf16`, `cuda_cudnn_available`), and
-`p.set_float32_matmul_precision("high")` lets float32 matmuls use TF32 tensor
-cores on A100-class GPUs, as in PyTorch -- a 12-layer GPT step on an A100 goes
-from 79 to 24.5 ms. CUDA Graphs record a training step once and replay it with
-one launch, as `torch.cuda.CUDAGraph` (`cuda_graphs_available()`):
+Kernels are compiled for the GPU present (Maxwell onward) and cached on disk. Every layer, loss and
+optimizer runs on the GPU, tested against the CPU.
 
-```python
-for _ in range(3):
-    loss = step()                      # warm up: kernels compiled, plans made
-g = p.CUDAGraph()
-with g.capture():
-    loss = step()                      # recorded, not run
-for batch in data:
-    x.copy_from(batch)                 # new inputs into the captured tensors
-    g.replay()                         # the whole step; loss refreshed in place
-```
-
-`p.compile(step)` does all of this for a function of GPU tensors, as
-`torch.compile(mode="reduce-overhead")`: a few eager calls, then one capture,
-then replays with the arguments copied in (a new shape captures again; a step
-that reads a value back keeps running eagerly, with a warning):
-
-```python
-@p.compile
-def train_step(x, y):
-    opt.zero_grad()
-    loss = p.cross_entropy_sparse_seq(model.forward(x), y)
-    loss.backward()
-    opt.step()
-    return loss
-```
-
-`p.fuse` turns an element-wise function of your own -- an activation, a loss
--- into one GPU kernel forward and one backward: the first call traces it on
-symbols (operators and `p.fx.exp`, `log`, `sqrt`, `abs`, `tanh`, `sigmoid`,
-`relu`, `gelu`, `pow`, `maximum`, `minimum`, and the reductions `sum` /
-`mean` along an axis) into the compiler's IR (`prometheus.compiler`: typed
-values, shape inference, common subexpressions merged), differentiates it in
-reverse mode and generates the kernels -- one per element-wise region,
-reductions run as the library's ops; inputs broadcast. Gradients of fused
-functions are fused functions too, so they differentiate again (second
-derivatives and beyond). On CPU tensors the same function runs as ordinary
-ops.
+| Feature | |
+|---|---|
+| Mixed precision | `autocast(p.bfloat16)` keeps the whole path in bf16; `p.set_default_autocast` turns it on without a scope |
+| TF32 | `p.set_float32_matmul_precision("high")` |
+| CUDA Graphs | `p.CUDAGraph`, or `@p.compile` to capture and replay a whole step |
+| Fusion | `@p.fuse` compiles your own element-wise functions, losses or whole blocks (`p.fx` ops) into generated kernels, with gradients to any order (`prometheus.compiler`) |
+| Attention | `p.set_attention_backend("auto" \| "math" \| "flash")`; flash keeps memory linear in the sequence length |
+| Data loading | `p.prefetch(batches)` uploads the next batch on a second stream |
+| Diagnostics | `p.cuda_profile()`, `p.cuda_launch_counts()`, `p.cuda_memory_stats()` |
 
 ```python
 @p.fuse
 def swish_mse(x, t):
-    y = x * p.fx.sigmoid(x)
-    return (y - t) * (y - t)      # 1 kernel, where the ops took 6 forward and more backward
+    y = x * p.fx.sigmoid(x) - t
+    return p.fx.mean(y * y)
 ```
 
-`p.prefetch(batches)` yields the batches (CPU tensors, or tuples of them) as
-GPU tensors with the next ones already uploading: the copies go through
-pinned memory on a second stream and the compute stream waits for each on the
-GPU, never the CPU. The device allocator reuses a freed block for any request
-of its size class or up to half its size (`p.cuda_allocator()`);
-`PROMETHEUS_ALLOCATOR=async` hands allocation to the driver's stream-ordered
-pool instead.
+## Performance
 
-Inside a capture nothing may read a value back (`.item()`, printing,
-`clip_grad_norm(..., return_norm=False)` instead); Adam and AdamW keep their
-step count on the GPU so replays stay correct. On an A100 graphs make the LSTM
-and GRU steps 1.5x faster, ahead of PyTorch's cuDNN.
+One training step, ms, against PyTorch 2.15 (with flash attention) on an A100, run on
+[Modal](https://modal.com) by [tests/modal_gpu.py](tests/modal_gpu.py):
 
-Under `autocast(p.bfloat16)` (or `float16`) the GPU path stays in the half
-dtype end to end: the gemms write their half results themselves, the backward
-gemms run in the half dtype too, attention keeps its probabilities in it, and
-the fused bias + GELU, bias + residual and residual + LayerNorm kernels read
-and write it directly -- parameters, the residual stream and gradients stay
-float32. A 12-layer GPT step on an A100 takes 20.4 ms this way, against
-PyTorch's 26.3 ms (eager, flash attention) and 17.0 ms (torch.compile). `p.set_default_autocast(p.bfloat16)` turns this on
-for every GPU matmul without a scope (CPU tensors stay float32, an explicit
-`autocast(p.float32)` still wins); it is off by default, so results are those
-of float32 unless asked.
+| Model | Prometheus | PyTorch eager | torch.compile |
+|---|---|---|---|
+| GPT 4×256, float32 | **5.1** | 7.2 | 4.8 |
+| GPT 4×256, bf16 | **2.8** | 7.8 | 2.2 |
+| GPT 12×768, TF32 | **24.2** | 29.1 | 24.4 |
+| GPT 12×768, bf16 | **20.4** | 26.3 | 17.0 |
+| GPT 12×768, float32 | 78.7 | 77.5 | 79.0 |
+| CNN, batch 64 | **1.0** | 1.6 | 1.8 |
+| `p.fuse` swish + MSE | **0.40** | 0.59 | 0.54 |
+| LSTM / GRU (with a CUDA Graph) | **2.2 / 2.0** | 2.3 / 2.4 | |
+| RNN | 2.0 | 0.9 | 1.0 |
 
-Attention has two GPU paths, picked by `p.set_attention_backend(...)` (or
-`PROMETHEUS_ATTENTION`): `"math"`, the scores as S x S buffers through cuBLAS,
-fastest at ordinary lengths, and `"flash"`, tiled with an online softmax so the
-scores are never stored -- memory linear in the sequence length, the backward
-recomputing them from each row's log-sum-exp (head size up to 128). The default
-`"auto"` switches to flash once the S x S buffers would pass 512 MB. The plain
-RNN runs its whole recurrence, forward and backward, in one kernel when the
-batch's hidden state fits in shared memory: each block owns a slice of the
-hidden units, with a barrier across the GPU between steps (A100: 2.3 ms against
-2.6 for a gemm and a kernel per step). LSTM and GRU can do the same
-(`PROMETHEUS_PERSISTENT_RNN=1`; `=0` turns it off for all) but are faster per
-step for now. `p.cuda_launch_counts()` counts
-the kernels, cuBLAS / cuDNN calls and copies issued since
-`p.cuda_reset_launch_counts()`; the GPU benchmarks print them per step.
-`cuda_memory_stats()` reports
-memory held by tensors, its peak and the allocator's cache; running out names
-the sizes involved. `cuda_set_device(i)` or `PROMETHEUS_CUDA_DEVICE` picks a
-GPU. `PROMETHEUS_PROFILE_BACKWARD=1` prints the backward pass's time by op.
-`p.cuda_profile()` (or `PROMETHEUS_PROFILE_KERNELS=1`) times every kernel, gemm
-and cuDNN call on the GPU itself, with events on the stream rather than a sync
-per op, and `p.cuda_profile_report()` sums them by name;
-[tests/profile_gpu_gpt.py](tests/profile_gpu_gpt.py) sets it against
-`torch.profiler` on the same model.
-Compiled kernels -- machine code for the GPU present -- are kept on disk
-(`%LOCALAPPDATA%\prometheus\kernels`, `~/.cache/prometheus/kernels`;
-`PROMETHEUS_KERNEL_CACHE` names another folder, `0` turns it off), so a later
-process starts without compiling: the first GPT and CNN steps of a process
-take 0.3 s on a GTX 970, 4.5 s with nothing cached
-([tests/bench_gpu_startup.py](tests/bench_gpu_startup.py)).
+Behind: bf16 against `torch.compile` (it fuses across ops), and the plain RNN (cuDNN's persistent
+kernel). On a GTX 970 the GPT step is 16.5 ms against PyTorch's 19.4.
 
-cuDNN is optional: with it installed, `Conv2D` and `ConvTranspose2D` run on
-its kernels; without it, or with `PROMETHEUS_CUDNN=0`, they run on the
-library's own. `cuda_cudnn_status()` names the version in use or why it is not
-used. A tiny test convolution runs when it loads, because recent cuDNN releases
-load on older cards and then fail; on a GTX 900 card use cuDNN 9.10, the
-version PyTorch bundles. Each convolution shape's algorithms are timed once
-and the fastest kept (`PROMETHEUS_CUDNN_BENCHMARK=0` takes cuDNN's heuristic
-pick instead, with no timing run):
+On the CPU, `matmul` uses MKL, OpenBLAS or a built-in tiled kernel, chosen at runtime
+(`p.backend()`, `p.set_blas`). A 16.8M-parameter GPT step runs at 1530-1680 tokens/s with MKL
+against PyTorch's 1920-1980 on a Ryzen AI 7 350; pooling, norms, GRU, embeddings and optimizers
+are faster than PyTorch's, convolutions about 3x slower.
+
+## Install
 
 ```bash
-pip install nvidia-cudnn-cu12            # Maxwell: nvidia-cudnn-cu12==9.10.2.21
+PROMETHEUS_USE_OPENMP=1 pip install . --no-build-isolation
+pip install mkl                       # optional: fastest CPU matmul
 ```
 
-GPT training step on a GTX 970 (4 layers x 256, batch 8 x 128,
-[tests/bench_gpu_gpt.py](tests/bench_gpu_gpt.py)): Prometheus 16.5 ms
-(62.0k tokens/s), PyTorch 2.14 19.5 ms (52.6k tokens/s), the same step on
-a Ryzen AI 7 350 CPU 208 ms; with RoPE (`--rope`, applied inside the fused
-attention kernel) 19.6-20.6 ms. Attention projects Q, K and V in one gemm. Small-CNN training step, batch 64 of 32x32
-([tests/bench_gpu_cnn.py](tests/bench_gpu_cnn.py)): Prometheus 4.4 ms
-with cuDNN, PyTorch 5.0 ms. Recurrent layers run fused on the GPU (one gemm
-and one gate kernel per step, backward through time on the device); a training
-step over 64 x 32 x 128 -> 256 ([tests/bench_gpu_lstm.py](tests/bench_gpu_lstm.py)):
-LSTM 5.2 ms, GRU 5.8 ms (5.0 with `reset_after=True`), RNN 2.6 ms against
-PyTorch's cuDNN 5.0, 4.0-4.7 and 3.2 ms. The GPU suite is
-[tests/test_cuda.cpp](tests/test_cuda.cpp) and
-[tests/test_cuda.py](tests/test_cuda.py): every op and layer against the CPU,
-forward and gradient; CI has no GPU, so there they build and skip. On a GPU
-machine, `python tests/build_gpu_tests.py --run` builds the C++ suite from the
-objects pip already compiled for the module (one compiler, one compile of the
-library) and runs it. `pip install .` itself rebuilds only the sources whose
-code or included headers changed, in parallel. Without a local GPU,
-[tests/modal_gpu.py](tests/modal_gpu.py) runs the same on a rented one with
-[Modal](https://modal.com) (`modal run tests/modal_gpu.py --gpu A100`): it
-builds the library in a Linux container, runs both GPU suites and
-[tests/bench_gpu_all.py](tests/bench_gpu_all.py) against PyTorch, eager and
-`torch.compile`.
-`p.clip_grad_norm(params, max_norm, return_norm=False)` clips on the GPU
-without reading the norm back, so the step never waits for the GPU; the GradScaler
-reads one overflow flag a step.
+C++: `cmake -B build && cmake --build build && ctest --test-dir build`.
+`PROMETHEUS_NATIVE=1` tunes for the building CPU. Wheels come from
+[build_wheels.yml](.github/workflows/build_wheels.yml).
 
-### C++
-
-Requires CMake and a C++17 compiler.
-
-```bash
-cmake -B build                     # tiled matmul, no external BLAS (default)
-cmake --build build
-ctest --test-dir build             # 25 test binaries
-```
-
-Each component has its own test executable (`test_tensor`, `test_gpt`, `test_attention`, …),
-built alongside the library. `ctest` runs them all with the correct working
-directory, which some tests need in order to find their fixtures.
-
-#### OpenMP and BLAS
-
-`cmake -B build -DUSE_OPENMP=ON` parallelises across cores. BLAS needs no
-build flag: the test binaries load MKL or OpenBLAS at runtime if one is on the
-library path or beside the executable, and `PROMETHEUS_BLAS=tiled ctest`
-forces the built-in kernel.
-
----
+GPU tests: [tests/test_cuda.cpp](tests/test_cuda.cpp) and [tests/test_cuda.py](tests/test_cuda.py)
+(they skip without a GPU); `python tests/build_gpu_tests.py --run` builds and runs the C++ suite;
+`modal run tests/modal_gpu.py --gpu A100` runs everything plus the benchmarks on a rented GPU.
 
 ## Examples
 
 | File | What it shows |
 |---|---|
-| [xor_example.py](examples/xor_example.py) | Smallest complete training loop |
-| [regression.py](examples/regression.py) | Tabular regression |
-| [binary_classifier.py](examples/binary_classifier.py) | Two-class classification |
-| [mnist_linear.py](examples/mnist_linear.py) | MNIST with dense layers |
+| [xor_example.py](examples/xor_example.py) | Smallest training loop |
 | [mnist_conv.py](examples/mnist_conv.py) | MNIST with `Conv2D` |
-| [sentiment_rnn.py](examples/sentiment_rnn.py) | Sequence classification with an RNN |
-| [text_generation.py](examples/text_generation.py) | Character-level language model |
-| [lm_tiktoken.py](examples/lm_tiktoken.py) | Token-level LM on `cl100k_base` |
-| [gpt_shakespeare.py](examples/gpt_shakespeare.py) | Full GPT: RoPE, AdamW, cosine schedule, KV-cache generation |
-| [maml_sine.py](examples/maml_sine.py) | MAML few-shot sine regression: differentiates through the inner step with `p.grad(..., create_graph=True)`. After one step on 10 points, MSE 1.69 against 4.50 for a random init after ten |
-
----
+| [sentiment_rnn.py](examples/sentiment_rnn.py) | Sequence classification |
+| [lm_tiktoken.py](examples/lm_tiktoken.py) | Token-level language model |
+| [gpt_shakespeare.py](examples/gpt_shakespeare.py) | Full GPT: RoPE, AdamW, cosine schedule, KV cache |
+| [maml_sine.py](examples/maml_sine.py) | MAML through `p.grad(..., create_graph=True)` |
 
 ## Layout
 
 ```
-include/ml/          headers
-├── tensor.hpp  ops.hpp  loss.hpp  autograd.hpp  matmul_backend.hpp
-├── nn/              module, linear, activations, dropout, flatten,
-│   │                sequential, batchnorm, groupnorm
-│   ├── vision/      conv2d, convtranspose2d, maxpool2d, avgpool2d
-│   ├── rnn/         rnn, lstm, gru
-│   └── nlp/         embedding, layernorm, positional_encoding,
-│                    attention, transformer, gpt
-├── optim/           optimizer, sgd, adam, adamw, rmsprop, scheduler, grad_scaler
-├── data/            dataloader, csv, image
-├── metrics/         metrics
-└── utils/           model_io, trainer, summary, early_stopping, grad_clip
-
-src/                 implementations, mirroring include/
-python/bindings.cpp  pybind11 module
-tests/               one test executable per component
-examples/            runnable Python examples
+include/ml/   headers: tensor, ops, autograd, nn/, optim/, data/, utils/, cuda
+src/          implementations; src/cuda/ the GPU kernels and runtime
+python/       bindings, prometheus.compiler (IR, codegen, executor), fuse
+tests/        one test per component, GPU suites, benchmarks
+examples/     runnable Python examples
 ```
-
----
 
 ## Roadmap
 
-Tracked in detail in [plan.md](plan.md).
-
-- **Meta-learning** — MAML, Reptile, ProtoNet; requires second-order gradients
-- **Continual learning** — EWC, PackNet, ProgressiveNets; catastrophic-forgetting benchmarks
-- **CUDA** — `device` field on Tensor, GPU kernels, cuBLAS matmul
+- Close the bf16 gap to `torch.compile` (tensor-core flash attention)
+- Faster recurrent layers and CPU convolutions
+- Meta-learning and continual-learning methods on top of higher-order gradients
