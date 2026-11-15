@@ -1208,6 +1208,33 @@ extern "C" __global__ void f_layernorm(const float* x, const float* g, const flo
     for (long long j = threadIdx.x; j < cols; j += blockDim.x) out[j] = (row[j] - mean) * inv * g[j] + b[j];
 }
 
+// The same, one warp per row (8 rows a block) with the row held in registers
+// (up to 32 values a lane: rows of up to 1024): one read of x, shuffle sums.
+// A block per row spent its time in __syncthreads and re-read the row.
+__device__ float lnw_sum(float v) {
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
+}
+extern "C" __global__ void f_layernorm_w(const float* x, const float* g, const float* b, float* y,
+                                         int cols, float eps, long long rows) {
+    const long long r = (long long)blockIdx.x * 8 + (threadIdx.x >> 5);
+    if (r >= rows) return;
+    const int lane = threadIdx.x & 31;
+    const float* row = x + r * cols;
+    float v[32];
+    float t = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < 32; k++) { const int j = lane + 32 * k; v[k] = j < cols ? row[j] : 0.0f; t += v[k]; }
+    const float mean = lnw_sum(t) / (float)cols;
+    t = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < 32; k++) { const int j = lane + 32 * k; if (j < cols) { const float d = v[k] - mean; t += d * d; } }
+    const float inv = rsqrtf(lnw_sum(t) / (float)cols + eps);
+    float* out = y + r * cols;
+    #pragma unroll
+    for (int k = 0; k < 32; k++) { const int j = lane + 32 * k; if (j < cols) out[j] = (v[k] - mean) * inv * g[j] + b[j]; }
+}
+
 // Philox-4x32-10 (Salmon et al. 2011, what cuRAND and PyTorch use): element
 // i's uniform comes from counter i and the key, so the mask is the same
 // whatever the launch shape, and a seed reproduces it exactly
@@ -1311,6 +1338,13 @@ TensorPtr layernorm(const TensorPtr& x0, const TensorPtr& g0, const TensorPtr& b
     const void* pg = base(g);
     const void* pb = base(b);
     void* py = out->storage()->data();
+    if (rows && cols <= 1024) {
+        int c = (int)cols;
+        long long rr = rows;
+        void* a[] = {&px, &pg, &pb, &py, &c, &eps, &rr};
+        cuda::launch(K("f_layernorm_w", FUSED_SRC()), (unsigned)((rows + 7) / 8), 1, 1, 256, 1, 1, 0, a);
+        return out;
+    }
     void* args[] = {&px, &pg, &pb, &py, &cols, &eps};
     if (rows) cuda::launch(K("f_layernorm", FUSED_SRC()), (unsigned)rows, 1, 1, 256, 1, 1, 0, args);
     return out;
@@ -1476,6 +1510,42 @@ extern "C" __global__ void b_layernorm_rows(const float* x, const float* g, cons
     }
     if (lane == 0) { mean_out[r] = mean; inv_out[r] = inv; }
 }
+// The same with x and g * dy held in registers (rows of up to 1024): one
+// read of each instead of up to four
+extern "C" __global__ void b_layernorm_rows_w(const float* x, const float* g, const float* dy, float* dx,
+                                              float* mean_out, float* inv_out, int cols, float eps,
+                                              long long rows) {
+    const long long r = (long long)blockIdx.x * 8 + (threadIdx.x >> 5);
+    if (r >= rows) return;
+    const int lane = threadIdx.x & 31;
+    const float* xr = x + r * cols;
+    const float* dyr = dy + r * cols;
+    float xv[32], gd[32];
+    float t = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < 32; k++) {
+        const int j = lane + 32 * k;
+        xv[k] = j < cols ? xr[j] : 0.0f;
+        gd[k] = j < cols ? g[j] * dyr[j] : 0.0f;
+        t += xv[k];
+    }
+    const float mean = ln_warp_sum(t) / (float)cols;
+    t = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < 32; k++) { const int j = lane + 32 * k; if (j < cols) { const float d = xv[k] - mean; t += d * d; } }
+    const float inv = rsqrtf(ln_warp_sum(t) / (float)cols + eps);
+    float a = 0.0f, b = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < 32; k++) { a += gd[k]; b += gd[k] * (xv[k] - mean) * inv; }
+    const float m1 = ln_warp_sum(a) / (float)cols, m2 = ln_warp_sum(b) / (float)cols;
+    float* dxr = dx + r * cols;
+    #pragma unroll
+    for (int k = 0; k < 32; k++) {
+        const int j = lane + 32 * k;
+        if (j < cols) dxr[j] = inv * (gd[k] - m1 - (xv[k] - mean) * inv * m2);
+    }
+    if (lane == 0) { mean_out[r] = mean; inv_out[r] = inv; }
+}
 // gamma / beta gradients: a thread per (chunk of 32 rows, column), added
 // atomically -- one thread per column left most of the GPU idle
 extern "C" __global__ void b_layernorm_cols(const float* x, const float* dy, const float* mean, const float* inv,
@@ -1539,8 +1609,14 @@ vector<TensorPtr> layernorm_backward(const TensorPtr& x0, const TensorPtr& g0, c
     void* pi = inv->storage()->data();
     void* pdg = dg->storage()->data();
     void* pdb = db->storage()->data();
-    void* a1[] = {&px, &pg, &pd, &pdx, &pm, &pi, &cols, &eps, &rows};
-    if (rows) cuda::launch(K("b_layernorm_rows", BACKWARD_SRC()), (unsigned)((rows + 7) / 8), 1, 1, 256, 1, 1, 0, a1);
+    if (rows && cols <= 1024) {
+        int cc = (int)cols;
+        void* aw[] = {&px, &pg, &pd, &pdx, &pm, &pi, &cc, &eps, &rows};
+        cuda::launch(K("b_layernorm_rows_w", BACKWARD_SRC()), (unsigned)((rows + 7) / 8), 1, 1, 256, 1, 1, 0, aw);
+    } else {
+        void* a1[] = {&px, &pg, &pd, &pdx, &pm, &pi, &cols, &eps, &rows};
+        if (rows) cuda::launch(K("b_layernorm_rows", BACKWARD_SRC()), (unsigned)((rows + 7) / 8), 1, 1, 256, 1, 1, 0, a1);
+    }
     void* a2[] = {&px, &pd, &pm, &pi, &pdg, &pdb, &rows, &cols};
     cuda::launch(K("b_layernorm_cols", BACKWARD_SRC()), cols * ((rows + 31) / 32), a2);
     return {dx, dg, db};
@@ -1999,7 +2075,36 @@ extern "C" __global__ void k_add_bias_residual(const float* y, const float* b, c
     long long i = gid(); if (i >= n) return;
     out[i] = y[i] + b[i % cols] + r[i];
 }
-// s = a + c and y = LayerNorm(s) per row, one block per row
+// s = a + c and y = LayerNorm(s), one warp per row with the row in registers
+// (rows of up to 1024), as f_layernorm_w
+__device__ float alnw_sum(float v) {
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
+}
+extern "C" __global__ void k_add_layernorm_w(const float* a, const float* c, float* s_out, const float* g,
+                                             const float* bt, float* y, int cols, float eps, long long rows) {
+    const long long r = (long long)blockIdx.x * 8 + (threadIdx.x >> 5);
+    if (r >= rows) return;
+    const int lane = threadIdx.x & 31;
+    const long long off = r * cols;
+    float v[32];
+    float t = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < 32; k++) {
+        const int j = lane + 32 * k;
+        v[k] = 0.0f;
+        if (j < cols) { v[k] = a[off + j] + c[off + j]; s_out[off + j] = v[k]; }
+        t += v[k];
+    }
+    const float mean = alnw_sum(t) / (float)cols;
+    t = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < 32; k++) { const int j = lane + 32 * k; if (j < cols) { const float d = v[k] - mean; t += d * d; } }
+    const float inv = rsqrtf(alnw_sum(t) / (float)cols + eps);
+    #pragma unroll
+    for (int k = 0; k < 32; k++) { const int j = lane + 32 * k; if (j < cols) y[off + j] = (v[k] - mean) * inv * g[j] + bt[j]; }
+}
+// s = a + c and y = LayerNorm(s) per row, one block per row (rows over 1024)
 extern "C" __global__ void k_add_layernorm(const float* a, const float* c, float* s_out, const float* g,
                                            const float* bt, float* y, long long cols, float eps) {
     __shared__ float sh[256];
@@ -2090,8 +2195,15 @@ pair<TensorPtr, TensorPtr> add_layernorm(const TensorPtr& a0, const TensorPtr& c
     const void* pbt = base(bt);
     void* ps = s->storage()->data();
     void* py = y->storage()->data();
-    void* args[] = {&pa, &pc, &ps, &pg, &pbt, &py, &cols, &eps};
-    if (rows) cuda::launch(K("k_add_layernorm", BLOCK_SRC()), (unsigned)rows, 1, 1, 256, 1, 1, 0, args);
+    if (rows && cols <= 1024) {
+        int cc = (int)cols;
+        long long rr = rows;
+        void* a1[] = {&pa, &pc, &ps, &pg, &pbt, &py, &cc, &eps, &rr};
+        cuda::launch(K("k_add_layernorm_w", BLOCK_SRC()), (unsigned)((rows + 7) / 8), 1, 1, 256, 1, 1, 0, a1);
+    } else {
+        void* args[] = {&pa, &pc, &ps, &pg, &pbt, &py, &cols, &eps};
+        if (rows) cuda::launch(K("k_add_layernorm", BLOCK_SRC()), (unsigned)rows, 1, 1, 256, 1, 1, 0, args);
+    }
     // s is a + c; y is LayerNorm(s), with the LayerNorm gradient: fused, or the op form
     attach(s, {a, c}, "add", [a, c](const TensorPtr&, const TensorPtr& G) -> vector<TensorPtr> {
         return {a->requires_grad() ? G : nullptr, c->requires_grad() ? G : nullptr};

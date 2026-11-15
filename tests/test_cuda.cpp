@@ -281,6 +281,13 @@ int main() {
         };
         auto x3 = random_tensor({2, 7, 16}, 50);
         layer_check("LayerNorm", [] { return std::make_shared<LayerNorm>(16); }, x3, 1e-5f);
+        // the warp-per-row kernels hold up to 1024 values a row in registers;
+        // wider rows take the block-per-row kernels
+        for (int w : {1000, 1024, 1100}) {
+            auto xw = random_tensor({3, 5, w}, 80 + w);
+            layer_check(("LayerNorm width " + std::to_string(w)).c_str(),
+                        [w] { return std::make_shared<LayerNorm>(w); }, xw, 1e-5f);
+        }
         layer_check("Linear", [] { return std::make_shared<Linear>(16, 8); }, x3, 1e-5f);
         layer_check("MultiHeadAttention", [] { return std::make_shared<MultiHeadAttention>(16, 4); }, x3, 1e-5f);
         layer_check("causal attention with RoPE", [] { return std::make_shared<MultiHeadAttention>(16, 4, true, true); }, x3, 1e-5f);
