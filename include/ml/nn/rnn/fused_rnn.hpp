@@ -16,12 +16,15 @@
 ///   - backward runs the recurrence in reverse once, then the weight and input
 ///     gradients over all timesteps are again one gemm each
 ///
-/// The formulas are the ones these layers have always used, which for the GRU
-/// is not PyTorch's: the reset gate applies before the hidden matmul,
-///   n = tanh(x W_xn + (r * h) W_hn + b_n).
+/// The GRU comes in two forms. Cell::GRU, these layers' original, applies the
+/// reset gate before the hidden matmul:
+///   n = tanh(x W_xn + (r * h) W_hn + b_n)
+/// Cell::GRU_AFTER is PyTorch's and cuDNN's, after it, with a fourth bias:
+///   n = tanh(x W_xn + b_n + r * (h W_hn + b_hn))
+/// which needs one hidden product a step instead of two.
 namespace rnn_kernel {
 
-enum class Cell { RNN, LSTM, GRU };
+enum class Cell { RNN, LSTM, GRU, GRU_AFTER };
 
 struct Result {
     TensorPtr output;   ///< [seq, batch, H]
@@ -37,7 +40,8 @@ TensorPtr init_param(Shape shape, int H);
 
 /// input [seq, batch, in]; h0 / c0 [batch, H] or null for zeros.
 /// Wx[k] is [in, H], Wh[k] is [H, H] and b[k] is [H], one per gate in the
-/// cell's order: RNN {h}, LSTM {i, f, o, g}, GRU {r, z, n}.
+/// cell's order: RNN {h}, LSTM {i, f, o, g}, GRU {r, z, n}; GRU_AFTER takes
+/// a fourth bias, b_hn, after b_r, b_z, b_n.
 Result run(Cell cell, TensorPtr input, TensorPtr h0, TensorPtr c0, int H,
            const std::vector<TensorPtr>& Wx, const std::vector<TensorPtr>& Wh,
            const std::vector<TensorPtr>& b);

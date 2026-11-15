@@ -7,6 +7,7 @@
 #include <cmath>
 #include <random>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -132,9 +133,151 @@ TensorPtr init_param(Shape shape, int H) {
     return t;
 }
 
+
+// GRU in PyTorch's / cuDNN's form, the reset gate applied after the hidden
+// product:
+//   r = sig(x W_xr + h W_hr + b_r)      z = sig(x W_xz + h W_hz + b_z)
+//   n = tanh(x W_xn + b_n + r * (h W_hn + b_hn))
+//   h' = (1 - z) n + z h
+// One product h @ [W_hr W_hz W_hn] a step instead of two, forward and back.
+// Saved for the backward: the gates and hn = h W_hn + b_hn per step. The
+// backward keeps two pre-activation gradients: dA for the input side
+// (r, z, n) and dHH for the hidden side, whose n part is dn * r.
+static Result run_gru_after_cpu(TensorPtr input, TensorPtr h0, int H, const vector<TensorPtr>& Wx,
+                                const vector<TensorPtr>& Wh, const vector<TensorPtr>& b,
+                                std::function<TensorPtr(const std::vector<TensorPtr>&)> reference) {
+    const int S = (int)input->size(0), B = (int)input->size(1), I = (int)input->size(2);
+    const int G = 3, GH = 3 * H, BH = B * H, H2 = 2 * H;
+    const int64_t SB = (int64_t)S * B;
+    auto Wxp = make_shared<vector<float>>(pack_cols(Wx, I, H));         // [I, 3H]
+    auto Whp = make_shared<vector<float>>(pack_cols(Wh, H, H));         // [H, 3H]
+    vector<float> bp(GH);
+    for (int k = 0; k < G; k++) memcpy(&bp[(size_t)k * H], b[k]->data(), H * sizeof(float));
+    const float* bhn = b[3]->data();
+
+    // every step's input projection plus (b_r, b_z, b_n), one gemm
+    auto gates = make_shared<vector<float>>((size_t)SB * GH);
+    for (int64_t r = 0; r < SB; r++) memcpy(&(*gates)[(size_t)r * GH], bp.data(), GH * sizeof(float));
+    pgemm(false, false, (int)SB, GH, I, input->data(), I, Wxp->data(), GH, 1.0f, gates->data(), GH);
+
+    auto packed = make_shared<Tensor>(Shape{SB * H});
+    float* OUT = packed->data();
+    auto HN = make_shared<vector<float>>((size_t)SB * H);
+    vector<float> zero_h((size_t)BH, 0.0f), hh((size_t)B * GH);
+    const float* h_init = h0 ? h0->data() : zero_h.data();
+
+    for (int t = 0; t < S; t++) {
+        const float* hp = t ? OUT + (size_t)(t - 1) * BH : h_init;
+        float* gt = gates->data() + (size_t)t * B * GH;
+        float* ht = OUT + (size_t)t * BH;
+        float* hnt = HN->data() + (size_t)t * BH;
+        pgemm(false, false, B, GH, H, hp, H, Whp->data(), GH, 0.0f, hh.data(), GH);
+        #pragma omp parallel for schedule(static) if(BH >= 4096)
+        for (int bb = 0; bb < B; bb++) {
+            float* gr = gt + (size_t)bb * GH;
+            const float* hr = hh.data() + (size_t)bb * GH;
+            for (int j = 0; j < H; j++) {
+                const int64_t k = (int64_t)bb * H + j;
+                const float r = sigm(gr[j] + hr[j]), z = sigm(gr[H + j] + hr[H + j]);
+                const float hn = hr[H2 + j] + bhn[j];
+                const float n = std::tanh(gr[H2 + j] + r * hn);
+                gr[j] = r; gr[H + j] = z; gr[H2 + j] = n;
+                hnt[k] = hn;
+                ht[k] = (1.0f - z) * n + z * hp[k];
+            }
+        }
+    }
+
+    vector<TensorPtr> inputs = {input};
+    if (h0) inputs.push_back(h0);
+    for (auto* group : {&Wx, &Wh}) for (auto& w : *group) inputs.push_back(w);
+    for (auto& w : b) inputs.push_back(w);
+    bool need = false;
+    for (auto& t : inputs) need = need || t->requires_grad();
+    if (need) {
+        auto node = make_node(packed, inputs);
+        node->name = "GRU";
+        autograd::attach_reference(*node, reference);
+        node->backward_fn = [input, h0, H, S, B, I, GH, BH, H2, SB, Wxp, Whp, gates, HN, Wx, Wh, b]
+                            (const TensorPtr& packed) {
+            const float* OUTd = packed->data();
+            const float* dOUT = packed->grad();
+            vector<float> zero((size_t)BH, 0.0f);
+            const float* h_init = h0 ? h0->data() : zero.data();
+            vector<float> dA((size_t)SB * GH), dHH((size_t)SB * GH), dh((size_t)BH, 0.0f);
+            for (int t = S - 1; t >= 0; t--) {
+                const float* hp = t ? OUTd + (size_t)(t - 1) * BH : h_init;
+                const float* gt = gates->data() + (size_t)t * B * GH;
+                const float* hnt = HN->data() + (size_t)t * BH;
+                float* da = dA.data() + (size_t)t * B * GH;
+                float* dhh = dHH.data() + (size_t)t * B * GH;
+                #pragma omp parallel for schedule(static) if(BH >= 4096)
+                for (int bb = 0; bb < B; bb++) {
+                    const float* gr = gt + (size_t)bb * GH;
+                    float* dr = da + (size_t)bb * GH;
+                    float* dq = dhh + (size_t)bb * GH;
+                    for (int j = 0; j < H; j++) {
+                        const int64_t k = (int64_t)bb * H + j;
+                        const float r = gr[j], z = gr[H + j], n = gr[H2 + j];
+                        const float d = dh[k] + dOUT[(size_t)t * BH + k];
+                        const float dn = d * (1.0f - z) * (1.0f - n * n);
+                        const float dzp = d * (hp[k] - n) * z * (1.0f - z);
+                        const float drp = dn * hnt[k] * r * (1.0f - r);
+                        dr[j] = drp; dr[H + j] = dzp; dr[H2 + j] = dn;
+                        dq[j] = drp; dq[H + j] = dzp; dq[H2 + j] = dn * r;
+                        dh[k] = d * z;
+                    }
+                }
+                // through h @ [W_hr W_hz W_hn]
+                pgemm(false, true, B, H, GH, dhh, GH, Whp->data(), GH, 1.0f, dh.data(), H);
+            }
+            if (input->requires_grad())
+                pgemm(false, true, (int)SB, I, GH, dA.data(), GH, Wxp->data(), GH, 1.0f, input->grad(), I);
+            if (h0 && h0->requires_grad())
+                for (int i = 0; i < BH; i++) h0->grad()[i] += dh[i];
+            bool wx = false, wh = false;
+            for (auto& w : Wx) wx = wx || w->requires_grad();
+            for (auto& w : Wh) wh = wh || w->requires_grad();
+            if (wx) {
+                vector<float> d((size_t)I * GH, 0.0f);
+                pgemm(true, false, I, GH, (int)SB, input->data(), I, dA.data(), GH, 0.0f, d.data(), GH);
+                unpack_add(d.data(), Wx, I, H, 0, 3);
+            }
+            if (wh) {
+                vector<float> Hprev((size_t)SB * H);
+                memcpy(Hprev.data(), h_init, BH * sizeof(float));
+                if (S > 1) memcpy(Hprev.data() + BH, OUTd, (size_t)(S - 1) * BH * sizeof(float));
+                vector<float> d((size_t)H * GH, 0.0f);
+                pgemm(true, false, H, GH, (int)SB, Hprev.data(), H, dHH.data(), GH, 0.0f, d.data(), GH);
+                unpack_add(d.data(), Wh, H, H, 0, 3);
+            }
+            // b_r, b_z, b_n from dA; b_hn from dHH's n part
+            for (int k = 0; k < 4; k++) {
+                if (!b[k]->requires_grad()) continue;
+                const vector<float>& src = k < 3 ? dA : dHH;
+                const int col = (k < 3 ? k : 2) * H;
+                vector<double> acc((size_t)H, 0.0);
+                for (int64_t r = 0; r < SB; r++) {
+                    const float* row = src.data() + (size_t)r * GH + col;
+                    for (int j = 0; j < H; j++) acc[j] += row[j];
+                }
+                float* g = b[k]->grad();
+                for (int j = 0; j < H; j++) g[j] += (float)acc[j];
+            }
+        };
+    }
+    Result res;
+    res.output = slice_of(packed, 0, Shape{S, B, H});
+    res.h_n    = slice_of(packed, (int64_t)(S - 1) * BH, Shape{B, H});
+    res.c_n    = nullptr;
+    return res;
+}
+
 Result run(Cell cell, TensorPtr input, TensorPtr h0, TensorPtr c0, int H,
            const vector<TensorPtr>& Wx, const vector<TensorPtr>& Wh, const vector<TensorPtr>& b) {
     const char* name = cell == Cell::RNN ? "RNN" : cell == Cell::LSTM ? "LSTM" : "GRU";
+    const bool after = cell == Cell::GRU_AFTER;
+    if (after && b.size() != 4) throw runtime_error("GRU (reset after): expected 4 biases, got " + to_string(b.size()));
     if (input->device() != Device::CUDA) input = checked_input(name, input);
     if (input->dim() != 3)
         throw runtime_error(string(name) + ": input must be [seq, batch, features]");
@@ -149,7 +292,8 @@ Result run(Cell cell, TensorPtr input, TensorPtr h0, TensorPtr c0, int H,
 
     // The recurrence unrolled from ops: the GPU path, and the reference the
     // higher-order gradients differentiate.
-    auto reference = [cell, S, B, I, H, G, lstm = (cell == Cell::LSTM), has_h0 = (bool)h0, has_c0 = (bool)c0](const std::vector<TensorPtr>& in) -> TensorPtr {
+    const int NB = (int)b.size();
+    auto reference = [cell, S, B, I, H, G, NB, lstm = (cell == Cell::LSTM), has_h0 = (bool)h0, has_c0 = (bool)c0](const std::vector<TensorPtr>& in) -> TensorPtr {
             // the recurrence unrolled from ops, in the cell's own formulas
             size_t k = 0;
             auto X = in[k++];
@@ -157,7 +301,7 @@ Result run(Cell cell, TensorPtr input, TensorPtr h0, TensorPtr c0, int H,
             TensorPtr c = (lstm && has_c0) ? in[k++] : Tensor::zeros({(int64_t)B, (int64_t)H})->to(X->device());
             vector<TensorPtr> Wx(in.begin() + k, in.begin() + k + G); k += G;
             vector<TensorPtr> Wh(in.begin() + k, in.begin() + k + G); k += G;
-            vector<TensorPtr> bb(in.begin() + k, in.begin() + k + G);
+            vector<TensorPtr> bb(in.begin() + k, in.begin() + k + NB);
             auto lin = [&](const TensorPtr& x, const TensorPtr& hh, int g) {
                 return add(add(matmul(x, Wx[g]), matmul(hh, Wh[g])), bb[g]);
             };
@@ -173,6 +317,11 @@ Result run(Cell cell, TensorPtr input, TensorPtr h0, TensorPtr c0, int H,
                     auto og = sigmoid(lin(x, h, 2)), gg = tanh_op(lin(x, h, 3));
                     c = add(multiply(fg, c), multiply(ig, gg));
                     h = multiply(og, tanh_op(c));
+                } else if (cell == Cell::GRU_AFTER) {
+                    auto r = sigmoid(lin(x, h, 0)), z = sigmoid(lin(x, h, 1));
+                    auto hn = add(matmul(h, Wh[2]), bb[3]);
+                    auto n = tanh_op(add(add(matmul(x, Wx[2]), bb[2]), multiply(r, hn)));
+                    h = add(multiply(subtract(1.0f, z), n), multiply(z, h));
                 } else {
                     auto r = sigmoid(lin(x, h, 0)), z = sigmoid(lin(x, h, 1));
                     auto n = tanh_op(add(add(matmul(x, Wx[2]), matmul(multiply(r, h), Wh[2])), bb[2]));
@@ -185,7 +334,7 @@ Result run(Cell cell, TensorPtr input, TensorPtr h0, TensorPtr c0, int H,
         };
     if (input->device() == Device::CUDA || Wx[0]->device() == Device::CUDA) {
         // fused kernels; the op form above serves recorded (higher-order) gradients
-        const int code = cell == Cell::RNN ? 0 : cell == Cell::LSTM ? 1 : 2;
+        const int code = cell == Cell::RNN ? 0 : cell == Cell::LSTM ? 1 : after ? 3 : 2;
         auto packed = cuda_ops::rnn(code, input, h0, cell == Cell::LSTM ? c0 : nullptr, H, Wx, Wh, b, reference);
         Result r;
         r.output = slice_of(packed, 0, Shape{S, B, H});
@@ -193,6 +342,8 @@ Result run(Cell cell, TensorPtr input, TensorPtr h0, TensorPtr c0, int H,
         r.c_n    = cell == Cell::LSTM ? slice_of(packed, SB * H, Shape{B, H}) : nullptr;
         return r;
     }
+
+    if (after) return run_gru_after_cpu(input, h0, H, Wx, Wh, b, reference);
 
     // packed weights: gates side by side
     auto Wxp = make_shared<vector<float>>(pack_cols(Wx, I, H));         // [I, GH]

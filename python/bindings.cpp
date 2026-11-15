@@ -605,7 +605,11 @@ PYBIND11_MODULE(_C, m) {
         .def("parameters", &LSTM::parameters);
 
     py::class_<GRU, Module, std::shared_ptr<GRU>>(m, "GRU")
-        .def(py::init<int, int>())
+        .def(py::init<int, int, bool>(), py::arg("input_size"), py::arg("hidden_size"),
+             py::arg("reset_after") = false,
+             "reset_after=True: PyTorch's form, n = tanh(x W_xn + b_n + r * (h W_hn + b_hn)) -- "
+             "one hidden product a step instead of two; loads nn.GRU weights exactly")
+        .def_readonly("reset_after", &GRU::reset_after)
         .def("forward",    py::overload_cast<TensorPtr>(&GRU::forward))
         .def("forward_with_state", [](GRU& g, TensorPtr x, TensorPtr h0) {
             return g.forward(x, h0);

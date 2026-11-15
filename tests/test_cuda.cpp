@@ -428,6 +428,7 @@ int main() {
         layer_check("RNN", [] { return std::make_shared<RNN>(5, 7); }, seq, 1e-5f);
         layer_check("LSTM", [] { return std::make_shared<LSTM>(5, 7); }, seq, 1e-5f);
         layer_check("GRU", [] { return std::make_shared<GRU>(5, 7); }, seq, 1e-5f);
+        layer_check("GRU reset_after", [] { return std::make_shared<GRU>(5, 7, true); }, seq, 1e-5f);
         {
             // initial states in, final states out: every output and every
             // input's gradient, including h0 and c0
@@ -472,6 +473,7 @@ int main() {
             };
             states("LSTM with states", [] { return std::make_shared<LSTM>(5, 7); }, true);
             states("GRU with state", [] { return std::make_shared<GRU>(5, 7); }, false);
+            states("GRU reset_after with state", [] { return std::make_shared<GRU>(5, 7, true); }, false);
         }
 
         // the losses written with raw loops on the CPU

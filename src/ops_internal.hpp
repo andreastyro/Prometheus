@@ -176,7 +176,7 @@ TensorPtr groupnorm(const TensorPtr& x, const TensorPtr& gamma, const TensorPtr&
                     std::function<TensorPtr(const std::vector<TensorPtr>&)> reference);
 TensorPtr avgpool2d(const TensorPtr& x, int kernel, int stride,
                     std::function<TensorPtr(const std::vector<TensorPtr>&)> reference);
-/// RNN (cell 0), LSTM (1) or GRU (2) over a whole [S, B, I] sequence, fused:
+/// RNN (cell 0), LSTM (1), GRU (2) or GRU in PyTorch's reset-after form (3, a fourth bias b_hn) over a whole [S, B, I] sequence, fused:
 /// the packed [S*B*H (+ B*H c_n for LSTM)] outputs. Inputs in the order
 /// input, h0?, c0?, Wx..., Wh..., b... -- as `reference` takes them.
 TensorPtr rnn(int cell, const TensorPtr& input, const TensorPtr& h0, const TensorPtr& c0, int H,

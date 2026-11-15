@@ -100,7 +100,7 @@ python examples/gpt_shakespeare.py path/to/text.txt  # your own corpus
 |---|---|
 | **Core** | `Linear`, `Dropout`, `Flatten`, `Sequential`, `BatchNorm`, `GroupNorm` |
 | **Vision** | `Conv2D`, `ConvTranspose2D`, `MaxPool2D`, `AvgPool2D` |
-| **Recurrent** | `RNN`, `LSTM`, `GRU` (all with `forward_with_state`) |
+| **Recurrent** | `RNN`, `LSTM`, `GRU` (all with `forward_with_state`); `GRU(..., reset_after=True)` is PyTorch's `nn.GRU` form -- it loads its weights exactly ([tests/check_gru_vs_pytorch.py](tests/check_gru_vs_pytorch.py)) and needs one hidden product a step instead of two |
 | **NLP** | `Embedding`, `LayerNorm`, `PositionalEncoding`, `MultiHeadAttention` (causal + RoPE), `TransformerBlock`, `GPT` |
 
 Initialisation matches PyTorch's defaults: `Linear`, `Conv2D` and
@@ -297,8 +297,8 @@ attention kernel) 19.6-20.6 ms. Attention projects Q, K and V in one gemm. Small
 with cuDNN, PyTorch 5.0 ms. Recurrent layers run fused on the GPU (one gemm
 and one gate kernel per step, backward through time on the device); a training
 step over 64 x 32 x 128 -> 256 ([tests/bench_gpu_lstm.py](tests/bench_gpu_lstm.py)):
-LSTM 5.2 ms, GRU 5.5 ms, RNN 2.6 ms against PyTorch's cuDNN 5.0, 4.7 and
-3.2 ms. The GPU suite is
+LSTM 5.2 ms, GRU 5.8 ms (5.0 with `reset_after=True`), RNN 2.6 ms against
+PyTorch's cuDNN 5.0, 4.0-4.7 and 3.2 ms. The GPU suite is
 [tests/test_cuda.cpp](tests/test_cuda.cpp) and
 [tests/test_cuda.py](tests/test_cuda.py): every op and layer against the CPU,
 forward and gradient; CI has no GPU, so there they build and skip.

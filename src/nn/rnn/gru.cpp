@@ -5,8 +5,8 @@
 
 using namespace std;
 
-GRU::GRU(int input_size, int hidden_size)
-    : input_size(input_size), hidden_size(hidden_size) {
+GRU::GRU(int input_size, int hidden_size, bool reset_after)
+    : input_size(input_size), hidden_size(hidden_size), reset_after(reset_after) {
 
     W_xr = rnn_kernel::init_param({input_size, hidden_size}, hidden_size); W_xr->set_requires_grad(true);
     W_xz = rnn_kernel::init_param({input_size, hidden_size}, hidden_size); W_xz->set_requires_grad(true);
@@ -19,12 +19,18 @@ GRU::GRU(int input_size, int hidden_size)
     b_r = rnn_kernel::init_param({hidden_size}, hidden_size); b_r->set_requires_grad(true);
     b_z = rnn_kernel::init_param({hidden_size}, hidden_size); b_z->set_requires_grad(true);
     b_n = rnn_kernel::init_param({hidden_size}, hidden_size); b_n->set_requires_grad(true);
+    if (reset_after) {
+        b_hn = rnn_kernel::init_param({hidden_size}, hidden_size); b_hn->set_requires_grad(true);
+    }
 }
 
 // The whole sequence in one fused kernel; see fused_rnn.hpp.
 pair<TensorPtr, TensorPtr> GRU::forward(TensorPtr input, TensorPtr h0) {
-    auto r = rnn_kernel::run(rnn_kernel::Cell::GRU, input, h0, nullptr, hidden_size,
-                             {W_xr, W_xz, W_xn}, {W_hr, W_hz, W_hn}, {b_r, b_z, b_n});
+    auto r = reset_after
+        ? rnn_kernel::run(rnn_kernel::Cell::GRU_AFTER, input, h0, nullptr, hidden_size,
+                          {W_xr, W_xz, W_xn}, {W_hr, W_hz, W_hn}, {b_r, b_z, b_n, b_hn})
+        : rnn_kernel::run(rnn_kernel::Cell::GRU, input, h0, nullptr, hidden_size,
+                          {W_xr, W_xz, W_xn}, {W_hr, W_hz, W_hn}, {b_r, b_z, b_n});
     return {r.output, r.h_n};
 }
 
@@ -33,7 +39,9 @@ TensorPtr GRU::forward(TensorPtr input) {
 }
 
 vector<TensorPtr> GRU::parameters() {
-    return {W_xr, W_xz, W_xn,
-            W_hr, W_hz, W_hn,
-            b_r, b_z, b_n};
+    vector<TensorPtr> p = {W_xr, W_xz, W_xn,
+                           W_hr, W_hz, W_hn,
+                           b_r, b_z, b_n};
+    if (reset_after) p.push_back(b_hn);
+    return p;
 }

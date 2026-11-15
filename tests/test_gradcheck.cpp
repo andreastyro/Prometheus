@@ -268,6 +268,12 @@ int main() {
         vector<TensorPtr> ui = gru.parameters();
         ui.push_back(xu);
         check("GRU", [&]{ return gru.forward(xu); }, ui, smooth_opts());
+
+        GRU gra(3, 4, /*reset_after=*/true);
+        auto xa = tin({5, 1, 3});
+        vector<TensorPtr> ai = gra.parameters();
+        ai.push_back(xa);
+        check("GRU reset_after", [&]{ return gra.forward(xa); }, ai, smooth_opts());
     }
 
     printf("\n=== vision layers ===\n");
@@ -440,6 +446,17 @@ int main() {
         vector<TensorPtr> ui2 = gru2.parameters();
         ui2.push_back(xu2);
         check("GRU seq 10 batch 3", [&]{ return gru2.forward(xu2); }, ui2, deep);
+
+        // reset_after with an initial state: h0's gradient and the final state's
+        GRU gra2(4, 6, true);
+        auto xa2 = tin({10, 3, 4}), ha2 = tin({3, 6});
+        vector<TensorPtr> ai2 = gra2.parameters();
+        ai2.push_back(xa2);
+        ai2.push_back(ha2);
+        check("GRU reset_after seq 10 batch 3, h0", [&]{
+            auto [o, hn] = gra2.forward(xa2, ha2);
+            return add(sum(o, -1), sum(multiply(hn, hn), -1));
+        }, ai2, deep);
 
         // Conv2D with a real batch, several channels, stride and padding
         Conv2D cv2(3, 4, 3, 2, 1);

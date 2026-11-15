@@ -19,6 +19,8 @@ ap.add_argument("--batch", type=int, default=32)
 ap.add_argument("--input", type=int, default=128)
 ap.add_argument("--hidden", type=int, default=256)
 ap.add_argument("--steps", type=int, default=20)
+ap.add_argument("--reset-after", action="store_true",
+                help="GRU in PyTorch's form (reset_after=True); PyTorch's GRU always is")
 args = ap.parse_args()
 
 import numpy as np
@@ -31,7 +33,8 @@ y_np = rng.uniform(-1, 1, (S, B, H)).astype(np.float32)
 if args.lib == "prometheus":
     import prometheus as p
     p.Tensor.manual_seed(0)
-    model = {"lstm": p.LSTM, "gru": p.GRU, "rnn": p.RNN}[args.cell](I, H)
+    model = (p.GRU(I, H, reset_after=True) if args.cell == "gru" and args.reset_after
+             else {"lstm": p.LSTM, "gru": p.GRU, "rnn": p.RNN}[args.cell](I, H))
     x = p.Tensor([S, B, I], [float(v) for v in x_np.reshape(-1)])
     y = p.Tensor([S, B, H], [float(v) for v in y_np.reshape(-1)])
     if args.device == "cuda":
@@ -84,4 +87,5 @@ for _ in range(args.steps):
     times.append(time.perf_counter() - t0)
 med = sorted(times)[len(times) // 2]
 print("%-10s %-4s %s seq %d x batch %d, %d -> %d: median %.1f ms/step, best %.1f ms (loss %.4f)"
-      % (args.lib, args.device, args.cell.upper(), S, B, I, H, med * 1e3, min(times) * 1e3, float(loss.item())))
+      % (args.lib, args.device, args.cell.upper() + (" reset_after" if args.reset_after else ""), S, B, I, H,
+         med * 1e3, min(times) * 1e3, float(loss.item())))

@@ -2872,6 +2872,37 @@ extern "C" __global__ void r_gru_back2(const float* g, const float* h_prev, cons
     da[(long long)b * 3 * H + j] = drh[i] * h_prev[i] * r * (1.0f - r);
     dhp[i] += drh[i] * r;
 }
+// GRU, PyTorch's form: hh = h W_h for all three gates (no bias), a = the
+// input projection plus (b_r, b_z, b_n); a becomes the gates, hn is kept
+extern "C" __global__ void r_gruA_fwd(float* a, const float* hh, const float* bhn, const float* h_prev,
+                                      float* hn_out, float* h, int B, int H) {
+    int i = (int)gid(); if (i >= B * H) return;
+    const int b = i / H, j = i % H;
+    float* ar = a + (long long)b * 3 * H;
+    const float* hr = hh + (long long)b * 3 * H;
+    const float r = sg(ar[j] + hr[j]), z = sg(ar[H + j] + hr[H + j]);
+    const float hn = hr[2 * H + j] + bhn[j];
+    const float n = th(ar[2 * H + j] + r * hn);
+    ar[j] = r; ar[H + j] = z; ar[2 * H + j] = n;
+    hn_out[i] = hn;
+    h[i] = (1.0f - z) * n + z * h_prev[i];
+}
+// its backward: da (input side) and dhh (hidden side, n part dn * r); dh
+// becomes d * z, to which the caller adds dhh @ W_h^T
+extern "C" __global__ void r_gruA_back(const float* g, const float* h_prev, const float* hn, const float* dout,
+                                       float* dh, float* da, float* dhh, int B, int H) {
+    int i = (int)gid(); if (i >= B * H) return;
+    const int b = i / H, j = i % H;
+    const long long o = (long long)b * 3 * H;
+    const float r = g[o + j], z = g[o + H + j], n = g[o + 2 * H + j];
+    const float d = dh[i] + dout[i];
+    const float dn = d * (1.0f - z) * (1.0f - n * n);
+    const float dzp = d * (h_prev[i] - n) * z * (1.0f - z);
+    const float drp = dn * hn[i] * r * (1.0f - r);
+    da[o + j] = drp; da[o + H + j] = dzp; da[o + 2 * H + j] = dn;
+    dhh[o + j] = drp; dhh[o + H + j] = dzp; dhh[o + 2 * H + j] = dn * r;
+    dh[i] = d * z;
+}
 )");
     return s;
 }
@@ -2903,20 +2934,21 @@ namespace cuda_ops {
 TensorPtr rnn(int cell, const TensorPtr& input0, const TensorPtr& h00, const TensorPtr& c00, int H,
               const vector<TensorPtr>& Wx0, const vector<TensorPtr>& Wh0, const vector<TensorPtr>& b0,
               Reference reference) {
-    const bool lstm = cell == 1, gru = cell == 2;
+    const bool lstm = cell == 1, gru = cell == 2, after = cell == 3;
     auto X = contiguous_on_device(f32(input0, "RNN"));
     const int S = (int)X->size(0), B = (int)X->size(1), I = (int)X->size(2);
     const int G = (int)Wx0.size(), GH = G * H, BH = B * H;
     const long long SB = (long long)S * B;
     TensorPtr h0 = h00 ? contiguous_on_device(f32(h00, "RNN")) : nullptr;
     TensorPtr c0 = (lstm && c00) ? contiguous_on_device(f32(c00, "RNN")) : nullptr;
-    TensorPtr Wxp, Whp, WhpT, bp;
+    TensorPtr Wxp, Whp, WhpT, bp, bhn;
     {
         NoGrad off;
         vector<TensorPtr> wx, wh, bb;
         for (auto& w : Wx0) wx.push_back(f32(w, "RNN"));
         for (auto& w : Wh0) wh.push_back(f32(w, "RNN"));
-        for (auto& w : b0) bb.push_back(f32(w, "RNN"));
+        for (size_t k = 0; k < (after ? 3 : b0.size()); k++) bb.push_back(f32(b0[k], "RNN"));
+        if (after) bhn = contiguous_on_device(f32(b0[3], "RNN"));
         Wxp = contiguous(concat_op(wx, 1));                    // [I, GH]
         Whp = contiguous(concat_op(wh, 1));                    // [H, GH]
         // the backward's products with W_h^T as plain NN gemms against a copy
@@ -2944,6 +2976,9 @@ TensorPtr rnn(int cell, const TensorPtr& input0, const TensorPtr& h00, const Ten
     auto packed = empty_cuda({SB * H + (lstm ? BH : 0)});
     auto cs = lstm ? empty_cuda({SB, (long long)H}) : nullptr;
     auto rh = gru ? empty_cuda({SB, (long long)H}) : nullptr;
+    // reset-after GRU: hn = h W_hn + b_hn per step, and a step's h W_h
+    auto HN = after ? empty_cuda({SB, (long long)H}) : nullptr;
+    auto hh = after ? empty_cuda({(long long)B, (long long)GH}) : nullptr;
     float* OUT = mf(packed);
     int b_ = B, h_ = H, bh = BH;
 
@@ -2962,6 +2997,14 @@ TensorPtr rnn(int cell, const TensorPtr& input0, const TensorPtr& h00, const Ten
             float* ct = mf(cs) + (size_t)t * BH;
             void* a[] = {&at, &cp, &ct, &ht, &b_, &h_};
             cuda::launch(RK("r_lstm_fwd"), BH, a);
+        } else if (after) {
+            // one product for all three gates
+            float* phh = mf(hh);
+            cuda::sgemm(false, false, B, GH, H, 1.0f, hp, H, cf(Whp), GH, 0.0f, phh, GH);
+            const float* pbn = cf(bhn);
+            float* hnt = mf(HN) + (size_t)t * BH;
+            void* a[] = {&at, &phh, &pbn, &hp, &hnt, &ht, &b_, &h_};
+            cuda::launch(RK("r_gruA_fwd"), BH, a);
         } else {
             cuda::sgemm(false, false, B, 2 * H, H, 1.0f, hp, H, cf(Whp), GH, 1.0f, at, GH);
             float* rt = mf(rh) + (size_t)t * BH;
@@ -2979,7 +3022,7 @@ TensorPtr rnn(int cell, const TensorPtr& input0, const TensorPtr& h00, const Ten
     if (lstm && c00) inputs.push_back(c00);
     for (auto* group : {&Wx0, &Wh0, &b0}) for (auto& w : *group) inputs.push_back(w);
 
-    attach_fused(packed, inputs, gru ? "GRU" : lstm ? "LSTM" : "RNN", reference,
+    attach_fused(packed, inputs, (gru || after) ? "GRU" : lstm ? "LSTM" : "RNN", reference,
                  [=](const TensorPtr& G0) -> vector<TensorPtr> {
         auto Gd = contiguous_on_device(f32(G0, "RNN"));
         const float* dOUT = cf(Gd);
@@ -2991,6 +3034,7 @@ TensorPtr rnn(int cell, const TensorPtr& input0, const TensorPtr& h00, const Ten
         auto dc = lstm ? empty_cuda({(long long)BH}) : nullptr;
         auto dhp = gru ? empty_cuda({(long long)BH}) : nullptr;
         auto drh = gru ? empty_cuda({(long long)BH}) : nullptr;
+        auto dHH = after ? empty_cuda({SB, (long long)GH}) : nullptr;
         if (lstm) cuda::copy_device(mf(dc), dOUT + SB * H, (size_t)BH * sizeof(float));
         int b2 = B, h2 = H, bh2 = BH;
 
@@ -3012,6 +3056,13 @@ TensorPtr rnn(int cell, const TensorPtr& input0, const TensorPtr& h00, const Ten
                 void* a[] = {&gt, &ct, &cp, &dout, &pdh, &pdc, &da, &b2, &h2};
                 cuda::launch(RK("r_lstm_back"), BH, a);
                 cuda::sgemm(false, false, B, H, GH, 1.0f, da, GH, cf(WhpT), H, 0.0f, pdh, H);
+            } else if (after) {
+                const float* hnt = cf(HN) + (size_t)t * BH;
+                float* dq = mf(dHH) + (size_t)t * B * GH;
+                void* a[] = {&gt, &hp, &hnt, &dout, &pdh, &da, &dq, &b2, &h2};
+                cuda::launch(RK("r_gruA_back"), BH, a);
+                // dh = d * z + dhh @ W_h^T, one product
+                cuda::sgemm(false, false, B, H, GH, 1.0f, dq, GH, cf(WhpT), H, 1.0f, pdh, H);
             } else {
                 float* pp = mf(dhp);
                 float* pr = mf(drh);
@@ -3045,7 +3096,9 @@ TensorPtr rnn(int cell, const TensorPtr& input0, const TensorPtr& h00, const Ten
         cuda::copy_device(mf(Hprev), hi, (size_t)BH * sizeof(float));
         if (S > 1) cuda::copy_device(mf(Hprev) + BH, OUTd, (size_t)(S - 1) * BH * sizeof(float));
         auto dWh = empty_cuda({(long long)H, (long long)GH});
-        if (!gru) {
+        if (after) {
+            cuda::sgemm(true, false, H, GH, (int)SB, 1.0f, cf(Hprev), H, cf(dHH), GH, 0.0f, mf(dWh), GH);
+        } else if (!gru) {
             cuda::sgemm(true, false, H, GH, (int)SB, 1.0f, cf(Hprev), H, cf(dA), GH, 0.0f, mf(dWh), GH);
         } else {
             cuda::sgemm(true, false, H, 2 * H, (int)SB, 1.0f, cf(Hprev), H, cf(dA), GH, 0.0f, mf(dWh), GH);
@@ -3054,6 +3107,10 @@ TensorPtr rnn(int cell, const TensorPtr& input0, const TensorPtr& h00, const Ten
         for (auto& d : split_cols(dWh, H, H, G)) out.push_back(d);
         auto db = ::sum(dA, 0);                                                // [GH]
         for (auto& d : split_cols(db, 1, H, G)) out.push_back(reshape(d, {(long long)H}));
+        if (after) {                                                           // b_hn: dhh's n part
+            auto dbh = ::sum(dHH, 0);
+            out.push_back(reshape(split_cols(dbh, 1, H, G)[2], {(long long)H}));
+        }
         return out;
     });
     return packed;

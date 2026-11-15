@@ -310,7 +310,8 @@ def test_layers():
             layer_check("attention c=%d r=%d" % (causal, rope),
                         lambda ts, m=mha: m.forward(ts[0]), [X(2, 5, 8)] + mha.parameters())
 
-    for name, layer in (("RNN", p.RNN(5, 6)), ("LSTM", p.LSTM(5, 6)), ("GRU", p.GRU(5, 6))):
+    for name, layer in (("RNN", p.RNN(5, 6)), ("LSTM", p.LSTM(5, 6)), ("GRU", p.GRU(5, 6)),
+                        ("GRU reset_after", p.GRU(5, 6, reset_after=True))):
         layer_check(name, lambda ts, L=layer: L.forward(ts[0]), [X(4, 3, 5)] + layer.parameters())
 
     fl, pe = p.Flatten(), p.PositionalEncoding(10, 6)

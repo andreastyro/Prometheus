@@ -362,6 +362,24 @@ def test_lstm_gru():
     check("GRU output sequence",
           arr(gru.forward(tensor([5, 1, 3], x_np))), np.stack(ref), atol=1e-4)
 
+    # reset_after: PyTorch's nn.GRU form, n = tanh(x@Wxn + bn + r*(h@Whn + bhn)),
+    # batch 2 with an initial state
+    gru = p.GRU(3, 4, reset_after=True)
+    Wxr, Wxz, Wxn, Whr, Whz, Whn, br, bz, bn, bhn = (arr(t) for t in gru.parameters())
+    x2 = spread(5 * 2 * 3).reshape(5, 2, 3)
+    h0 = 0.3 * spread(2 * 4).reshape(2, 4)
+    h = h0.copy(); ref = []
+    for t in range(5):
+        xt = x2[t]
+        r = sig(xt @ Wxr + h @ Whr + br)
+        z = sig(xt @ Wxz + h @ Whz + bz)
+        n = np.tanh(xt @ Wxn + bn + r * (h @ Whn + bhn))
+        h = (1 - z) * n + z * h
+        ref.append(h.copy())
+    out, hn = gru.forward_with_state(tensor([5, 2, 3], x2), tensor([2, 4], h0))
+    check("GRU reset_after output sequence", arr(out), np.stack(ref), atol=1e-4)
+    check("GRU reset_after final state", arr(hn), ref[-1], atol=1e-4)
+
 
 def test_optimizers():
     print("\n=== optimizer update rules ===\n")
