@@ -16,6 +16,9 @@ set(SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/dtype_ops.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/cuda_runtime.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/cuda_ops.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/cuda_nn.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/cuda_vision.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/cuda_rnn.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/loss.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/matmul_backend.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/blas_loader.cpp

@@ -125,6 +125,10 @@ TensorPtr cross_entropy(const TensorPtr& logits, const std::vector<int>& targets
 /// The same with the targets as an int64 / int32 tensor (on either device) --
 /// on the GPU they are never read back; an out-of-range target's loss is NaN
 TensorPtr cross_entropy_targets(const TensorPtr& logits, const TensorPtr& targets);
+/// mean((pred - target)^2) for same-shape tensors, one kernel each way;
+/// `reference` is the op form, for recorded gradients
+TensorPtr mse(const TensorPtr& pred, const TensorPtr& target,
+              std::function<TensorPtr(const std::vector<TensorPtr>&)> reference);
 /// LayerNorm forward over the last dim, one fused kernel (no graph)
 TensorPtr layernorm(const TensorPtr& x, const TensorPtr& gamma, const TensorPtr& beta, float eps);
 /// float32 mask of `shape`: 0 with probability `rate`, else 1/(1-rate). Philox, keyed by `seed`.
@@ -155,7 +159,11 @@ void scale_inplace(float* a, int64_t n, float c);
 /// g /= scale in place, zeroing non-finite entries; false if there were any
 bool unscale_inplace(float* g, int64_t n, float inv);
 // fused backward kernels (used when the gradient is not itself recorded)
-std::vector<TensorPtr> layernorm_backward(const TensorPtr& x, const TensorPtr& gamma, const TensorPtr& G, float eps);
+/// add_to: x's gradient buffer when it already holds a gradient (another
+/// branch, e.g. the residual stream) -- dx is added into it in the same
+/// kernel and returned as null, so no separate add runs
+std::vector<TensorPtr> layernorm_backward(const TensorPtr& x, const TensorPtr& gamma, const TensorPtr& G, float eps,
+                                          const TensorPtr& add_to = nullptr);
 TensorPtr gelu_backward(const TensorPtr& x, const TensorPtr& G);
 /// rows of W picked by ids, as `out_shape`; backward is a scatter-add kernel
 TensorPtr embedding(const TensorPtr& W, const std::vector<int64_t>& ids, const Shape& out_shape);

@@ -1578,6 +1578,10 @@ std::vector<TensorPtr> grad(TensorPtr output, std::vector<TensorPtr> inputs,
     g[output.get()] = grad_output;
     const bool previous = grad_enabled();
     grad_enabled() = create_graph;
+    // gradients are collected in `g` here, not in .grad buffers: no backward
+    // may write into an input's buffer
+    const bool previous_into = backward_into_grads();
+    backward_into_grads() = false;
     try {
         for (auto it = order.rbegin(); it != order.rend(); ++it) {
             const TensorPtr& t = *it;
@@ -1599,9 +1603,11 @@ std::vector<TensorPtr> grad(TensorPtr output, std::vector<TensorPtr> inputs,
         }
     } catch (...) {
         grad_enabled() = previous;
+        backward_into_grads() = previous_into;
         throw;
     }
     grad_enabled() = previous;
+    backward_into_grads() = previous_into;
 
     // an input the output does not depend on gets zeros
     vector<TensorPtr> result;

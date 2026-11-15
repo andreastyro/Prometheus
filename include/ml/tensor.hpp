@@ -321,6 +321,12 @@ std::mt19937& prometheus_rng();
 /// Global switch for building the graph; see NoGrad.
 bool& grad_enabled();
 
+/// True while Tensor::backward() runs: gradients land in the tensors' .grad
+/// buffers, so a fused backward may add straight into an input's buffer.
+/// autograd::grad() collects them in a map of its own instead -- there it is
+/// false and every backward returns its parts.
+bool& backward_into_grads();
+
 /// Scope that turns graph-building off, like torch.no_grad(). Ops still
 /// compute their results but attach no backward node, so inference holds no
 /// activations for a backward pass that will never run.

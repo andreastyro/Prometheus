@@ -10,6 +10,14 @@
 using namespace std;
 
 TensorPtr mse_loss(TensorPtr pred, TensorPtr target){
+    // same-shape float GPU tensors: one kernel each way (the op form below,
+    // ~10 kernels, serves broadcasting and recorded gradients)
+    if (pred->device() == Device::CUDA && target->device() == Device::CUDA && pred->shape() == target->shape() &&
+        is_floating(pred->dtype()) && is_floating(target->dtype()) &&
+        pred->dtype() != DType::Float64 && target->dtype() != DType::Float64)
+        return cuda_ops::mse(pred, target, [](const std::vector<TensorPtr>& in) -> TensorPtr {
+            return mean(pow_op(subtract(in[0], in[1]), 2.0f), -1);
+        });
     auto diff = subtract(pred, target);
     auto sq = pow_op(diff, 2.0f);
     return mean(sq, -1);

@@ -47,7 +47,11 @@ TensorPtr LayerNorm::forward(TensorPtr input) {
             const float e = eps;
             node->backward_graph = [reference, x, g, b, e](const TensorPtr& out, const TensorPtr& G) -> std::vector<TensorPtr> {
                 if (grad_enabled()) return reference(out, G);
-                auto r = cuda_ops::layernorm_backward(x, g, G, e);
+                // x's gradient buffer, when another branch (the residual stream)
+                // already gave it one: the kernel adds into it directly
+                auto r = cuda_ops::layernorm_backward(x, g, G, e,
+                                                      backward_into_grads() && x->requires_grad() && x->has_grad()
+                                                          ? x->grad_tensor() : nullptr);
                 return {x->requires_grad() ? r[0] : nullptr, g->requires_grad() ? r[1] : nullptr,
                         b->requires_grad() ? r[2] : nullptr};
             };

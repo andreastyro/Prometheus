@@ -613,6 +613,11 @@ bool& grad_enabled() {
     return enabled;
 }
 
+bool& backward_into_grads() {
+    static bool on = false;
+    return on;
+}
+
 void Tensor::manual_seed(unsigned int seed) { global_rng().seed(seed); }
 
 TensorPtr Tensor::zeros(ShapeArg shape, DType dtype) {
@@ -749,6 +754,13 @@ static void dfs(TensorPtr node, vector<TensorPtr>& order, unordered_set<TensorPt
 }
 
 void Tensor::backward() {
+    // gradients go to the .grad buffers for the length of this pass (see
+    // backward_into_grads); restored however it ends
+    struct IntoGrads {
+        bool previous = backward_into_grads();
+        IntoGrads() { backward_into_grads() = true; }
+        ~IntoGrads() { backward_into_grads() = previous; }
+    } into_grads;
     if (!grad_fn_)
         throw runtime_error(
             "backward() called on a tensor with no computation graph. It is "

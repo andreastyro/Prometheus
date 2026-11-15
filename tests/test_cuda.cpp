@@ -203,6 +203,34 @@ int main() {
                max_diff(scatter_add_flat(G(vals), idx, Shape{15}), scatter_add_flat(vals, idx, Shape{15})), 0.0f, 1e-6f);
     CHECK_TRUE("concat axis 0", max_diff(concat_op({xg, yg}, 0), concat_op({x, y}, 0)) == 0.0f);
     CHECK_TRUE("concat axis 1", max_diff(concat_op({xg, yg, xg}, 1), concat_op({x, y, x}, 1)) == 0.0f);
+    {
+        // one launch for up to 8 inputs: uneven widths on a middle axis, int64
+        // (byte copies), 9 inputs (the per-input fallback), and the gradient
+        // with a middle input that wants none
+        auto c1 = random_tensor({2, 3, 4}, 101), c2 = random_tensor({2, 5, 4}, 102), c3 = random_tensor({2, 1, 4}, 103);
+        CHECK_TRUE("concat, uneven widths on a middle axis",
+                   max_diff(concat_op({G(c1), G(c2), G(c3)}, 1), concat_op({c1, c2, c3}, 1)) == 0.0f);
+        auto i1 = c1->to(DType::Int64), i2 = c2->to(DType::Int64);
+        CHECK_TRUE("concat, int64",
+                   max_diff(concat_op({G(i1), G(i2)}, 1)->to(DType::Float32), concat_op({i1, i2}, 1)->to(DType::Float32)) == 0.0f);
+        std::vector<TensorPtr> nine_c, nine_g;
+        for (int k = 0; k < 9; k++) { auto t = random_tensor({3, k + 1}, 110 + k); nine_c.push_back(t); nine_g.push_back(G(t)); }
+        CHECK_TRUE("concat, 9 inputs", max_diff(concat_op(nine_g, 1), concat_op(nine_c, 1)) == 0.0f);
+        auto a = G(c1), b = G(c2), cc = G(c3);
+        a->set_requires_grad(true);
+        cc->set_requires_grad(true);
+        auto w = G(random_tensor({2, 9, 4}, 104));
+        sum(multiply(concat_op({a, b, cc}, 1), w), -1)->backward();
+        const auto wv = w->to_vector();
+        const auto ga = a->grad_doubles(), gc = cc->grad_doubles();
+        bool ok = !b->has_grad() && ga.size() == 24 && gc.size() == 8;
+        for (int o = 0; o < 2 && ok; o++)
+            for (int j = 0; j < 4; j++) {
+                ok = ok && ga[(size_t)(o * 12 + j)] == wv[(size_t)(o * 36 + j)];            // a: rows 0..2
+                ok = ok && gc[(size_t)(o * 4 + j)] == wv[(size_t)(o * 36 + 8 * 4 + j)];     // c: row 8
+            }
+        CHECK_TRUE("concat gradient, one launch: each part's slab, none for a part without grad", ok);
+    }
 
     // ── matmul on cuBLAS: summation order differs from the CPU, so relative ──
     auto rel = [&](const TensorPtr& gpu, const TensorPtr& cpu) {
@@ -287,6 +315,31 @@ int main() {
             auto xw = random_tensor({3, 5, w}, 80 + w);
             layer_check(("LayerNorm width " + std::to_string(w)).c_str(),
                         [w] { return std::make_shared<LayerNorm>(w); }, xw, 1e-5f);
+        }
+        // x feeding LayerNorm and a second branch (the residual stream): the
+        // backward adds into x's existing gradient in place
+        for (int w : {256, 1100}) {
+            auto xr = random_tensor({4, w}, 95 + w);
+            auto res = [w](const TensorPtr& x, LayerNorm& ln) {
+                auto y = add(multiply(3.0f, x), ln.forward(x));
+                return sum(multiply(y, y), -1);
+            };
+            Tensor::manual_seed(7);
+            LayerNorm lc(w);
+            Tensor::manual_seed(7);
+            LayerNorm lgpu(w);
+            lgpu.to(Device::CUDA);
+            auto a = xr->detach(), b = G(xr);
+            a->set_requires_grad(true);
+            b->set_requires_grad(true);
+            res(a, lc)->backward();
+            res(b, lgpu)->backward();
+            CHECK_NEAR(("LayerNorm + a second branch, width " + std::to_string(w) + ": dx").c_str(),
+                       rel(b->grad_tensor(), a->grad_tensor()), 0.0f, 1e-5f);
+            CHECK_NEAR(("LayerNorm + a second branch, width " + std::to_string(w) + ": dgamma").c_str(),
+                       rel(lgpu.gamma->grad_tensor(), lc.gamma->grad_tensor()), 0.0f, 1e-5f);
+            CHECK_NEAR(("LayerNorm + a second branch, width " + std::to_string(w) + ": dbeta").c_str(),
+                       rel(lgpu.beta->grad_tensor(), lc.beta->grad_tensor()), 0.0f, 1e-5f);
         }
         layer_check("Linear", [] { return std::make_shared<Linear>(16, 8); }, x3, 1e-5f);
         layer_check("MultiHeadAttention", [] { return std::make_shared<MultiHeadAttention>(16, 4); }, x3, 1e-5f);
@@ -505,6 +558,28 @@ int main() {
         loss_pair("l2_regularization", [](TensorPtr a, TensorPtr, TensorPtr) { return l2_regularization({a}, 0.1f); });
         loss_pair("mse_loss", [](TensorPtr a, TensorPtr b, TensorPtr) { return mse_loss(a, b); });
         loss_pair("bce_loss", [](TensorPtr a, TensorPtr b, TensorPtr) { return bce_loss(sigmoid(a), divide(b, 2.5f)); });
+        {
+            // the fused MSE: both inputs' gradients, past one grid of blocks
+            // (300k elements), and its second derivative through the op form
+            auto pc = random_tensor({300, 1000}, 91), tc = random_tensor({300, 1000}, 92);
+            auto a = pc->detach(), b = tc->detach(), ag = G(pc), bg = G(tc);
+            for (auto& t : {a, b, ag, bg}) t->set_requires_grad(true);
+            auto lc = mse_loss(a, b), lg2 = mse_loss(ag, bg);
+            CHECK_NEAR("mse_loss, 300k elements: value", (float)(std::fabs(lg2->item_double() - lc->item_double()) /
+                                                                 lc->item_double()), 0.0f, 1e-5f);
+            lc->backward();
+            lg2->backward();
+            CHECK_NEAR("mse_loss: gradient of the prediction", rel(ag->grad_tensor(), a->grad_tensor()), 0.0f, 1e-5f);
+            CHECK_NEAR("mse_loss: gradient of the target", rel(bg->grad_tensor(), b->grad_tensor()), 0.0f, 1e-5f);
+            auto x = G(random_tensor({7, 9}, 93)), y = G(random_tensor({7, 9}, 94));
+            x->set_requires_grad(true);
+            auto g1 = autograd::grad(mse_loss(x, y), {x}, true)[0];
+            auto g2 = autograd::grad(sum(multiply(g1, x), -1), {x})[0];     // d/dx sum(g1 * x) = g1 + (2/n) x
+            const auto h = g2->to_vector(), gv = g1->to_vector(), xv = x->to_vector();
+            double m = 0;
+            for (size_t j = 0; j < h.size(); j++) m = std::max(m, std::fabs(h[j] - (gv[j] + 2.0 / 63.0 * xv[j])));
+            CHECK_NEAR("mse_loss: second derivative on the GPU", (float)m, 0.0f, 1e-5f);
+        }
 
         PositionalEncoding pe(16, 6);
         CHECK_NEAR("PositionalEncoding", rel(pe.forward(G(pe_in)), pe.forward(pe_in)), 0.0f, 1e-6f);
