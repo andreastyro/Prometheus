@@ -130,7 +130,18 @@ TensorPtr cross_entropy_targets(const TensorPtr& logits, const TensorPtr& target
 TensorPtr mse(const TensorPtr& pred, const TensorPtr& target,
               std::function<TensorPtr(const std::vector<TensorPtr>&)> reference);
 /// LayerNorm forward over the last dim, one fused kernel (no graph)
-TensorPtr layernorm(const TensorPtr& x, const TensorPtr& gamma, const TensorPtr& beta, float eps);
+/// out_dtype: float32, or a half dtype when the result only feeds a gemm under autocast
+/// p.fuse: `fwd` (CUDA statements over x0..x{k-1} defining `out`) as one
+/// kernel over the inputs' broadcast shape; `bwd` (statements defining d{j},
+/// the gradient of input j, for every j with mask[j], from the same and the
+/// upstream g) as one backward kernel
+/// higher: when the gradient is itself recorded, (inputs, G) -> each input's
+/// gradient as differentiable ops (p.fuse builds them as fused ops in turn)
+using FusedHigher = std::function<std::vector<TensorPtr>(const std::vector<TensorPtr>&, const TensorPtr&)>;
+TensorPtr fused_map(const std::string& fwd, const std::string& bwd, const std::vector<int>& mask,
+                    const std::vector<TensorPtr>& inputs, FusedHigher higher = nullptr);
+TensorPtr layernorm(const TensorPtr& x, const TensorPtr& gamma, const TensorPtr& beta, float eps,
+                    DType out_dtype = DType::Float32);
 /// float32 mask of `shape`: 0 with probability `rate`, else 1/(1-rate). Philox, keyed by `seed`.
 TensorPtr dropout_mask(const Shape& shape, uint64_t seed, float rate);
 // optimizer updates on device buffers; v may be null for plain SGD

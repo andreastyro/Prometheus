@@ -90,6 +90,16 @@ struct Driver {
     CUresult (*cuGraphDestroy)(void*);
     CUresult (*cuMemHostAlloc)(void**, size_t, unsigned);
     CUresult (*cuMemFreeHost)(void*);
+    // optional: events across streams (data loading on a second stream)
+    CUresult (*cuStreamWaitEvent)(CUstream, void*, unsigned);
+    CUresult (*cuEventQuery)(void*);
+    // optional: the driver's stream-ordered allocator (CUDA 11.2+)
+    CUresult (*cuMemAllocAsync)(CUdeviceptr*, size_t, CUstream);
+    CUresult (*cuMemFreeAsync)(CUdeviceptr, CUstream);
+    CUresult (*cuDeviceGetDefaultMemPool)(void**, CUdevice);
+    CUresult (*cuMemPoolSetAttribute)(void*, int, void*);
+    CUresult (*cuMemPoolGetAttribute)(void*, int, void*);
+    CUresult (*cuMemPoolTrimTo)(void*, size_t);
     // optional: occupancy, for kernels that keep every block resident
     CUresult (*cuOccupancyMaxActiveBlocksPerMultiprocessor)(int*, CUfunction, int, size_t);
 };
@@ -152,7 +162,12 @@ unordered_map<KernelKey, CUfunction, KernelKeyHash> g_kernels;
 // one module per source text: a source holding many kernels is compiled once
 unordered_map<const char*, CUmodule> g_modules;
 mutex                         g_kernel_mu;
-map<size_t, vector<CUdeviceptr>> g_pool;   // idle blocks by size
+map<size_t, vector<CUdeviceptr>> g_pool;   // idle blocks by size (classes: see bucket)
+unordered_map<CUdeviceptr, size_t> g_live;  // blocks handed out, by their real size
+// PROMETHEUS_ALLOCATOR=async: the driver's stream-ordered pool
+// (cuMemAllocAsync) instead of this cache; graph captures keep their own
+void*                         g_async_pool = nullptr;
+int                           g_async = -1;               // -1: not decided yet
 size_t                        g_pool_bytes = 0;
 size_t                        g_in_use = 0, g_peak = 0;   // bytes handed to tensors
 int                           g_device_index = -1;        // -1: not chosen yet
@@ -258,6 +273,14 @@ void init_locked() {
     bind(lib, d.cuMemHostAlloc, "cuMemHostAlloc");
     bind(lib, d.cuMemFreeHost, "cuMemFreeHost");
     bind(lib, d.cuOccupancyMaxActiveBlocksPerMultiprocessor, "cuOccupancyMaxActiveBlocksPerMultiprocessor");
+    bind(lib, d.cuStreamWaitEvent, "cuStreamWaitEvent");
+    bind(lib, d.cuEventQuery, "cuEventQuery");
+    bind(lib, d.cuMemAllocAsync, "cuMemAllocAsync");
+    bind(lib, d.cuMemFreeAsync, "cuMemFreeAsync");
+    bind(lib, d.cuDeviceGetDefaultMemPool, "cuDeviceGetDefaultMemPool");
+    bind(lib, d.cuMemPoolSetAttribute, "cuMemPoolSetAttribute");
+    bind(lib, d.cuMemPoolGetAttribute, "cuMemPoolGetAttribute");
+    bind(lib, d.cuMemPoolTrimTo, "cuMemPoolTrimTo");
     CUresult r = d.cuInit(0);
     if (r != 0) { g.why = "cuInit failed: " + err(r); return; }
     int count = 0;
@@ -535,7 +558,33 @@ CUfunction function(const Kernel& k) {
 }
 
 // requests round up to 512 bytes so near-equal sizes share blocks
-size_t bucket(size_t n) { return (n + 511) & ~size_t(511); }
+// Size classes: 512-byte steps up to 1 MB, then four classes per power of
+// two (at most 25% over the request), so nearby sizes share blocks.
+size_t bucket(size_t n) {
+    if (n <= (size_t(1) << 20)) return (n + 511) & ~size_t(511);
+    size_t p = size_t(1) << 20;
+    while (p <= n / 2) p <<= 1;
+    const size_t step = p / 4;
+    return (n + step - 1) / step * step;
+}
+
+// The stream-ordered pool, chosen once: PROMETHEUS_ALLOCATOR=async and a
+// driver that has it. Its memory is kept (release threshold: all of it) so
+// steady-state allocation never goes back to the driver.
+bool use_async() {
+    if (g_async >= 0) return g_async == 1;
+    g_async = 0;
+    const char* e = getenv("PROMETHEUS_ALLOCATOR");
+    if (!e || string(e) != "async" || !g.d.cuMemAllocAsync || !g.d.cuMemFreeAsync ||
+        !g.d.cuDeviceGetDefaultMemPool || g.d.cuDeviceGetDefaultMemPool(&g_async_pool, g.dev) != 0)
+        return false;
+    if (g.d.cuMemPoolSetAttribute) {
+        unsigned long long keep = ~0ull;
+        g.d.cuMemPoolSetAttribute(g_async_pool, 4 /* RELEASE_THRESHOLD */, &keep);
+    }
+    g_async = 1;
+    return true;
+}
 
 } // namespace
 
@@ -596,12 +645,28 @@ void* alloc(size_t nbytes) {
             g_peak = max(g_peak, g_in_use);
             return (void*)p;
         }
-        auto it = g_pool.find(b);
-        if (it != g_pool.end() && !it->second.empty()) {
+        if (use_async()) {
+            CUdeviceptr p = 0;
+            const CUresult ra = g.d.cuMemAllocAsync(&p, b, g.stream);
+            if (ra == 0) {
+                g_live[p] = b;
+                g_in_use += b;
+                g_peak = max(g_peak, g_in_use);
+                return (void*)p;
+            }
+        }
+        // the smallest cached block of this class or larger, up to twice the
+        // size: a new size reuses memory instead of a cuMemAlloc (which waits
+        // for the GPU)
+        for (auto it = g_pool.lower_bound(b); it != g_pool.end() && it->first <= 2 * b; ++it) {
+            if (it->second.empty()) continue;
+            const size_t got = it->first;
             CUdeviceptr p = it->second.back();
             it->second.pop_back();
-            g_pool_bytes -= b;
-            g_in_use += b;
+            if (it->second.empty()) g_pool.erase(it);
+            g_pool_bytes -= got;
+            g_live[p] = got;
+            g_in_use += got;
             g_peak = max(g_peak, g_in_use);
             return (void*)p;
         }
@@ -629,6 +694,7 @@ void* alloc(size_t nbytes) {
                             ". Reduce the batch size or sequence length, or free tensors you no longer need.");
     }
     lock_guard<mutex> lock(g_pool_mu);
+    g_live[p] = b;
     g_in_use += b;
     g_peak = max(g_peak, g_in_use);
     return (void*)p;
@@ -647,9 +713,20 @@ void free(void* ptr, size_t nbytes) noexcept {
         }
         g_owner.erase(own);                   // its graph is gone: an ordinary block now
     }
-    g_pool[b].push_back((CUdeviceptr)ptr);
-    g_pool_bytes += b;
-    g_in_use -= min(g_in_use, b);
+    size_t real = b;
+    auto live = g_live.find((CUdeviceptr)ptr);
+    if (live != g_live.end()) {
+        real = live->second;
+        g_live.erase(live);
+    }
+    g_in_use -= min(g_in_use, real);
+    if (g_async == 1) {
+        // stream-ordered: reusable by work queued after this point
+        try { bind_context(); } catch (...) {}
+        if (g.d.cuMemFreeAsync((CUdeviceptr)ptr, g.stream) == 0) return;
+    }
+    g_pool[real].push_back((CUdeviceptr)ptr);
+    g_pool_bytes += real;
 }
 
 MemoryStats memory_stats() {
@@ -660,10 +737,22 @@ MemoryStats memory_stats() {
         s.in_use = g_in_use;
         s.peak = g_peak;
         s.cached = g_pool_bytes;
+        if (g_async == 1 && g.d.cuMemPoolGetAttribute) {
+            unsigned long long reserved = 0;
+            if (g.d.cuMemPoolGetAttribute(g_async_pool, 5 /* RESERVED_MEM_CURRENT */, &reserved) == 0)
+                s.cached = reserved > g_in_use ? (size_t)(reserved - g_in_use) : 0;
+        }
     }
     bind_context();
     g.d.cuMemGetInfo(&s.device_free, &s.device_total);
     return s;
+}
+
+std::string allocator_name() {
+    if (!available()) return "none";
+    bind_context();
+    lock_guard<mutex> lock(g_pool_mu);
+    return use_async() ? "async" : "caching";
 }
 
 void reset_peak_memory() {
@@ -705,6 +794,7 @@ void empty_cache() {
         for (CUdeviceptr p : blocks) g.d.cuMemFree(p);
     g_pool.clear();
     g_pool_bytes = 0;
+    if (g_async == 1 && g.d.cuMemPoolTrimTo) g.d.cuMemPoolTrimTo(g_async_pool, 0);
 }
 
 void memset_zero(void* dst, size_t nbytes) {
@@ -1397,6 +1487,73 @@ void set_attention_backend(const std::string& mode) {
     g_attention_backend = mode;
 }
 std::string attention_backend() { return g_attention_backend; }
+
+// ── uploads on a second stream ───────────────────────────────────────────────
+//
+// Host data is staged in a pinned buffer and copied on a stream of its own,
+// so the next batch moves while this one computes. The copy first waits (on
+// the GPU) for the work already queued on the compute stream: its
+// destination may be a block that work still reads, freed and handed out
+// again by the caching allocator. The compute stream later waits for the copy
+// with wait_upload -- again on the GPU, the CPU never blocks. A pinned buffer
+// is reused once its copy has finished.
+namespace {
+struct Staging {
+    void* host = nullptr;
+    size_t cap = 0;
+    void* done = nullptr;          // event recorded after its last copy
+};
+mutex           g_up_mu;
+CUstream        g_copy_stream = nullptr;
+vector<Staging> g_staging;
+}
+
+bool uploads_available() {
+    return available() && g.d.cuStreamWaitEvent && g.d.cuEventQuery && g.d.cuEventCreate && g.d.cuEventRecord &&
+           g.d.cuMemHostAlloc;
+}
+
+unsigned long long upload_async(void* dst, const void* src, size_t nbytes) {
+    if (!uploads_available()) throw runtime_error("cuda: asynchronous uploads need a newer driver");
+    if (capturing()) throw runtime_error("cuda: upload_async during graph capture -- upload before the captured step");
+    bind_context();
+    lock_guard<mutex> lock(g_up_mu);
+    if (!g_copy_stream) check(g.d.cuStreamCreate(&g_copy_stream, 1 /* non-blocking */), "cuStreamCreate (copies)");
+    Staging* st = nullptr;
+    for (auto& s : g_staging)
+        if (s.cap >= nbytes && (!s.done || g.d.cuEventQuery(s.done) == 0)) { st = &s; break; }
+    if (!st) {
+        Staging s;
+        s.cap = std::max<size_t>(nbytes, 1 << 16);
+        check(g.d.cuMemHostAlloc(&s.host, s.cap, 0), "cuMemHostAlloc");
+        check(g.d.cuEventCreate(&s.done, 2 /* disable timing */), "cuEventCreate");
+        g_staging.push_back(s);
+        st = &g_staging.back();
+    }
+    std::memcpy(st->host, src, nbytes);
+    // after everything queued so far on the compute stream
+    void* ready = nullptr;
+    check(g.d.cuEventCreate(&ready, 2), "cuEventCreate");
+    check(g.d.cuEventRecord(ready, g.stream), "cuEventRecord");
+    check(g.d.cuStreamWaitEvent(g_copy_stream, ready, 0), "cuStreamWaitEvent");
+    g.d.cuEventDestroy(ready);                 // released once the wait is satisfied
+    g_n_copies.fetch_add(1, std::memory_order_relaxed);
+    check(g.d.cuMemcpyHtoDAsync((CUdeviceptr)dst, st->host, nbytes, g_copy_stream), "cuMemcpyHtoD (copy stream)");
+    check(g.d.cuEventRecord(st->done, g_copy_stream), "cuEventRecord");
+    // the fence: a fresh event, so a later reuse of the buffer cannot move it
+    void* fence = nullptr;
+    check(g.d.cuEventCreate(&fence, 2), "cuEventCreate");
+    check(g.d.cuEventRecord(fence, g_copy_stream), "cuEventRecord");
+    return (unsigned long long)(uintptr_t)fence;
+}
+
+void wait_upload(unsigned long long fence) {
+    if (!fence) return;
+    bind_context();
+    void* e = (void*)(uintptr_t)fence;
+    check(g.d.cuStreamWaitEvent(g.stream, e, 0), "cuStreamWaitEvent");
+    g.d.cuEventDestroy(e);
+}
 
 int multiprocessor_count() { return available() ? state().sms : 0; }
 

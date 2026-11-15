@@ -8,6 +8,7 @@
 #include "ml/cuda.hpp"
 #include <cstdlib>
 #include "ml/ops.hpp"
+#include "../src/ops_internal.hpp"
 #include "ml/matmul_backend.hpp"
 #include "ml/blas.hpp"
 #include "ml/loss.hpp"
@@ -398,6 +399,22 @@ PYBIND11_MODULE(_C, m) {
           "GPU attention: \"math\" (S x S scores through cuBLAS), \"flash\" (tiled, memory linear in the "
           "length), or \"auto\" (flash once the score buffers would pass 512 MB).");
     m.def("get_attention_backend", &cuda::attention_backend);
+    m.def("_upload_async", [](TensorPtr t) {
+              // a CPU tensor -> (its GPU copy, the fence to wait on before use)
+              if (t->device() != Device::CPU) throw std::runtime_error("_upload_async: expects a CPU tensor");
+              auto c = t->is_contiguous() && t->offset() == 0 ? t : contiguous(t);
+              auto d = std::make_shared<Tensor>(c->shape(), Tensor::Uninitialized{}, c->dtype(), Device::CUDA);
+              const size_t n = (size_t)c->numel() * dtype_size(c->dtype());
+              unsigned long long fence = n ? cuda::upload_async(d->storage()->data(), c->storage()->data(), n) : 0;
+              return py::make_tuple(d, fence);
+          });
+    m.def("_wait_upload", &cuda::wait_upload);
+    m.def("_fused_map", &cuda_ops::fused_map, py::arg("fwd"), py::arg("bwd"), py::arg("mask"), py::arg("inputs"),
+          py::arg("higher") = nullptr);
+    m.def("cuda_uploads_available", &cuda::uploads_available);
+    m.def("cuda_allocator", &cuda::allocator_name,
+          "\"caching\" (freed blocks reused best-fit by size class) or \"async\" "
+          "(PROMETHEUS_ALLOCATOR=async: the driver's stream-ordered pool).");
     m.def("cuda_launch_counts", []() {
               auto c = cuda::launch_counts();
               py::dict d;

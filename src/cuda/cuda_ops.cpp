@@ -1406,11 +1406,12 @@ TensorPtr matmul(const TensorPtr& a0, const TensorPtr& b0) {
 static const string& FUSED_SRC() {
     static const string s = src(R"(
 // y = (x - mean) / sqrt(var + eps) * gamma + beta over rows of `cols`; one block per row
-extern "C" __global__ void f_layernorm(const float* x, const float* g, const float* b, float* y,
-                                       long long cols, float eps) {
+// y in the dtype ioy (float32, or half for the gemm it feeds under autocast)
+extern "C" __global__ void f_layernorm(const float* x, const float* g, const float* b, void* y,
+                                       long long cols, float eps, int ioy) {
     __shared__ float s[256];
     const float* row = x + (long long)blockIdx.x * cols;
-    float* out = y + (long long)blockIdx.x * cols;
+    const long long yo = (long long)blockIdx.x * cols;
     float t = 0.0f;
     for (long long j = threadIdx.x; j < cols; j += blockDim.x) t += row[j];
     s[threadIdx.x] = t;
@@ -1424,7 +1425,7 @@ extern "C" __global__ void f_layernorm(const float* x, const float* g, const flo
     __syncthreads();
     for (int w = blockDim.x / 2; w > 0; w >>= 1) { if (threadIdx.x < w) s[threadIdx.x] += s[threadIdx.x + w]; __syncthreads(); }
     const float inv = rsqrtf(s[0] / (float)cols + eps);
-    for (long long j = threadIdx.x; j < cols; j += blockDim.x) out[j] = (row[j] - mean) * inv * g[j] + b[j];
+    for (long long j = threadIdx.x; j < cols; j += blockDim.x) stx(y, ioy, yo + j, (row[j] - mean) * inv * g[j] + b[j]);
 }
 
 // The same, one warp per row (8 rows a block) with the row held in registers
@@ -1434,8 +1435,8 @@ __device__ float lnw_sum(float v) {
     for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
     return v;
 }
-extern "C" __global__ void f_layernorm_w(const float* x, const float* g, const float* b, float* y,
-                                         int cols, float eps, long long rows) {
+extern "C" __global__ void f_layernorm_w(const float* x, const float* g, const float* b, void* y,
+                                         int cols, float eps, long long rows, int ioy) {
     const long long r = (long long)blockIdx.x * 8 + (threadIdx.x >> 5);
     if (r >= rows) return;
     const int lane = threadIdx.x & 31;
@@ -1449,9 +1450,9 @@ extern "C" __global__ void f_layernorm_w(const float* x, const float* g, const f
     #pragma unroll
     for (int k = 0; k < 32; k++) { const int j = lane + 32 * k; if (j < cols) { const float d = v[k] - mean; t += d * d; } }
     const float inv = rsqrtf(lnw_sum(t) / (float)cols + eps);
-    float* out = y + r * cols;
+    const long long yo = r * cols;
     #pragma unroll
-    for (int k = 0; k < 32; k++) { const int j = lane + 32 * k; if (j < cols) out[j] = (v[k] - mean) * inv * g[j] + b[j]; }
+    for (int k = 0; k < 32; k++) { const int j = lane + 32 * k; if (j < cols) stx(y, ioy, yo + j, (v[k] - mean) * inv * g[j] + b[j]); }
 }
 
 // Philox-4x32-10 (Salmon et al. 2011, what cuRAND and PyTorch use): element
@@ -1589,14 +1590,15 @@ extern "C" __global__ void o_scale(float* a, long long n, float c) {
     return s;
 }
 
-TensorPtr layernorm(const TensorPtr& x0, const TensorPtr& g0, const TensorPtr& b0, float eps) {
+TensorPtr layernorm(const TensorPtr& x0, const TensorPtr& g0, const TensorPtr& b0, float eps, DType out_dtype) {
     auto x = contiguous_on_device(f32(x0, "LayerNorm"));
     auto g = contiguous_on_device(f32(g0, "LayerNorm")), b = contiguous_on_device(f32(b0, "LayerNorm"));
     long long cols = x->shape().back();
     if (g->numel() != cols || b->numel() != cols)
         throw runtime_error("LayerNorm: gamma and beta must have " + to_string(cols) + " elements");
     const long long rows = cols ? x->numel() / cols : 0;
-    auto out = empty_cuda(x->shape());
+    auto out = empty_cuda(x->shape(), out_dtype);
+    int ioy = out_dtype == DType::BFloat16 ? 3 : out_dtype == DType::Float16 ? 2 : 0;
     const void* px = base(x);
     const void* pg = base(g);
     const void* pb = base(b);
@@ -1604,11 +1606,11 @@ TensorPtr layernorm(const TensorPtr& x0, const TensorPtr& g0, const TensorPtr& b
     if (rows && cols <= 1024) {
         int c = (int)cols;
         long long rr = rows;
-        void* a[] = {&px, &pg, &pb, &py, &c, &eps, &rr};
+        void* a[] = {&px, &pg, &pb, &py, &c, &eps, &rr, &ioy};
         cuda::launch(K("f_layernorm_w", FUSED_SRC()), (unsigned)((rows + 7) / 8), 1, 1, 256, 1, 1, 0, a);
         return out;
     }
-    void* args[] = {&px, &pg, &pb, &py, &cols, &eps};
+    void* args[] = {&px, &pg, &pb, &py, &cols, &eps, &ioy};
     if (rows) cuda::launch(K("f_layernorm", FUSED_SRC()), (unsigned)rows, 1, 1, 256, 1, 1, 0, args);
     return out;
 }
@@ -1770,6 +1772,125 @@ void scale_inplace(float* a, int64_t n, float c) {
     long long nn = n;
     void* args[] = {&a, &nn, &c};
     cuda::launch(K("o_scale", FUSED_SRC()), nn, args);
+}
+
+} // namespace cuda_ops
+
+// ── fused element-wise functions (p.fuse) ─────────────────────────────────────
+//
+// An expression over inputs x0..x{k-1} (CUDA C, written by p.fuse's tracer)
+// becomes one kernel: every input read through its broadcast index, the
+// result written once. Its gradient is a second generated kernel: the
+// upstream gradient g and the inputs in, every input's gradient (at the
+// output's shape) out, reduced to each input's shape after. Sources are
+// compiled once per expression and kept.
+
+namespace {
+constexpr int FUSE_MAX = 8;
+struct FuseIn {
+    const float* p[FUSE_MAX];
+    Index ix[FUSE_MAX];
+};
+struct FuseOut {
+    float* p[FUSE_MAX];
+};
+const char* const FUSE_HELPERS = R"(
+#define FUSE_MAX 8
+struct FuseIn { const float* p[FUSE_MAX]; Index ix[FUSE_MAX]; };
+struct FuseOut { float* p[FUSE_MAX]; };
+__device__ __forceinline__ float f_sigmoid(float v) { return 1.0f / (1.0f + expf(-v)); }
+__device__ __forceinline__ float f_gelu(float v) { return 0.5f * v * (1.0f + tanhf(0.7978845608f * (v + 0.044715f * v * v * v))); }
+__device__ __forceinline__ float f_gelu_d(float v) {
+    const float k = 0.7978845608f, c = 0.044715f, t = tanhf(k * (v + c * v * v * v));
+    return 0.5f * (1.0f + t) + 0.5f * v * (1.0f - t * t) * k * (1.0f + 3.0f * c * v * v);
+}
+)";
+// fwd: statements defining `out` from x0..x{k-1}; bwd: statements defining
+// d{j} for every j in mask, from the same and the upstream gradient g
+const string& fuse_source(const string& fwd, const string& bwd, const vector<int>& mask, int k) {
+    static std::mutex mu;
+    static auto& cache = *new std::unordered_map<string, string>();     // Kernel keeps c_str()
+    string key = fwd + "\x1f" + bwd + "\x1f" + to_string(k);
+    for (int m : mask) key += m ? '1' : '0';
+    std::lock_guard<std::mutex> lock(mu);
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
+    string loads;
+    for (int j = 0; j < k; j++)
+        loads += "    const float x" + to_string(j) + " = in.p[" + to_string(j) + "][at(in.ix[" + to_string(j) + "], i)];\n";
+    string body = string(FUSE_HELPERS) +
+        "extern \"C\" __global__ void fz_fwd(FuseIn in, float* y, long long n) {\n"
+        "    const long long i = gid(); if (i >= n) return;\n" + loads + fwd + "\n    y[i] = out;\n}\n"
+        "extern \"C\" __global__ void fz_bwd(FuseIn in, const float* G, FuseOut o, long long n) {\n"
+        "    const long long i = gid(); if (i >= n) return;\n" + loads +
+        "    const float g = G[i];\n" + bwd + "\n";
+    for (int j = 0; j < k; j++)
+        if (mask[j])                           // null: that input needs no gradient
+            body += "    if (o.p[" + to_string(j) + "]) o.p[" + to_string(j) + "][i] = d" + to_string(j) + ";\n";
+    body += "}\n";
+    return cache.emplace(key, src(body.c_str())).first->second;
+}
+} // namespace
+
+namespace cuda_ops {
+
+TensorPtr fused_map(const string& fwd, const string& bwd, const vector<int>& mask, const vector<TensorPtr>& inputs0,
+                    FusedHigher higher) {
+    const int k = (int)inputs0.size();
+    if (k < 1 || k > FUSE_MAX) throw runtime_error("fuse: 1 to 8 tensor inputs");
+    if ((int)mask.size() != k) throw runtime_error("fuse: one gradient flag per input");
+    vector<TensorPtr> in;
+    Shape shape;
+    for (int j = 0; j < k; j++) {
+        in.push_back(f32(inputs0[j], "fuse"));
+        shape = j ? broadcast_shapes(shape, in[j]->shape()) : in[j]->shape();
+    }
+    const string& source = fuse_source(fwd, bwd, mask, k);
+    auto out = empty_cuda(shape);
+    FuseIn fi{};
+    for (int j = 0; j < k; j++) {
+        fi.p[j] = static_cast<const float*>(base(in[j]));
+        fi.ix[j] = index_for(in[j], shape);
+    }
+    float* py = static_cast<float*>(out->storage()->data());
+    long long n = out->numel();
+    void* a[] = {&fi, &py, &n};
+    if (n) cuda::launch(K("fz_fwd", source), n, a);
+    const string* srcp = &source;                  // in the never-destroyed cache
+    attach(out, in, "fuse", [in, mask, shape, n, srcp, higher](const TensorPtr&, const TensorPtr& G0) -> vector<TensorPtr> {
+        if (grad_enabled()) {
+            // the gradient is itself recorded: each input's g * d/dx_j as a fused
+            // op of its own (built by the caller from the expression tree), so it
+            // differentiates again
+            if (!higher) throw runtime_error("fuse: no higher-order gradient for this fused op");
+            auto r = higher(in, G0);
+            for (size_t j = 0; j < r.size() && j < in.size(); j++)
+                if (r[j] && r[j]->shape() != in[j]->shape()) r[j] = sum_to(r[j], in[j]->shape());
+            return r;
+        }
+        auto G = contiguous_on_device(f32(G0, "fuse"));
+        const int kk = (int)in.size();
+        FuseIn fi{};
+        FuseOut fo{};
+        vector<TensorPtr> full(kk);
+        for (int j = 0; j < kk; j++) {
+            fi.p[j] = static_cast<const float*>(base(in[j]));
+            fi.ix[j] = index_for(in[j], shape);
+            if (in[j]->requires_grad() && mask[j]) {
+                full[j] = empty_cuda(shape);
+                fo.p[j] = static_cast<float*>(full[j]->storage()->data());
+            }
+        }
+        const float* pg = static_cast<const float*>(base(G));
+        long long nn = n;
+        void* a[] = {&fi, &pg, &fo, &nn};
+        if (nn) cuda::launch(K("fz_bwd", *srcp), nn, a);
+        vector<TensorPtr> r(kk);
+        for (int j = 0; j < kk; j++)
+            if (full[j]) r[j] = full[j]->shape() == in[j]->shape() ? full[j] : sum_to(full[j], in[j]->shape());
+        return r;
+    });
+    return out;
 }
 
 } // namespace cuda_ops

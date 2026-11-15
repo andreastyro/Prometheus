@@ -178,7 +178,7 @@ setup(
     cmdclass={"build_ext": build_ext},
     version="0.1.0",
     ext_modules=[ext],
-    packages=["prometheus", "prometheus.models"],
+    packages=["prometheus", "prometheus.models", "prometheus.compiler"],
     package_dir={"prometheus": "python"},
     # prometheus_onnx.py sits beside setup.py and provides save_onnx(). It was
     # not listed here, so pip install gave users the extension but not the

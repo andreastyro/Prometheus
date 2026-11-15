@@ -205,25 +205,29 @@ against its own im2col path (oneDNN off) the convolutions here are 1.3-1.6x. Ben
 One full training step (forward, backward, optimizer), ms, against PyTorch 2.15
 eager and `torch.compile` on the same model in the same session, interleaved
 ([tests/bench_gpu_all.py](tests/bench_gpu_all.py), run on Modal with
-[tests/modal_gpu.py](tests/modal_gpu.py)). A100, float32:
+[tests/modal_gpu.py](tests/modal_gpu.py)). PyTorch's attention is
+`F.scaled_dot_product_attention` (flash kernels on this card) -- its fastest.
+A100:
 
 | Model | Prometheus | PyTorch eager | torch.compile |
 |---|---|---|---|
-| GPT 4 x 256, batch 8 x 128, AdamW | **4.6** | 8.9 (1.9x slower) | 5.1 |
-| GPT, with gradient clipping | **5.2** | 9.6 | 5.2 |
-| CNN, batch 64 of 32x32 | **1.1** | 1.4 | 1.5 |
-| GPT 12 x 768, batch 8 x 256 | **79.1** | 86.2 | 81.3 (max-autotune) |
-| the same, TF32 matmuls | **24.5** | 30.6 | 24.7 (max-autotune) |
+| GPT 4 x 256, batch 8 x 128, AdamW | **5.1** | 7.2 (1.4x slower) | 4.8 |
+| GPT, with gradient clipping | **5.2** | 7.5 | 5.3 |
+| GPT 4 x 256, bf16 autocast | **2.8** | 7.8 (2.8x slower) | 2.2 |
+| GPT 12 x 768, batch 8 x 256, TF32 matmuls | **24.2** | 29.1 | 24.4 (max-autotune) |
+| the same, bf16 autocast | **20.4** | 26.3 | 17.0 (max-autotune) |
+| the same, float32 | 78.7 | 77.5 | 79.0 (max-autotune) |
+| CNN, batch 64 of 32x32 | **1.0** | 1.6 | 1.8 |
 
-With the step replayed from a CUDA Graph (`p.CUDAGraph`), against PyTorch
-eager in the same run:
+With the step replayed from a CUDA Graph (`p.CUDAGraph`, or `p.compile`),
+against PyTorch eager in the same run (an earlier run; PyTorch with its
+matmul / softmax attention):
 
 | Model | Prometheus, graph | PyTorch eager |
 |---|---|---|
 | CNN | **0.8** | 1.2 |
 | LSTM, 64 x 32 x 128 -> 256 | **2.2** | 2.3 |
 | GRU (`reset_after=True`) | **2.0** | 2.4 |
-| GPT 4 x 256 | 4.6 | 5.8 (`reduce-overhead` 4.2) |
 
 GTX 970, float32, against PyTorch 2.14 eager: GPT 16.5 vs 19.4 ms, with
 clipping 16.9 vs 20.1, CNN 4.4 vs 4.9, RNN 2.6 vs 3.2.
@@ -232,14 +236,10 @@ Where it is behind, and why:
 
 | Model | Prometheus | PyTorch eager | torch.compile | Why |
 |---|---|---|---|---|
-| RNN, A100 | 2.7 (graph 1.7) | 0.8 | 0.8 | 64 small sequential steps: launch-bound, cuDNN runs the recurrence in one persistent kernel |
-| LSTM / GRU, A100, no graph | 3.3 / 3.2 | 2.5 / 2.4 | 2.5 / 2.5 | the same; a graph closes it (above) |
+| RNN, A100 | 2.0 (one launch) | 0.9 | 1.0 | 64 short sequential steps; cuDNN's persistent kernel keeps more on chip |
+| LSTM / GRU, A100, no graph | 3.2 / 3.2 | 2.7 / 2.9 | 2.8 / 2.8 | launch-bound: a gemm and a kernel per step; a graph closes it (above) |
 | LSTM / GRU, GTX 970 | 5.2 / 5.0 | 5.0 / 4.4 | | the same |
-| GPT 12 x 768, bf16 autocast, A100 | 71.2 | 35.3 | 16.7 (max-autotune) | only the matmuls run in bf16; every fused kernel casts in and out of float32 |
-| GPT 4 x 256, bf16 autocast, A100 | 5.9 | 11.4 | 2.5 | the same |
-
-A real bf16 path (fused kernels reading and writing bf16) and a persistent
-recurrent kernel are the next pieces of work.
+| GPT 12 x 768, bf16, against torch.compile | 20.4 | | 17.0 | compile fuses across ops (and into its gemms); here the fusions are hand-written per layer |
 
 ---
 
@@ -317,6 +317,48 @@ for batch in data:
     g.replay()                         # the whole step; loss refreshed in place
 ```
 
+`p.compile(step)` does all of this for a function of GPU tensors, as
+`torch.compile(mode="reduce-overhead")`: a few eager calls, then one capture,
+then replays with the arguments copied in (a new shape captures again; a step
+that reads a value back keeps running eagerly, with a warning):
+
+```python
+@p.compile
+def train_step(x, y):
+    opt.zero_grad()
+    loss = p.cross_entropy_sparse_seq(model.forward(x), y)
+    loss.backward()
+    opt.step()
+    return loss
+```
+
+`p.fuse` turns an element-wise function of your own -- an activation, a loss
+-- into one GPU kernel forward and one backward: the first call traces it on
+symbols (operators and `p.fx.exp`, `log`, `sqrt`, `abs`, `tanh`, `sigmoid`,
+`relu`, `gelu`, `pow`, `maximum`, `minimum`, and the reductions `sum` /
+`mean` along an axis) into the compiler's IR (`prometheus.compiler`: typed
+values, shape inference, common subexpressions merged), differentiates it in
+reverse mode and generates the kernels -- one per element-wise region,
+reductions run as the library's ops; inputs broadcast. Gradients of fused
+functions are fused functions too, so they differentiate again (second
+derivatives and beyond). On CPU tensors the same function runs as ordinary
+ops.
+
+```python
+@p.fuse
+def swish_mse(x, t):
+    y = x * p.fx.sigmoid(x)
+    return (y - t) * (y - t)      # 1 kernel, where the ops took 6 forward and more backward
+```
+
+`p.prefetch(batches)` yields the batches (CPU tensors, or tuples of them) as
+GPU tensors with the next ones already uploading: the copies go through
+pinned memory on a second stream and the compute stream waits for each on the
+GPU, never the CPU. The device allocator reuses a freed block for any request
+of its size class or up to half its size (`p.cuda_allocator()`);
+`PROMETHEUS_ALLOCATOR=async` hands allocation to the driver's stream-ordered
+pool instead.
+
 Inside a capture nothing may read a value back (`.item()`, printing,
 `clip_grad_norm(..., return_norm=False)` instead); Adam and AdamW keep their
 step count on the GPU so replays stay correct. On an A100 graphs make the LSTM
@@ -327,8 +369,8 @@ dtype end to end: the gemms write their half results themselves, the backward
 gemms run in the half dtype too, attention keeps its probabilities in it, and
 the fused bias + GELU, bias + residual and residual + LayerNorm kernels read
 and write it directly -- parameters, the residual stream and gradients stay
-float32. A 12-layer GPT step on an A100 takes 21.2 ms this way, against
-PyTorch's 35.7 ms (eager). `p.set_default_autocast(p.bfloat16)` turns this on
+float32. A 12-layer GPT step on an A100 takes 20.4 ms this way, against
+PyTorch's 26.3 ms (eager, flash attention) and 17.0 ms (torch.compile). `p.set_default_autocast(p.bfloat16)` turns this on
 for every GPU matmul without a scope (CPU tensors stay float32, an explicit
 `autocast(p.float32)` still wins); it is off by default, so results are those
 of float32 unless asked.
@@ -338,11 +380,13 @@ Attention has two GPU paths, picked by `p.set_attention_backend(...)` (or
 fastest at ordinary lengths, and `"flash"`, tiled with an online softmax so the
 scores are never stored -- memory linear in the sequence length, the backward
 recomputing them from each row's log-sum-exp (head size up to 128). The default
-`"auto"` switches to flash once the S x S buffers would pass 512 MB. An
-experimental single-launch recurrence for RNN, LSTM and GRU
-(`PROMETHEUS_PERSISTENT_RNN=1`: each block owns a slice of the hidden units,
-a barrier across the GPU between steps) is correct but not yet faster than a
-gemm and a kernel per step, so it is off. `p.cuda_launch_counts()` counts
+`"auto"` switches to flash once the S x S buffers would pass 512 MB. The plain
+RNN runs its whole recurrence, forward and backward, in one kernel when the
+batch's hidden state fits in shared memory: each block owns a slice of the
+hidden units, with a barrier across the GPU between steps (A100: 2.3 ms against
+2.6 for a gemm and a kernel per step). LSTM and GRU can do the same
+(`PROMETHEUS_PERSISTENT_RNN=1`; `=0` turns it off for all) but are faster per
+step for now. `p.cuda_launch_counts()` counts
 the kernels, cuBLAS / cuDNN calls and copies issued since
 `p.cuda_reset_launch_counts()`; the GPU benchmarks print them per step.
 `cuda_memory_stats()` reports

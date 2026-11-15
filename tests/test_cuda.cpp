@@ -943,6 +943,15 @@ int main() {
         CHECK_TRUE("memory_stats: in_use rises by the tensor and falls back", during.in_use >= before.in_use + (4u << 20) &&
                    after.in_use == before.in_use && after.cached >= (4u << 20));
         CHECK_TRUE("memory_stats: peak and device totals", during.peak >= during.in_use && during.device_total > 0);
+        if (cuda::allocator_name() == "caching") {
+            // a freed 48 MB block serves a 33 MB request (size class 40 MB): no new allocation
+            { auto big = Tensor::zeros({12LL << 20})->to(Device::CUDA); }
+            const auto c0 = cuda::memory_stats();
+            auto smaller = std::make_shared<Tensor>(Shape{(33LL << 20) / 4}, DType::Float32, Device::CUDA);
+            const auto c1 = cuda::memory_stats();
+            CHECK_TRUE("allocator: a cached larger block is reused for a new size",
+                       c0.cached >= (48u << 20) && c1.cached + (48u << 20) == c0.cached);
+        }
         std::string msg;
         // twice the card's memory, so no GPU can satisfy it (a 40 GB request fit an A100)
         const int64_t too_many = (int64_t)(during.device_total / 4) * 2;

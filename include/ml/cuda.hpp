@@ -185,6 +185,21 @@ std::string profile_report(int top = 0);
 void set_attention_backend(const std::string& mode);
 std::string attention_backend();
 
+/// Host-to-device copies on a second stream, overlapping the compute
+/// stream: upload_async copies `src` (ordinary host memory, staged through
+/// pinned buffers) to `dst` after the work queued so far, and returns a
+/// fence; wait_upload(fence) makes the compute stream wait for it (on the
+/// GPU -- the CPU does not block). What p.prefetch builds on.
+bool uploads_available();
+unsigned long long upload_async(void* dst, const void* src, size_t nbytes);
+void wait_upload(unsigned long long fence);
+
+/// The device allocator: "caching" (default -- freed blocks kept by size
+/// class and reused best-fit, up to twice the request) or "async"
+/// (PROMETHEUS_ALLOCATOR=async: the driver's stream-ordered pool,
+/// cuMemAllocAsync). CUDA Graph captures use their own blocks either way.
+std::string allocator_name();
+
 /// The GPU's multiprocessors (0 without a GPU).
 int multiprocessor_count();
 /// How many blocks of kernel `k` (block threads, dynamic shared bytes) are
