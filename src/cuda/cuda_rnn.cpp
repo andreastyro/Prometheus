@@ -332,8 +332,12 @@ struct Persist {
 Persist persist_plan(int cell, int B, int H, int G) {
     Persist p;
     static const bool on = [] {
+        // off by default: on an A100 it is slower than a gemm + kernel a step
+        // (LSTM 13.4 vs 3.3 ms) -- W_h is read from global memory, a thread
+        // at a time, latency-bound; needs W_h in shared memory and the dot
+        // products split across threads
         const char* e = std::getenv("PROMETHEUS_PERSISTENT_RNN");
-        return !(e && e[0] == '0');
+        return e && e[0] == '1';
     }();
     const int sms = cuda::multiprocessor_count();
     if (!on || cell == 2 || sms <= 0 || B <= 0 || H <= 0) return p;

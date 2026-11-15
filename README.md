@@ -338,12 +338,11 @@ Attention has two GPU paths, picked by `p.set_attention_backend(...)` (or
 fastest at ordinary lengths, and `"flash"`, tiled with an online softmax so the
 scores are never stored -- memory linear in the sequence length, the backward
 recomputing them from each row's log-sum-exp (head size up to 128). The default
-`"auto"` switches to flash once the S x S buffers would pass 512 MB. The
-recurrent layers (RNN, LSTM, GRU with `reset_after=True`) run their whole
-recurrence in one kernel when the batch's hidden state fits in shared memory:
-each block owns a slice of the hidden units, with a barrier across the GPU
-between steps, instead of a gemm and a kernel launched per step
-(`PROMETHEUS_PERSISTENT_RNN=0` turns it off). `p.cuda_launch_counts()` counts
+`"auto"` switches to flash once the S x S buffers would pass 512 MB. An
+experimental single-launch recurrence for RNN, LSTM and GRU
+(`PROMETHEUS_PERSISTENT_RNN=1`: each block owns a slice of the hidden units,
+a barrier across the GPU between steps) is correct but not yet faster than a
+gemm and a kernel per step, so it is off. `p.cuda_launch_counts()` counts
 the kernels, cuBLAS / cuDNN calls and copies issued since
 `p.cuda_reset_launch_counts()`; the GPU benchmarks print them per step.
 `cuda_memory_stats()` reports
