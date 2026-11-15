@@ -339,11 +339,16 @@ inline std::shared_ptr<GradNode> make_node(TensorPtr result, std::vector<TensorP
     if (!grad_enabled())
         return node;
 
-    // anything joining the graph will be written to by a backward_fn
+    // anything joining the graph will be written to by a backward_fn -- on the
+    // CPU, whose raw kernels write into the buffers. On the GPU backward builds
+    // each gradient and hands it over (accumulate_grad), so an activation gets
+    // no buffer here: a zeroed one meant a memset in the forward and an add in
+    // place of taking the first gradient over -- 2.7 ms of a 22 ms GPT step.
+    // Leaves (parameters) keep theirs, as before.
     for (auto& in : node->inputs)
-        if (in && in->requires_grad())
+        if (in && in->requires_grad() && (in->device() != Device::CUDA || !in->grad_fn()))
             in->ensure_grad();
-    result->ensure_grad();
+    if (result->device() != Device::CUDA) result->ensure_grad();
 
     result->set_requires_grad(true);
     result->set_grad_fn(node);

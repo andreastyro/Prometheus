@@ -75,6 +75,10 @@ ext = Extension(
     language="c++",
     extra_compile_args=compile_args,
     extra_link_args=extra_link,
+    # setuptools rebuilds only when a source is newer than the built module;
+    # without the headers here, a change to one alone was silently not built
+    depends=(glob.glob(os.path.join(src_root, "include/**/*.hpp"), recursive=True) +
+             glob.glob(os.path.join(src_root, "src/**/*.hpp"), recursive=True)),
 )
 
 # Compile the ~40 sources in parallel. setuptools can, but does not unless

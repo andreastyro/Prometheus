@@ -803,7 +803,23 @@ void Tensor::backward() {
         }
         for (size_t i = 0; i < node->inputs.size() && i < parts.size(); i++) {
             const TensorPtr& in = node->inputs[i];
-            if (parts[i] && in && in->requires_grad()) in->accumulate_grad(parts[i]);
+            if (!(parts[i] && in && in->requires_grad())) continue;
+            if (cuda::profiling() && in->device() == Device::CUDA) {
+                // which op's gradients cost an add rather than taking a buffer over
+                const bool add = in->has_grad();
+                const auto& p = parts[i];
+                string why;
+                if (p->storage().use_count() > 1 || p.use_count() > 1) why += " shared";
+                if (!p->is_contiguous() || p->offset() != 0) why += " strided";
+                if (p->dtype() != DType::Float32) why += " dtype";
+                if (p->storage()->nbytes() != (size_t)p->numel() * sizeof(float)) why += " size";
+                cuda::ProfScope ps(string(add ? "grad add <- " : "grad first <- ") + node->name +
+                                   (in->grad_fn() ? string(" -> ") + in->grad_fn()->name : string(" -> param")) +
+                                   " n=" + to_string(in->numel()) + why);
+                in->accumulate_grad(parts[i]);
+            } else {
+                in->accumulate_grad(parts[i]);
+            }
         }
     }
     if (profile) {

@@ -289,16 +289,16 @@ pip install nvidia-cudnn-cu12            # Maxwell: nvidia-cudnn-cu12==9.10.2.21
 ```
 
 GPT training step on a GTX 970 (4 layers x 256, batch 8 x 128,
-[tests/bench_gpu_gpt.py](tests/bench_gpu_gpt.py)): Prometheus 21.2 ms
-(48.2k tokens/s), PyTorch 2.14 19.4 ms (52.8k tokens/s), the same step on a
-Ryzen AI 7 350 CPU 208 ms; with RoPE (`--rope`, applied inside the fused
-attention kernel) 25.2 ms. Attention projects Q, K and V in one gemm. Small-CNN training step, batch 64 of 32x32
-([tests/bench_gpu_cnn.py](tests/bench_gpu_cnn.py)): Prometheus 5.8-5.9 ms
-with cuDNN, PyTorch 4.9 ms. Recurrent layers run fused on the GPU (one gemm
+[tests/bench_gpu_gpt.py](tests/bench_gpu_gpt.py)): Prometheus 19.2 ms
+(53.2k tokens/s), PyTorch 2.14 19.1-20.2 ms (51-53k tokens/s), the same step on
+a Ryzen AI 7 350 CPU 208 ms; with RoPE (`--rope`, applied inside the fused
+attention kernel) 19.6-20.6 ms. Attention projects Q, K and V in one gemm. Small-CNN training step, batch 64 of 32x32
+([tests/bench_gpu_cnn.py](tests/bench_gpu_cnn.py)): Prometheus 4.7 ms
+with cuDNN, PyTorch 5.0 ms. Recurrent layers run fused on the GPU (one gemm
 and one gate kernel per step, backward through time on the device); a training
 step over 64 x 32 x 128 -> 256 ([tests/bench_gpu_lstm.py](tests/bench_gpu_lstm.py)):
-LSTM 5.8 ms, GRU 5.8 ms, RNN 2.8-3.5 ms against PyTorch's cuDNN 4.9-5.4,
-4.6-5.5 and 3.3-4.2 ms. The GPU suite is
+LSTM 5.2 ms, GRU 5.5 ms, RNN 2.6 ms against PyTorch's cuDNN 5.0, 4.7 and
+3.2 ms. The GPU suite is
 [tests/test_cuda.cpp](tests/test_cuda.cpp) and
 [tests/test_cuda.py](tests/test_cuda.py): every op and layer against the CPU,
 forward and gradient; CI has no GPU, so there they build and skip.
