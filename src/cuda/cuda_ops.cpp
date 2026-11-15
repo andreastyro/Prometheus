@@ -2789,7 +2789,11 @@ namespace {
 
 const string& RNN_SRC() {
     static const string s = src(R"(
-__device__ float sg(float x) { return 1.0f / (1.0f + expf(-x)); }
+// sigmoid and tanh on the fast exponential (ex2.approx): the gate kernels
+// spent most of their time in five full-precision expf / tanhf per element.
+// Within ~1e-7 of the exact functions; tanh saturates cleanly at +-1.
+__device__ float sg(float x) { return 1.0f / (1.0f + __expf(-x)); }
+__device__ float th(float x) { return 1.0f - 2.0f / (__expf(2.0f * x) + 1.0f); }
 extern "C" __global__ void r_bias_rows(float* y, const float* b, long long rows, int GH) {
     long long i = gid(); if (i >= rows * GH) return;
     y[i] = b[i % GH];
@@ -2802,16 +2806,16 @@ extern "C" __global__ void r_cols(const float* src, float* dst, long long rows, 
 }
 extern "C" __global__ void r_rnn_fwd(float* a, float* h, int BH) {
     int i = (int)gid(); if (i >= BH) return;
-    const float v = tanhf(a[i]); a[i] = v; h[i] = v;
+    const float v = th(a[i]); a[i] = v; h[i] = v;
 }
 extern "C" __global__ void r_lstm_fwd(float* a, const float* c_prev, float* c, float* h, int B, int H) {
     int i = (int)gid(); if (i >= B * H) return;
     const int b = i / H, j = i % H;
     float* ar = a + (long long)b * 4 * H;
-    const float ig = sg(ar[j]), fg = sg(ar[H + j]), og = sg(ar[2 * H + j]), gg = tanhf(ar[3 * H + j]);
+    const float ig = sg(ar[j]), fg = sg(ar[H + j]), og = sg(ar[2 * H + j]), gg = th(ar[3 * H + j]);
     ar[j] = ig; ar[H + j] = fg; ar[2 * H + j] = og; ar[3 * H + j] = gg;
     const float ct = fg * c_prev[i] + ig * gg;
-    c[i] = ct; h[i] = og * tanhf(ct);
+    c[i] = ct; h[i] = og * th(ct);
 }
 extern "C" __global__ void r_gru_fwd1(float* a, const float* h_prev, float* rh, int B, int H) {
     int i = (int)gid(); if (i >= B * H) return;
@@ -2824,7 +2828,7 @@ extern "C" __global__ void r_gru_fwd2(float* a, const float* h_prev, float* h, i
     int i = (int)gid(); if (i >= B * H) return;
     const int b = i / H, j = i % H;
     float* ar = a + (long long)b * 3 * H;
-    const float n = tanhf(ar[2 * H + j]), z = ar[H + j];
+    const float n = th(ar[2 * H + j]), z = ar[H + j];
     ar[2 * H + j] = n;
     h[i] = (1.0f - z) * n + z * h_prev[i];
 }
@@ -2841,7 +2845,7 @@ extern "C" __global__ void r_lstm_back(const float* g, const float* c, const flo
     const float* gr = g + (long long)b * 4 * H;
     float* dr = da + (long long)b * 4 * H;
     const float ig = gr[j], fg = gr[H + j], og = gr[2 * H + j], gg = gr[3 * H + j];
-    const float d = dh[i] + dout[i], tc = tanhf(c[i]);
+    const float d = dh[i] + dout[i], tc = th(c[i]);
     const float dct = dc[i] + d * og * (1.0f - tc * tc);
     dr[j]         = dct * gg * ig * (1.0f - ig);
     dr[H + j]     = dct * c_prev[i] * fg * (1.0f - fg);
@@ -2906,7 +2910,7 @@ TensorPtr rnn(int cell, const TensorPtr& input0, const TensorPtr& h00, const Ten
     const long long SB = (long long)S * B;
     TensorPtr h0 = h00 ? contiguous_on_device(f32(h00, "RNN")) : nullptr;
     TensorPtr c0 = (lstm && c00) ? contiguous_on_device(f32(c00, "RNN")) : nullptr;
-    TensorPtr Wxp, Whp, bp;
+    TensorPtr Wxp, Whp, WhpT, bp;
     {
         NoGrad off;
         vector<TensorPtr> wx, wh, bb;
@@ -2915,6 +2919,10 @@ TensorPtr rnn(int cell, const TensorPtr& input0, const TensorPtr& h00, const Ten
         for (auto& w : b0) bb.push_back(f32(w, "RNN"));
         Wxp = contiguous(concat_op(wx, 1));                    // [I, GH]
         Whp = contiguous(concat_op(wh, 1));                    // [H, GH]
+        // the backward's products with W_h^T as plain NN gemms against a copy
+        // laid out [GH, H]: cuBLAS's NT kernel for 32 x 256 x 256 took 15 us
+        // a step against 9 us for NN on a GTX 970
+        WhpT = contiguous(transpose(Whp, 0, 1));
         bp  = contiguous(concat_op(bb, 0));                    // [GH]
     }
     auto zeros_bh = make_shared<Tensor>(Shape{(long long)BH}, F32, Device::CUDA);   // zeroed
@@ -2996,25 +3004,25 @@ TensorPtr rnn(int cell, const TensorPtr& input0, const TensorPtr& h00, const Ten
             if (cell == 0) {
                 void* a[] = {&gt, &dout, &pdh, &da, &bh2};
                 cuda::launch(RK("r_rnn_back"), BH, a);
-                cuda::sgemm(false, true, B, H, GH, 1.0f, da, GH, cf(Whp), GH, 0.0f, pdh, H);
+                cuda::sgemm(false, false, B, H, GH, 1.0f, da, GH, cf(WhpT), H, 0.0f, pdh, H);
             } else if (lstm) {
                 const float* ct = cf(cs) + (size_t)t * BH;
                 const float* cp = t ? cf(cs) + (size_t)(t - 1) * BH : ci;
                 float* pdc = mf(dc);
                 void* a[] = {&gt, &ct, &cp, &dout, &pdh, &pdc, &da, &b2, &h2};
                 cuda::launch(RK("r_lstm_back"), BH, a);
-                cuda::sgemm(false, true, B, H, GH, 1.0f, da, GH, cf(Whp), GH, 0.0f, pdh, H);
+                cuda::sgemm(false, false, B, H, GH, 1.0f, da, GH, cf(WhpT), H, 0.0f, pdh, H);
             } else {
                 float* pp = mf(dhp);
                 float* pr = mf(drh);
                 void* a1[] = {&gt, &hp, &dout, &pdh, &da, &pp, &b2, &h2};
                 cuda::launch(RK("r_gru_back1"), BH, a1);
                 // through (r * h) @ W_hn
-                cuda::sgemm(false, true, B, H, H, 1.0f, da + 2 * H, GH, cf(Whp) + 2 * H, GH, 0.0f, pr, H);
+                cuda::sgemm(false, false, B, H, H, 1.0f, da + 2 * H, GH, cf(WhpT) + (size_t)2 * H * H, H, 0.0f, pr, H);
                 void* a2[] = {&gt, &hp, &pr, &da, &pp, &b2, &h2};
                 cuda::launch(RK("r_gru_back2"), BH, a2);
                 // through h @ [W_hr W_hz]
-                cuda::sgemm(false, true, B, H, 2 * H, 1.0f, da, GH, cf(Whp), GH, 1.0f, pp, H);
+                cuda::sgemm(false, false, B, H, 2 * H, 1.0f, da, GH, cf(WhpT), H, 1.0f, pp, H);
                 cuda::copy_device(pdh, pp, (size_t)BH * sizeof(float));
             }
         }
