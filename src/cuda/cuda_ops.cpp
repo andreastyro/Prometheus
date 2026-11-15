@@ -9,6 +9,7 @@
 #include "ml/cuda.hpp"
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <functional>
 #include <stdexcept>
 #include <string>
@@ -739,6 +740,9 @@ extern "C" __global__ void i_argmax_rows(const float* a, long long cols, float* 
     if (threadIdx.x == 0) out[blockIdx.x] = (float)si[0];
 }
 // y[i] = x[idx[i]], any element size; a negative index reads as zero
+// the element at a device-held index, and its gradient back into place
+extern "C" __global__ void i_pick(const float* a, const long long* idx, float* y) { y[0] = a[idx[0]]; }
+extern "C" __global__ void i_put(const float* g, const long long* idx, float* dx) { dx[idx[0]] = g[0]; }
 extern "C" __global__ void i_gather(const unsigned char* x, const long long* idx, unsigned char* y,
                                     long long n, int es) {
     long long i = gid(); if (i >= n) return;
@@ -793,15 +797,30 @@ TensorPtr extreme(const char* name, const TensorPtr& a0, bool is_max) {
     int mx = is_max ? 1 : 0;
     void* args[] = {&pa, &n, &mx, &pi};
     cuda::launch(K("i_extreme", INDEX_SRC()), 1, 1, 1, 1024, 1, 1, 0, args);
-    int64_t arg = 0;
-    cuda::copy_to_host(&arg, pi, sizeof arg);
-    auto idx = make_shared<const vector<int64_t>>(1, arg);
-    TensorPtr out;
+    // the value and its gradient read the index on the device: max_op used
+    // to copy it back to the CPU, which stalled the stream every call
+    auto out = empty_cuda({1});
     {
-        NoGrad off;
-        out = gather_flat(a, idx, Shape{1});
+        const void* pidx = pi;
+        void* po = out->storage()->data();
+        void* a2[] = {&pa, &pidx, &po};
+        cuda::launch(K("i_pick", INDEX_SRC()), 1, a2);
     }
-    attach(out, {a}, name, [a, idx](const TensorPtr&, const TensorPtr& G) -> vector<TensorPtr> {
+    attach(out, {a}, name, [a, where_t](const TensorPtr&, const TensorPtr& G) -> vector<TensorPtr> {
+        if (!grad_enabled() && G->dtype() == F32) {
+            auto g = contiguous_on_device(G);
+            auto dx = make_shared<Tensor>(a->shape(), F32, Device::CUDA);           // zeroed
+            const void* pg = base(g);
+            const void* pidx = where_t->storage()->data();
+            void* pd = dx->storage()->data();
+            void* a3[] = {&pg, &pidx, &pd};
+            cuda::launch(K("i_put", INDEX_SRC()), 1, a3);
+            return {dx};
+        }
+        // recorded (higher-order) gradients: the op form, which needs the index on the host
+        int64_t arg = 0;
+        cuda::copy_to_host(&arg, where_t->storage()->data(), sizeof arg);
+        auto idx = make_shared<const vector<int64_t>>(1, arg);
         return {scatter_add_flat(reshape(G, {1}), idx, a->shape())};
     });
     return out;
@@ -1286,6 +1305,44 @@ extern "C" __global__ void o_adam_multi(const MultiTensor* t, const long long* c
         T.w[i] = T.w[i] * decay - lr * (mi / bc1) / (sqrtf(vi / bc2) + eps);
     }
 }
+// Sum of squares of every gradient into one float on the device (zeroed
+// first): a block per chunk, a tree in shared memory, one atomic a block.
+extern "C" __global__ void o_sumsq_multi(const MultiTensor* t, const long long* chunk_start, const int* chunk_tensor,
+                                         float* total) {
+    __shared__ float sh[256];
+    const MultiTensor T = t[chunk_tensor[blockIdx.x]];
+    const long long s = chunk_start[blockIdx.x], e = min(T.n, s + 8192);
+    float acc = 0.0f;
+    for (long long i = s + threadIdx.x; i < e; i += blockDim.x) { const float v = T.g[i]; acc += v * v; }
+    sh[threadIdx.x] = acc;
+    __syncthreads();
+    for (int w = 128; w > 0; w >>= 1) { if (threadIdx.x < w) sh[threadIdx.x] += sh[threadIdx.x + w]; __syncthreads(); }
+    if (threadIdx.x == 0) atomicAdd(total, sh[0]);
+}
+// g *= max_norm / norm where the norm (sqrt of *total, read here on the
+// device) exceeds max_norm: the CPU never waits for the norm to clip
+extern "C" __global__ void o_clip_multi(const MultiTensor* t, const long long* chunk_start, const int* chunk_tensor,
+                                        const float* total, float max_norm) {
+    const float norm = sqrtf(*total);
+    if (!(norm > max_norm)) return;
+    const float c = max_norm / norm;
+    const MultiTensor T = t[chunk_tensor[blockIdx.x]];
+    float* g = (float*)T.g;
+    const long long s = chunk_start[blockIdx.x], e = min(T.n, s + 8192);
+    for (long long i = s + threadIdx.x; i < e; i += blockDim.x) g[i] *= c;
+}
+// the GradScaler's unscale over every gradient: g *= inv, or 0 and a flag
+// where g is not finite
+extern "C" __global__ void o_unscale_multi(const MultiTensor* t, const long long* chunk_start, const int* chunk_tensor,
+                                           float inv, int* bad) {
+    const MultiTensor T = t[chunk_tensor[blockIdx.x]];
+    float* g = (float*)T.g;
+    const long long s = chunk_start[blockIdx.x], e = min(T.n, s + 8192);
+    for (long long i = s + threadIdx.x; i < e; i += blockDim.x) {
+        const float v = g[i];
+        if (isinf(v) || isnan(v)) { *bad = 1; g[i] = 0.0f; } else g[i] = v * inv;
+    }
+}
 // SGD, the same way; m is the velocity (or null for none)
 extern "C" __global__ void o_sgd_multi(const MultiTensor* t, const long long* chunk_start, const int* chunk_tensor,
                                        float lr, float mu) {
@@ -1408,6 +1465,48 @@ void adam_multi(const vector<OptTensor>& ts, float lr, float b1, float b2, float
     const void* po = base_p + ts.size() * 40 + (size_t)chunks * 8;
     void* args[] = {&pt, &ps, &po, &lr, &b1, &b2, &bc1, &bc2, &eps, &decay};
     cuda::launch(K("o_adam_multi", FUSED_SRC()), chunks, 1, 1, 256, 1, 1, 0, args);
+}
+
+float clip_grad_norm_multi(const vector<OptTensor>& ts, float max_norm, double* sum_sq, bool read) {
+    auto total = make_shared<Tensor>(Shape{1}, F32, Device::CUDA);              // zeroed
+    float* pt = static_cast<float*>(total->storage()->data());
+    unsigned chunks = 0;
+    TensorPtr table = ts.empty() ? nullptr : multi_table(ts, chunks);
+    if (chunks) {
+        unsigned char* bp = static_cast<unsigned char*>(table->storage()->data());
+        const void* p1 = bp;
+        const void* p2 = bp + ts.size() * 40;
+        const void* p3 = bp + ts.size() * 40 + (size_t)chunks * 8;
+        void* a1[] = {&p1, &p2, &p3, &pt};
+        cuda::launch(K("o_sumsq_multi", FUSED_SRC()), chunks, 1, 1, 256, 1, 1, 0, a1);
+        if (max_norm >= 0.0f) {
+            void* a2[] = {&p1, &p2, &p3, &pt, &max_norm};
+            cuda::launch(K("o_clip_multi", FUSED_SRC()), chunks, 1, 1, 256, 1, 1, 0, a2);
+        }
+    }
+    if (!read && !sum_sq) return std::numeric_limits<float>::quiet_NaN();   // no wait for the GPU
+    float h = 0.0f;
+    cuda::copy_to_host(&h, pt, sizeof h);        // the one read: the norm the caller returns
+    if (sum_sq) *sum_sq = h;
+    return std::sqrt(h);
+}
+
+bool unscale_multi(const vector<OptTensor>& ts, float inv) {
+    if (ts.empty()) return true;
+    unsigned chunks = 0;
+    auto table = multi_table(ts, chunks);
+    if (!chunks) return true;
+    auto flag = make_shared<Tensor>(Shape{1}, DType::Int32, Device::CUDA);      // zeroed
+    void* pf = flag->storage()->data();
+    unsigned char* bp = static_cast<unsigned char*>(table->storage()->data());
+    const void* p1 = bp;
+    const void* p2 = bp + ts.size() * 40;
+    const void* p3 = bp + ts.size() * 40 + (size_t)chunks * 8;
+    void* args[] = {&p1, &p2, &p3, &inv, &pf};
+    cuda::launch(K("o_unscale_multi", FUSED_SRC()), chunks, 1, 1, 256, 1, 1, 0, args);
+    int bad = 0;
+    cuda::copy_to_host(&bad, pf, sizeof bad);   // one read for every parameter
+    return bad == 0;
 }
 
 void sgd_multi(const vector<OptTensor>& ts, float lr, float mu) {

@@ -22,6 +22,8 @@ ap.add_argument("--batch", type=int, default=8)
 ap.add_argument("--steps", type=int, default=20)
 ap.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
 ap.add_argument("--rope", action="store_true", help="RoPE instead of learned positions (Prometheus only; PyTorch keeps its learned positions)")
+ap.add_argument("--clip", action="store_true", help="clip_grad_norm(1.0) every step, as real training loops do")
+ap.add_argument("--clip-norm", action="store_true", help="with --clip, read the norm back (Prometheus; a sync each step)")
 ap.add_argument("--issue", action="store_true", help="also time how long the CPU takes to issue a step (before waiting for the GPU)")
 args = ap.parse_args()
 
@@ -49,6 +51,8 @@ if args.lib == "prometheus":
         opt.zero_grad()
         loss = p.cross_entropy_sparse_seq(model.forward(x), tg)
         loss.backward()
+        if args.clip:
+            p.clip_grad_norm(model.parameters(), 1.0, return_norm=args.clip_norm)
         opt.step()
         return loss
 
@@ -105,6 +109,8 @@ else:
         opt.zero_grad()
         loss = F.cross_entropy(model(x).view(-1, args.vocab), tg)
         loss.backward()
+        if args.clip:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         return loss
 

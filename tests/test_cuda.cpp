@@ -595,6 +595,60 @@ int main() {
         for (size_t j = 0; j < b.size(); j++) m = std::max(m, std::fabs(a[j] - b[j]));
         CHECK_NEAR("clip_grad_norm: the clipped gradients", (float)m, 0.0f, 1e-6f);
     }
+    {
+        // several parameters, sizes across the 8192-element chunks, with the
+        // norm above max_norm and below it (no change)
+        for (float max_norm : {1.0f, 1e4f}) {
+            std::vector<TensorPtr> lc, lg;
+            int k = 0;
+            for (int n : {20000, 7, 9000, 8192}) {
+                auto pc = std::make_shared<Tensor>(Shape{n});
+                auto pg = pc->to(Device::CUDA);
+                pc->set_requires_grad(true);
+                pg->set_requires_grad(true);
+                std::vector<float> g((size_t)n);
+                for (int j = 0; j < n; j++) g[j] = std::sin(0.013f * j + k) * 0.5f;
+                pc->set_grad(g);
+                pg->set_grad(g);
+                lc.push_back(pc);
+                lg.push_back(pg);
+                k++;
+            }
+            const float nc = clip_grad_norm(lc, max_norm), ng = clip_grad_norm(lg, max_norm);
+            const std::string tag = max_norm < 10.0f ? " (clipping)" : " (under the limit)";
+            CHECK_NEAR(("clip_grad_norm, 4 tensors: the norm" + tag).c_str(), std::fabs(nc - ng) / nc, 0.0f, 1e-5f);
+            double m = 0;
+            for (size_t i = 0; i < lc.size(); i++) {
+                const auto a = lg[i]->grad_doubles(), b = lc[i]->grad_doubles();
+                for (size_t j = 0; j < b.size(); j++) m = std::max(m, std::fabs(a[j] - b[j]));
+            }
+            CHECK_NEAR(("clip_grad_norm, 4 tensors: the gradients" + tag).c_str(), (float)m, 0.0f, 1e-6f);
+        }
+        // max_op / min_op gradients: the plain backward on the device, the
+        // second derivative through the op form
+        auto mc = random_tensor({300}, 88), mg = G(mc);
+        for (bool is_max : {true, false}) {
+            auto a = mc->detach(), b = mg->detach();
+            a->set_requires_grad(true);
+            b->set_requires_grad(true);
+            multiply(3.0f, is_max ? max_op(a) : min_op(a))->backward();
+            multiply(3.0f, is_max ? max_op(b) : min_op(b))->backward();
+            const auto ga = a->grad_doubles(), gb = b->grad_doubles();
+            double m = 0;
+            for (size_t j = 0; j < ga.size(); j++) m = std::max(m, std::fabs(ga[j] - gb[j]));
+            CHECK_TRUE(is_max ? "max_op gradient on the GPU" : "min_op gradient on the GPU", m == 0.0);
+            auto x2 = mg->detach();
+            x2->set_requires_grad(true);
+            auto g1 = autograd::grad(multiply(is_max ? max_op(x2) : min_op(x2), is_max ? max_op(x2) : min_op(x2)),
+                                     {x2}, true)[0];
+            auto g2 = autograd::grad(sum(g1, -1), {x2})[0];      // d/dx of 2 m dm/dx = 2 at the arg, 0 elsewhere
+            const auto h = g2->to_vector();
+            double s = 0;
+            for (float v : h) s += v;
+            CHECK_NEAR(is_max ? "max_op second derivative on the GPU" : "min_op second derivative on the GPU",
+                       (float)s, 2.0f, 1e-5f);
+        }
+    }
 
     // ── the milestone: training a GPT on the GPU tracks the CPU step for step ──
     {
@@ -759,6 +813,21 @@ int main() {
         p1->set_grad(bad);
         CHECK_TRUE("GradScaler: an inf on the GPU is caught", !scaler.unscale({p1}));
         CHECK_TRUE("GradScaler: and zeroed", p1->grad_doubles()[7] == 0.0);
+        // several tensors in one launch: an inf in one of them is caught, the
+        // others are unscaled all the same
+        auto p2 = G(random_tensor({9000}, 89)), p3 = G(random_tensor({33}, 90));
+        p2->set_requires_grad(true);
+        p3->set_requires_grad(true);
+        std::vector<float> gv2(9000, 2048.0f), gv3(33, 1024.0f);
+        gv3[5] = NAN;
+        p2->set_grad(gv2);
+        p3->set_grad(gv3);
+        GradScaler s2(1024.0f);
+        const bool clean2 = s2.unscale({p2, p3});
+        const auto u2 = p2->grad_doubles(), u3 = p3->grad_doubles();
+        CHECK_TRUE("GradScaler, several GPU tensors: a NaN in one is caught", !clean2);
+        CHECK_TRUE("GradScaler, several GPU tensors: the rest unscaled, the NaN zeroed",
+                   u2[0] == 2.0 && u2[8999] == 2.0 && u3[0] == 1.0 && u3[5] == 0.0);
     }
 
     // a CPU leaf that goes to the GPU and back gets its gradient on the CPU

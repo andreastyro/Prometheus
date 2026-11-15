@@ -472,7 +472,10 @@ PYBIND11_MODULE(_C, m) {
     m.def("clip",           &clip);
     m.def("argmax",         &argmax);
     m.def("clip_grad_norm", &clip_grad_norm,
-          py::arg("params"), py::arg("max_norm"));
+          py::arg("params"), py::arg("max_norm"), py::arg("return_norm") = true,
+          "Scale the gradients so their global norm is at most max_norm; returns the norm before. "
+          "On the GPU, return_norm=False skips reading the norm back (returns NaN), so the step "
+          "never waits for the GPU.");
 
     // -------------------------------------------------------------------------
     // Loss

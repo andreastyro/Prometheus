@@ -138,6 +138,15 @@ struct OptTensor { float* w; const float* g; float* m; float* v; long long n; };
 void adam_multi(const std::vector<OptTensor>& ts, float lr, float b1, float b2, float bc1, float bc2, float eps,
                 float decay);
 void sgd_multi(const std::vector<OptTensor>& ts, float lr, float mu);
+/// The global norm of every listed gradient (OptTensor::g), and with
+/// max_norm >= 0 the gradients scaled to it -- the scaling reads the norm on
+/// the device. One read back: the norm returned. sum_sq, if given, gets the
+/// sum of squares.
+float clip_grad_norm_multi(const std::vector<OptTensor>& ts, float max_norm, double* sum_sq = nullptr,
+                           bool read = true);
+/// The GradScaler's unscale over every listed gradient in one launch; false
+/// if any value was not finite (those are zeroed). One read back.
+bool unscale_multi(const std::vector<OptTensor>& ts, float inv);
 double sum_squares(const float* a, int64_t n);
 void scale_inplace(float* a, int64_t n, float c);
 /// g /= scale in place, zeroing non-finite entries; false if there were any

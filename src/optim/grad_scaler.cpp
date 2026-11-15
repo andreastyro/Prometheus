@@ -41,13 +41,15 @@ TensorPtr GradScaler::scale_loss(TensorPtr loss) {
 bool GradScaler::unscale(vector<TensorPtr> params) {
     if (!enabled) return true;
     bool clean = true;
+    // every GPU gradient in one launch and one read of the overflow flag
+    // (it was a launch and a read back per parameter)
+    vector<cuda_ops::OptTensor> gpu;
+    for (auto& p : params)
+        if (p->device() == Device::CUDA && p->has_grad())
+            gpu.push_back({nullptr, device_grad(p), nullptr, nullptr, (long long)p->numel()});
+    if (!cuda_ops::unscale_multi(gpu, 1.0f / scale)) clean = false;
     for (auto& p : params) {
-        if (p->device() == Device::CUDA) {
-            if (p->has_grad() &&
-                !cuda_ops::unscale_inplace(const_cast<float*>(device_grad(p)), p->numel(), 1.0f / scale))
-                clean = false;
-            continue;
-        }
+        if (p->device() == Device::CUDA) continue;
         for (float& g : p->grad_values()) {
             if (std::isinf(g) || std::isnan(g)) {
                 clean = false;
