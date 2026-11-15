@@ -1,5 +1,6 @@
 #pragma once
 #include "ml/tensor.hpp"
+#include <initializer_list>
 #include <vector>
 
 /// Mean Squared Error: average of (pred - target)^2
@@ -64,3 +65,10 @@ TensorPtr cross_entropy_sparse_seq(TensorPtr logits, const std::vector<int>& tar
 /// out-of-range target makes the loss NaN rather than raising, since checking
 /// would mean reading the targets back.
 TensorPtr cross_entropy_sparse_seq(TensorPtr logits, TensorPtr targets);
+
+/// Brace-list targets, `cross_entropy_sparse_seq(logits, {1, 2, 3})`: an exact
+/// match, so the call is not ambiguous between the list and tensor forms (GCC
+/// considers shared_ptr's constructors for a braced list).
+inline TensorPtr cross_entropy_sparse_seq(TensorPtr logits, std::initializer_list<int> targets) {
+    return cross_entropy_sparse_seq(std::move(logits), std::vector<int>(targets));
+}
