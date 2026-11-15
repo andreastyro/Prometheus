@@ -86,11 +86,91 @@ ext = Extension(
 from setuptools.command.build_ext import build_ext as _build_ext
 
 
+import re
+from concurrent.futures import ThreadPoolExecutor
+
+_INCLUDE = re.compile(r'^\s*#\s*include\s*"([^"]+)"', re.M)
+_include_cache = {}
+
+
+def _local_includes(path):
+    """Every header of this project `path` includes, transitively."""
+    if path in _include_cache:
+        return _include_cache[path]
+    _include_cache[path] = set()            # cycles stop here
+    found = set()
+    try:
+        text = open(path, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return found
+    for name in _INCLUDE.findall(text):
+        for base in (os.path.dirname(path), os.path.join(src_root, "include"), os.path.join(src_root, "src")):
+            cand = os.path.normpath(os.path.join(base, name))
+            if os.path.isfile(cand):
+                found.add(cand)
+                found |= _local_includes(cand)
+                break
+    _include_cache[path] = found
+    return found
+
+
+def _stale(source, obj):
+    """The object is missing, or older than the source or any header it includes."""
+    if not os.path.exists(obj):
+        return True
+    t = os.path.getmtime(obj)
+    return any(os.path.getmtime(f) > t for f in [source, *_local_includes(source)])
+
+
 class build_ext(_build_ext):
+    """Per-file incremental, parallel compilation.
+
+    setuptools compiles every source of an extension, one at a time, whenever
+    any of them is out of date. Here only the sources whose object file is
+    older than the source or a project header it includes are recompiled,
+    PROMETHEUS_BUILD_JOBS (default: every core) at once; the rest are linked
+    from the objects already built.
+    """
+
     def finalize_options(self):
         super().finalize_options()
         if not self.parallel:
             self.parallel = int(os.environ.get("PROMETHEUS_BUILD_JOBS", os.cpu_count() or 1))
+
+    def build_extensions(self):
+        compiler = self.compiler
+        original = compiler.compile
+        jobs = max(1, int(self.parallel or 1))
+        # MSVC finds its toolchain on first use: once, before the threads start
+        if hasattr(compiler, "initialized") and not compiler.initialized:
+            compiler.initialize()
+
+        def compile(sources, output_dir=None, macros=None, include_dirs=None, debug=0,
+                    extra_preargs=None, extra_postargs=None, depends=None):
+            objects = compiler.object_filenames(sources, output_dir=output_dir)
+            # objects built with other flags (OpenMP on / off, native) are all stale
+            stamp = os.path.join(output_dir or self.build_temp, "prometheus-flags.txt")
+            flags = repr((sorted(map(str, macros or [])), list(extra_preargs or []), list(extra_postargs or []),
+                          sys.version))
+            same = os.path.exists(stamp) and open(stamp).read() == flags
+            stale = [s for s, o in zip(sources, objects) if not same or _stale(s, o)]
+            if stale:
+                one = lambda s: original([s], output_dir, macros, include_dirs, debug,
+                                         extra_preargs, extra_postargs, depends)
+                if jobs > 1 and len(stale) > 1:
+                    with ThreadPoolExecutor(jobs) as pool:
+                        list(pool.map(one, stale))
+                else:
+                    for s in stale:
+                        one(s)
+            os.makedirs(os.path.dirname(stamp), exist_ok=True)
+            with open(stamp, "w") as f:
+                f.write(flags)
+            print("prometheus: compiled %d of %d sources" % (len(stale), len(sources)))
+            return objects
+
+        compiler.compile = compile
+        super().build_extensions()
 
 
 setup(

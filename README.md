@@ -301,7 +301,14 @@ LSTM 5.2 ms, GRU 5.8 ms (5.0 with `reset_after=True`), RNN 2.6 ms against
 PyTorch's cuDNN 5.0, 4.0-4.7 and 3.2 ms. The GPU suite is
 [tests/test_cuda.cpp](tests/test_cuda.cpp) and
 [tests/test_cuda.py](tests/test_cuda.py): every op and layer against the CPU,
-forward and gradient; CI has no GPU, so there they build and skip.
+forward and gradient; CI has no GPU, so there they build and skip. On a GPU
+machine, `python tests/build_gpu_tests.py --run` builds the C++ suite from the
+objects pip already compiled for the module (one compiler, one compile of the
+library) and runs it. `pip install .` itself rebuilds only the sources whose
+code or included headers changed, in parallel.
+`p.clip_grad_norm(params, max_norm, return_norm=False)` clips on the GPU
+without reading the norm back, so the step never waits for the GPU; the GradScaler
+reads one overflow flag a step.
 
 ### C++
 
