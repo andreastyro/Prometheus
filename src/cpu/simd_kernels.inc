@@ -364,6 +364,19 @@ static void micro(int kc, const float* pa, const float* pb, float* c, int ldc, i
         _mm256_storeu_ps(c + 5 * ldc, c50); _mm256_storeu_ps(c + 5 * ldc + 8, c51);
         return;
     }
+    {
+        // an edge block (rows or columns past the matrix, packed as zeros):
+        // the vector kernel into a zeroed tile, then only the real part added.
+        // The scalar loop below did every edge block's full 6 x 16 x kc
+        // without vectors -- a 32-row product (5 panels and one of 2 rows)
+        // ran at 34 GFLOP/s on one thread, MKL 79
+        float tile[GM * GN];
+        for (int q = 0; q < GM * GN; q++) tile[q] = 0.0f;
+        micro(kc, pa, pb, tile, GN, GM, GN);
+        for (int r = 0; r < mr; r++)
+            for (int q = 0; q < nr; q++) c[(long long)r * ldc + q] += tile[r * GN + q];
+        return;
+    }
 #endif
     float acc[GM][GN];
     for (int r = 0; r < GM; r++)
@@ -395,6 +408,36 @@ void gemm_acc(int ta, int tb, int m, int n, int k, const float* a, int lda, cons
                               c + (long long)(i0 + ip) * ldc + j0 + jp, ldc, mc - ip < GM ? mc - ip : GM,
                               nc - jp < GN ? nc - jp : GN);
             }
+        }
+    }
+}
+
+// Short, wide products (few rows, many threads): A packed once for every
+// k-block and shared by the threads, each packing only its own columns of B.
+// Block p0 of A starts at pa + p0 * mpad (mpad: m rounded up to GM), laid out
+// as pack_a lays out one block.
+void pack_a_all(int ta, const float* a, int lda, int m, int k, float* pa) {
+    const int mpad = (m + GM - 1) / GM * GM;
+    for (int p0 = 0; p0 < k; p0 += GKC) {
+        const int kc = k - p0 < GKC ? k - p0 : GKC;
+        pack_a(ta, a, lda, 0, m, p0, kc, pa + (long long)p0 * mpad);
+        (void)mpad;
+    }
+}
+void gemm_acc_packed_a(int tb, int m, int n, int k, const float* pa, const float* b, int ldb, float* c, int ldc,
+                       float* work) {
+    const int mpad = (m + GM - 1) / GM * GM;
+    float* pb = work;
+    for (int j0 = 0; j0 < n; j0 += GNC) {
+        const int nc = n - j0 < GNC ? n - j0 : GNC;
+        for (int p0 = 0; p0 < k; p0 += GKC) {
+            const int kc = k - p0 < GKC ? k - p0 : GKC;
+            pack_b(tb, b, ldb, p0, kc, j0, nc, pb);
+            const float* pab = pa + (long long)p0 * mpad;
+            for (int jp = 0; jp < nc; jp += GN)
+                for (int ip = 0; ip < m; ip += GM)
+                    micro(kc, pab + (long long)ip * kc, pb + (long long)jp * kc, c + (long long)ip * ldc + j0 + jp, ldc,
+                          m - ip < GM ? m - ip : GM, nc - jp < GN ? nc - jp : GN);
         }
     }
 }

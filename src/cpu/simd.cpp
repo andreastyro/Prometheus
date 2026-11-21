@@ -12,6 +12,8 @@
 #endif
 
 namespace simd_base {
+void pack_a_all(int, const float*, int, int, int, float*);
+void gemm_acc_packed_a(int, int, int, int, const float*, const float*, int, float*, int, float*);
 void gemm_acc(int, int, int, int, int, const float*, int, const float*, int, float*, int, float*);
 void f32_to_bf16(const float*, unsigned short*, long long);
 void bf16_to_f32(const unsigned short*, float*, long long);
@@ -23,6 +25,8 @@ void lstm_fwd_row(const float*, float*, const float*, float*, float*, int, int);
 void lstm_bwd_row(const float*, const float*, const float*, const float*, float*, float*, int, int);
 }
 namespace simd_avx2 {
+void pack_a_all(int, const float*, int, int, int, float*);
+void gemm_acc_packed_a(int, int, int, int, const float*, const float*, int, float*, int, float*);
 void gemm_acc(int, int, int, int, int, const float*, int, const float*, int, float*, int, float*);
 void f32_to_bf16(const float*, unsigned short*, long long);
 void bf16_to_f32(const unsigned short*, float*, long long);
@@ -34,6 +38,8 @@ void lstm_fwd_row(const float*, float*, const float*, float*, float*, int, int);
 void lstm_bwd_row(const float*, const float*, const float*, const float*, float*, float*, int, int);
 }
 namespace simd_avx512 {
+void pack_a_all(int, const float*, int, int, int, float*);
+void gemm_acc_packed_a(int, int, int, int, const float*, const float*, int, float*, int, float*);
 void gemm_acc(int, int, int, int, int, const float*, int, const float*, int, float*, int, float*);
 void f32_to_bf16(const float*, unsigned short*, long long);
 void bf16_to_f32(const unsigned short*, float*, long long);
@@ -194,6 +200,13 @@ void gemm_acc(bool ta, bool tb, int m, int n, int k, const float* a, int lda, co
     par = false;
 #endif
     if (!par) { rows(0, m); return; }
+    std::vector<float> packed_a;
+#ifdef _OPENMP
+    if ((m + 5) / 6 < omp_get_max_threads()) {
+        packed_a.resize((size_t)((m + 5) / 6 * 6) * (size_t)k);
+        SIMD_CALL(pack_a_all, ta ? 1 : 0, a, lda, m, k, packed_a.data());
+    }
+#endif
     #pragma omp parallel
     {
         long long t = 0, nt = 1;
@@ -202,22 +215,23 @@ void gemm_acc(bool ta, bool tb, int m, int n, int k, const float* a, int lda, co
         nt = omp_get_num_threads();
 #endif
         const long long panels = (m + 5) / 6;
-        if (panels >= nt) {
+        if (panels >= nt || packed_a.empty()) {
             // whole 6-row panels per thread
             const long long per = (panels + nt - 1) / nt;
             const int r0 = (int)std::min<long long>(m, t * per * 6), r1 = (int)std::min<long long>(m, (t + 1) * per * 6);
             if (r0 < r1) rows(r0, r1);
         } else {
             // too few rows to go round (32 x 1024 x 256: 6 panels for 16
-            // threads ran at 29 GFLOP/s, MKL 231): 16-column blocks instead
+            // threads ran at 29 GFLOP/s, MKL 231): 16-column blocks, with A
+            // packed once (packed_a, before the region) and shared
             const long long blocks = (n + 15) / 16, per = (blocks + nt - 1) / nt;
             const int j0 = (int)std::min<long long>(n, t * per * 16), j1 = (int)std::min<long long>(n, (t + 1) * per * 16);
             if (j0 < j1) {
                 thread_local std::vector<float> buf;
-                const size_t need = (size_t)72 * 256 + (size_t)256 * 1024;
+                const size_t need = (size_t)256 * 1024;
                 if (buf.size() < need) buf.resize(need);
                 const float* bp = tb ? b + (long long)j0 * ldb : b + j0;
-                SIMD_CALL(gemm_acc, ta ? 1 : 0, tb ? 1 : 0, m, j1 - j0, k, a, lda, bp, ldb, c + j0, ldc, buf.data());
+                SIMD_CALL(gemm_acc_packed_a, tb ? 1 : 0, m, j1 - j0, k, packed_a.data(), bp, ldb, c + j0, ldc, buf.data());
             }
         }
     }
