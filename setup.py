@@ -24,6 +24,7 @@ from setuptools import setup, Extension
 import pybind11
 import glob
 import os
+import platform
 import sys
 
 src_root = os.path.dirname(os.path.abspath(__file__))
@@ -154,9 +155,20 @@ class build_ext(_build_ext):
                           sys.version))
             same = os.path.exists(stamp) and open(stamp).read() == flags
             stale = [s for s, o in zip(sources, objects) if not same or _stale(s, o)]
+            def arch(s):
+                # the AVX2 / AVX-512 builds of the hot loops (src/cpu/simd.cpp picks one at runtime)
+                x86 = platform.machine().lower() in ("x86_64", "amd64", "i386", "i686", "x86")
+                if not x86:
+                    return []
+                if s.endswith("simd_avx2.cpp"):
+                    return ["/arch:AVX2"] if sys.platform == "win32" else ["-mavx2", "-mfma"]
+                if s.endswith("simd_avx512.cpp"):
+                    return ["/arch:AVX512"] if sys.platform == "win32" else \
+                        ["-mavx512f", "-mavx512bw", "-mavx512dq", "-mavx512vl", "-mfma"]
+                return []
             if stale:
                 one = lambda s: original([s], output_dir, macros, include_dirs, debug,
-                                         extra_preargs, extra_postargs, depends)
+                                         extra_preargs, list(extra_postargs or []) + arch(s), depends)
                 if jobs > 1 and len(stale) > 1:
                     with ThreadPoolExecutor(jobs) as pool:
                         list(pool.map(one, stale))

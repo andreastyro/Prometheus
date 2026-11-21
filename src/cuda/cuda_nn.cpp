@@ -80,7 +80,7 @@ extern "C" __global__ void b_layernorm_rows(const float* x, const float* g, cons
 // another branch's gradient: no separate add pass).
 extern "C" __global__ void b_layernorm_rows_w(const float* x, const float* g, const float* dy, float* dx,
                                               int cols, float eps, long long rows, int accum,
-                                              float* pg, float* pb) {
+                                              float* pg, float* pb, int sums) {
     __shared__ float sg[1024], sb[1024];
     for (int j = threadIdx.x; j < cols; j += blockDim.x) { sg[j] = 0.0f; sb[j] = 0.0f; }
     __syncthreads();
@@ -112,11 +112,14 @@ extern "C" __global__ void b_layernorm_rows_w(const float* x, const float* g, co
                 const float xh = (xv[k] - mean) * inv, gd = g[j] * dv[k];
                 a += gd;
                 b += gd * xh;
-                atomicAdd(&sg[j], dv[k] * xh);
-                atomicAdd(&sb[j], dv[k]);
+                if (sums) {
+                    atomicAdd(&sg[j], dv[k] * xh);
+                    atomicAdd(&sb[j], dv[k]);
+                }
             }
         }
         const float m1 = ln_warp_sum(a) / (float)cols, m2 = ln_warp_sum(b) / (float)cols;
+        if (!sums && lane == 0) { pg[r] = mean; pb[r] = inv; }     // for b_layernorm_cols
         float* dxr = dx + r * cols;
         #pragma unroll
         for (int k = 0; k < 32; k++) {
@@ -127,6 +130,7 @@ extern "C" __global__ void b_layernorm_rows_w(const float* x, const float* g, co
             }
         }
     }
+    if (!sums) return;
     __syncthreads();
     const long long o = (long long)blockIdx.x * cols;
     for (int j = threadIdx.x; j < cols; j += blockDim.x) { pg[o + j] = sg[j]; pb[o + j] = sb[j]; }
@@ -216,13 +220,34 @@ vector<TensorPtr> layernorm_backward(const TensorPtr& x0, const TensorPtr& g0, c
     void* pdg = dg->storage()->data();
     void* pdb = db->storage()->data();
     if (rows && cols <= 1024) {
-        // dx and the blocks' gamma / beta partials in one kernel, the partials summed by a second
         int cc = (int)cols, ac = into ? 1 : 0;
         const int blocks = (int)((rows + 7) / 8);
+        // Two ways to the gamma / beta sums. fused: the row kernel folds each
+        // block's rows into shared memory (atomics), b_ln_colsum adds the
+        // blocks -- one read of x and dy (best on the GTX 970). split: the row
+        // kernel only computes dx (and each row's mean / 1/std), and a column
+        // kernel reads x and dy again -- no shared atomics (PyTorch's way).
+        // PROMETHEUS_LN_SPLIT=0 / 1 forces one.
+        static const int split_env = [] {
+            const char* e = std::getenv("PROMETHEUS_LN_SPLIT");
+            return e && *e ? (e[0] == '1' ? 1 : 0) : -1;
+        }();
+        const bool split = split_env == 1 || (split_env == -1 && cuda::compute_capability() >= 80);
+        if (split) {
+            int no = 0;
+            float* pm2 = static_cast<float*>(pm);
+            float* pi2 = static_cast<float*>(pi);
+            void* aw[] = {&px, &pg, &pd, &pdx, &cc, &eps, &rows, &ac, &pm2, &pi2, &no};
+            cuda::launch(K("b_layernorm_rows_w", BACKWARD_SRC()), (unsigned)blocks, 1, 1, 256, 1, 1, 0, aw);
+            void* a2[] = {&px, &pd, &pm, &pi, &pdg, &pdb, &rows, &cols};
+            cuda::launch(K("b_layernorm_cols", BACKWARD_SRC()), cols * ((rows + 31) / 32), a2);
+            return {into ? nullptr : dx, dg, db};
+        }
         auto part = empty_cuda({2LL * blocks * cols});
         float* ppg = static_cast<float*>(part->storage()->data());
         float* ppb = ppg + (size_t)blocks * cols;
-        void* aw[] = {&px, &pg, &pd, &pdx, &cc, &eps, &rows, &ac, &ppg, &ppb};
+        int yes = 1;
+        void* aw[] = {&px, &pg, &pd, &pdx, &cc, &eps, &rows, &ac, &ppg, &ppb, &yes};
         cuda::launch(K("b_layernorm_rows_w", BACKWARD_SRC()), (unsigned)blocks, 1, 1, 256, 1, 1, 0, aw);
         int bl = blocks;
         void* ac2[] = {&ppg, &ppb, &pdg, &pdb, &bl, &cc};

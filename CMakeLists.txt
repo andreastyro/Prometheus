@@ -13,6 +13,10 @@ option(USE_OPENMP   "Parallelise across CPU cores"      OFF)
 set(SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/tensor.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/ops.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/cpu/simd.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/cpu/simd_base.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/cpu/simd_avx2.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/cpu/simd_avx512.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/dtype_ops.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/cuda_runtime.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/cuda_ops.cpp
@@ -204,3 +208,13 @@ add_test(NAME test_gpt COMMAND test_gpt WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE
 add_test(NAME test_gradcheck COMMAND test_gradcheck WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME test_matmul_backend COMMAND test_matmul_backend WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME test_fastmath COMMAND test_fastmath WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+# The hot element-wise loops, built for AVX2 / AVX-512 on their own and chosen
+# at runtime (src/cpu/simd.cpp) -- the rest of the library stays portable.
+if(MSVC)
+    set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/cpu/simd_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+    set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/cpu/simd_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i.86")
+    set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/cpu/simd_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
+    set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/cpu/simd_avx512.cpp PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512dq;-mavx512vl;-mfma")
+endif()

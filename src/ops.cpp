@@ -5,6 +5,7 @@
 #include "ml/fastmath.hpp"
 #include "ml/strided.hpp"
 #include "ops_internal.hpp"
+#include "cpu/simd.hpp"
 #include <cstring>
 #include <unordered_set>
 #include <unordered_map>
@@ -113,7 +114,7 @@ static TensorPtr binary_op(const char* name, TensorPtr a, TensorPtr b) {
                 throw runtime_error("Division by zero at index " + to_string(i));
     }
 
-    auto result = make_shared<Tensor>(out_shape);
+    auto result = make_shared<Tensor>(out_shape, Tensor::Uninitialized{});
     const float* A = a->data();
     const float* Bv = b->data();
     float* C = result->data();
@@ -234,11 +235,14 @@ TensorPtr add(float scalar, TensorPtr a) {
             [=](TensorPtr x) { return add(scalar, x); }, false, false, "u_sadd", scalar, 0.0f))
         return r;
     a = checked_input("add", a);
-    auto result = make_shared<Tensor>(a->shape());
+    // every element is written below: no zero-fill pass, pointers hoisted so the loop vectorises
+    auto result = make_shared<Tensor>(a->shape(), Tensor::Uninitialized{});
+    float* const rd_ = result->data();
+    const float* const ad_ = a->data();
     const int n_3 = a->num_el();
     #pragma omp parallel for schedule(static) if(n_3 >= 32768)
     for (int i = 0; i < n_3; i++)
-        result->data()[i] = scalar + a->data()[i];
+        rd_[i] = scalar + ad_[i];
 
     if (a->requires_grad()) {
         auto node = make_node(result, {a});
@@ -264,11 +268,14 @@ TensorPtr multiply(float scalar, TensorPtr a) {
             [=](TensorPtr x) { return multiply(scalar, x); }, false, false, "u_smul", scalar, 0.0f))
         return r;
     a = checked_input("multiply", a);
-    auto result = make_shared<Tensor>(a->shape());
+    // every element is written below: no zero-fill pass, pointers hoisted so the loop vectorises
+    auto result = make_shared<Tensor>(a->shape(), Tensor::Uninitialized{});
+    float* const rd_ = result->data();
+    const float* const ad_ = a->data();
     const int n_7 = a->num_el();
     #pragma omp parallel for schedule(static) if(n_7 >= 32768)
     for (int i = 0; i < n_7; i++)
-        result->data()[i] = scalar * a->data()[i];
+        rd_[i] = scalar * ad_[i];
 
     if (a->requires_grad()) {
         auto node = make_node(result, {a});
@@ -406,11 +413,14 @@ TensorPtr relu(TensorPtr a) {
         return r;
     a = checked_input("relu", a);
 
-    auto result = make_shared<Tensor>(a->shape());
+    // every element is written below: no zero-fill pass, pointers hoisted so the loop vectorises
+    auto result = make_shared<Tensor>(a->shape(), Tensor::Uninitialized{});
+    float* const rd_ = result->data();
+    const float* const ad_ = a->data();
     const int n_9 = a->num_el();
     #pragma omp parallel for schedule(static) if(n_9 >= 32768)
     for (int i = 0; i < n_9; i++){
-        result->data()[i] = a->data()[i] > 0 ? a->data()[i] : 0.0f;
+        rd_[i] = ad_[i] > 0 ? ad_[i] : 0.0f;
     }
 
     if (a->requires_grad()) {
@@ -444,11 +454,14 @@ TensorPtr sigmoid(TensorPtr a) {
         return r;
     a = checked_input("sigmoid", a);
 
-    auto result = make_shared<Tensor>(a->shape());
+    // every element is written below: no zero-fill pass, pointers hoisted so the loop vectorises
+    auto result = make_shared<Tensor>(a->shape(), Tensor::Uninitialized{});
+    float* const rd_ = result->data();
+    const float* const ad_ = a->data();
     const int n_11 = a->num_el();
     #pragma omp parallel for schedule(static) if(n_11 >= 32768)
     for (int i = 0; i < n_11; i++){
-        result->data()[i] = 1.0f / (1.0f + exp(-a->data()[i]));
+        rd_[i] = 1.0f / (1.0f + exp(-ad_[i]));
     }
 
     if (a->requires_grad()){
@@ -477,11 +490,14 @@ TensorPtr subtract(float scalar, TensorPtr a) {
             [=](TensorPtr x) { return subtract(scalar, x); }, false, false, "u_rsub", scalar, 0.0f))
         return r;
     a = checked_input("subtract", a);
-    auto result = make_shared<Tensor>(a->shape());
+    // every element is written below: no zero-fill pass, pointers hoisted so the loop vectorises
+    auto result = make_shared<Tensor>(a->shape(), Tensor::Uninitialized{});
+    float* const rd_ = result->data();
+    const float* const ad_ = a->data();
     const int n_15 = a->num_el();
     #pragma omp parallel for schedule(static) if(n_15 >= 32768)
     for (int i = 0; i < n_15; i++)
-        result->data()[i] = scalar - a->data()[i];
+        rd_[i] = scalar - ad_[i];
 
     if (a->requires_grad()) {
         auto node = make_node(result, {a});
@@ -505,11 +521,14 @@ TensorPtr subtract(TensorPtr a, float scalar) {
             [=](TensorPtr x) { return subtract(x, scalar); }, false, false, "u_ssub", scalar, 0.0f))
         return r;
     a = checked_input("subtract", a);
-    auto result = make_shared<Tensor>(a->shape());
+    // every element is written below: no zero-fill pass, pointers hoisted so the loop vectorises
+    auto result = make_shared<Tensor>(a->shape(), Tensor::Uninitialized{});
+    float* const rd_ = result->data();
+    const float* const ad_ = a->data();
     const int n_17 = a->num_el();
     #pragma omp parallel for schedule(static) if(n_17 >= 32768)
     for (int i = 0; i < n_17; i++)
-        result->data()[i] = a->data()[i] - scalar;
+        rd_[i] = ad_[i] - scalar;
 
     if (a->requires_grad()) {
         auto node = make_node(result, {a});
@@ -535,13 +554,16 @@ TensorPtr divide(float scalar, TensorPtr a) {
             [=](TensorPtr x) { return divide(scalar, x); }, false, false, "u_rdiv", scalar, 0.0f))
         return r;
     a = checked_input("divide", a);
-    auto result = make_shared<Tensor>(a->shape());
+    // every element is written below: no zero-fill pass, pointers hoisted so the loop vectorises
+    auto result = make_shared<Tensor>(a->shape(), Tensor::Uninitialized{});
+    float* const rd_ = result->data();
+    const float* const ad_ = a->data();
     const int n_21 = a->num_el();
     #pragma omp parallel for schedule(static) if(n_21 >= 32768)
     for (int i = 0; i < n_21; i++) {
-        if (a->data()[i] == 0)
+        if (ad_[i] == 0)
             throw std::runtime_error("Division by zero at index " + std::to_string(i));
-        result->data()[i] = scalar / a->data()[i];
+        rd_[i] = scalar / ad_[i];
     }
 
     if (a->requires_grad()) {
@@ -568,11 +590,14 @@ TensorPtr divide(TensorPtr a, float scalar) {
     a = checked_input("divide", a);
     if (scalar == 0)
         throw std::runtime_error("Division by zero");
-    auto result = make_shared<Tensor>(a->shape());
+    // every element is written below: no zero-fill pass, pointers hoisted so the loop vectorises
+    auto result = make_shared<Tensor>(a->shape(), Tensor::Uninitialized{});
+    float* const rd_ = result->data();
+    const float* const ad_ = a->data();
     const int n_23 = a->num_el();
     #pragma omp parallel for schedule(static) if(n_23 >= 32768)
     for (int i = 0; i < n_23; i++)
-        result->data()[i] = a->data()[i] / scalar;
+        rd_[i] = ad_[i] / scalar;
 
     if (a->requires_grad()) {
         auto node = make_node(result, {a});
@@ -596,11 +621,14 @@ TensorPtr tanh_op(TensorPtr a) {
             [=](TensorPtr x) { return tanh_op(x); }, false, false, "u_tanh", 0.0f, 0.0f))
         return r;
     a = checked_input("tanh_op", a);
-    auto result = make_shared<Tensor>(a->shape());
+    // every element is written below: no zero-fill pass, pointers hoisted so the loop vectorises
+    auto result = make_shared<Tensor>(a->shape(), Tensor::Uninitialized{});
+    float* const rd_ = result->data();
+    const float* const ad_ = a->data();
     const int n_25 = a->num_el();
     #pragma omp parallel for schedule(static) if(n_25 >= 32768)
     for (int i = 0; i < n_25; i++){
-        result->data()[i] = (exp(a->data()[i]) - exp(-a->data()[i])) / (exp(a->data()[i]) + exp(-a->data()[i]));
+        rd_[i] = (exp(ad_[i]) - exp(-ad_[i])) / (exp(ad_[i]) + exp(-ad_[i]));
     }
 
     if (a->requires_grad()){
@@ -687,13 +715,16 @@ TensorPtr log_op(TensorPtr a) {
             [=](TensorPtr x) { return log_op(x); }, false, true, "u_log", 0.0f, 0.0f))
         return r;
     a = checked_input("log_op", a);
-    auto result = make_shared<Tensor>(a->shape());
+    // every element is written below: no zero-fill pass, pointers hoisted so the loop vectorises
+    auto result = make_shared<Tensor>(a->shape(), Tensor::Uninitialized{});
+    float* const rd_ = result->data();
+    const float* const ad_ = a->data();
     const int n_27 = a->num_el();
     #pragma omp parallel for schedule(static) if(n_27 >= 32768)
     for (int i = 0; i < n_27; i++){
-        if (a->data()[i] <= 0)
+        if (ad_[i] <= 0)
             throw runtime_error("Log of non-positive value at index " + to_string(i));
-        result->data()[i] = log(a->data()[i]);
+        rd_[i] = log(ad_[i]);
     }
 
     if (a->requires_grad()) {
@@ -718,11 +749,14 @@ TensorPtr exp_op(TensorPtr a) {
             [=](TensorPtr x) { return exp_op(x); }, false, true, "u_exp", 0.0f, 0.0f))
         return r;
     a = checked_input("exp_op", a);
-    auto result = make_shared<Tensor>(a->shape());
+    // every element is written below: no zero-fill pass, pointers hoisted so the loop vectorises
+    auto result = make_shared<Tensor>(a->shape(), Tensor::Uninitialized{});
+    float* const rd_ = result->data();
+    const float* const ad_ = a->data();
     const int n_29 = a->num_el();
     #pragma omp parallel for schedule(static) if(n_29 >= 32768)
     for (int i = 0; i < n_29; i++){
-        result->data()[i] = exp(a->data()[i]);
+        rd_[i] = exp(ad_[i]);
     }
 
     if (a->requires_grad()) {
@@ -747,11 +781,14 @@ TensorPtr pow_op(TensorPtr a, float p) {
             [=](TensorPtr x) { return pow_op(x, p); }, false, true, "u_pow", p, 0.0f))
         return r;
     a = checked_input("pow_op", a);
-    auto result = make_shared<Tensor>(a->shape());
+    // every element is written below: no zero-fill pass, pointers hoisted so the loop vectorises
+    auto result = make_shared<Tensor>(a->shape(), Tensor::Uninitialized{});
+    float* const rd_ = result->data();
+    const float* const ad_ = a->data();
     const int n_31 = a->num_el();
     #pragma omp parallel for schedule(static) if(n_31 >= 32768)
     for (int i = 0; i < n_31; i++){
-        result->data()[i] = pow(a->data()[i], p);
+        rd_[i] = pow(ad_[i], p);
     }
 
     if (a->requires_grad()) {
@@ -776,14 +813,17 @@ TensorPtr sqrt_op(TensorPtr a) {
             [=](TensorPtr x) { return sqrt_op(x); }, false, false, "u_sqrt", 0.0f, 0.0f))
         return r;
     a = checked_input("sqrt_op", a);
-    auto result = make_shared<Tensor>(a->shape());
+    // every element is written below: no zero-fill pass, pointers hoisted so the loop vectorises
+    auto result = make_shared<Tensor>(a->shape(), Tensor::Uninitialized{});
+    float* const rd_ = result->data();
+    const float* const ad_ = a->data();
     const int n_33 = a->num_el();
     #pragma omp parallel for schedule(static) if(n_33 >= 32768)
     for (int i = 0; i < n_33; i++){
-        if (a->data()[i] < 0)
+        if (ad_[i] < 0)
             throw runtime_error("Cannot compute square root of negative value " +
-                                to_string(a->data()[i]) + " at index " + to_string(i));
-        result->data()[i] = sqrt(a->data()[i]);
+                                to_string(ad_[i]) + " at index " + to_string(i));
+        rd_[i] = sqrt(ad_[i]);
     }
 
     if (a->requires_grad()) {
@@ -808,11 +848,14 @@ TensorPtr abs_op(TensorPtr a) {
             [=](TensorPtr x) { return abs_op(x); }, true, false, "u_abs", 0.0f, 0.0f))
         return r;
     a = checked_input("abs_op", a);
-    auto result = make_shared<Tensor>(a->shape());
+    // every element is written below: no zero-fill pass, pointers hoisted so the loop vectorises
+    auto result = make_shared<Tensor>(a->shape(), Tensor::Uninitialized{});
+    float* const rd_ = result->data();
+    const float* const ad_ = a->data();
     const int n_35 = a->num_el();
     #pragma omp parallel for schedule(static) if(n_35 >= 32768)
     for (int i = 0; i < n_35; i++){
-        result->data()[i] = abs(a->data()[i]);
+        rd_[i] = abs(ad_[i]);
     }
 
     if (a->requires_grad()){
@@ -1100,19 +1143,20 @@ TensorPtr gelu(TensorPtr a) {
             [=](TensorPtr x) { return gelu(x); }, false, false, "u_gelu", 0.0f, 0.0f))
         return r;
     a = checked_input("gelu", a);
-    auto result = make_shared<Tensor>(a->shape());
+    // every element is written below: no zero-fill pass, pointers hoisted so the loop vectorises
+    auto result = make_shared<Tensor>(a->shape(), Tensor::Uninitialized{});
+    float* const rd_ = result->data();
+    const float* const ad_ = a->data();
     int n = a->num_el();
     constexpr float kSqrt2OverPi = 0.7978845608f;
 
     // gelu was missed when the other elementwise ops were parallelised -- it
     // bounds its loop with a local, not num_el() -- and tanhf is an opaque
     // call that kept it to one lane besides
-    #pragma omp parallel for schedule(static) if(n >= 32768)
-    for (int i = 0; i < n; i++) {
-        float x = a->data()[i];
-        float inner = kSqrt2OverPi * (x + 0.044715f * x * x * x);
-        result->data()[i] = 0.5f * x * (1.0f + fastmath::tanh(inner));
-    }
+    // pointers hoisted: a->data() per element is a call the compiler cannot
+    // prove constant, which kept the loop from vectorising
+    (void)kSqrt2OverPi;
+    simd::gelu_fwd(a->data(), result->data(), n);      // AVX-512 / AVX2 / portable, chosen at runtime
 
     if (a->requires_grad()) {
         auto node = make_node(result, {a});
@@ -1129,17 +1173,7 @@ TensorPtr gelu(TensorPtr a) {
             return {multiply(G, add(left, right))};
         };
         node->backward_fn = [a](const TensorPtr& result) {
-            constexpr float k = 0.7978845608f;
-            int m = a->num_el();
-            #pragma omp parallel for schedule(static) if(m >= 32768)
-            for (int i = 0; i < m; i++) {
-                float x = a->data()[i];
-                float inner = k * (x + 0.044715f * x * x * x);
-                float t = fastmath::tanh(inner);
-                float d_inner = k * (1.0f + 3.0f * 0.044715f * x * x);
-                float grad = 0.5f * (1.0f + t) + 0.5f * x * (1.0f - t * t) * d_inner;
-                a->grad()[i] += result->grad()[i] * grad;
-            }
+            simd::gelu_bwd(a->data(), result->grad(), a->grad(), a->num_el());
         };
     }
 
@@ -1515,19 +1549,28 @@ TensorPtr linear_op(TensorPtr x, TensorPtr W, TensorPtr bias, TensorPtr residual
             // bias: sum over rows, parallel over the output feature so each
             // thread owns its own slot
             if (bias && bias->requires_grad()) {
-                #pragma omp parallel for schedule(static) if(out >= 256)
-                for (int j = 0; j < out; j++) {
-                    float acc = 0.0f;
-                    for (int r = 0; r < rows; r++) acc += g[(size_t)r * out + j];
-                    bias->grad()[j] += acc;
+                // column sums, a row at a time across all columns (contiguous,
+                // vectorised) into per-thread rows, then added
+                float* gb = bias->grad();
+                #pragma omp parallel if((long long)rows * out >= 65536)
+                {
+                    std::vector<float> acc((size_t)out, 0.0f);
+                    #pragma omp for schedule(static) nowait
+                    for (int r = 0; r < rows; r++) {
+                        const float* gr = g + (size_t)r * out;
+                        for (int j = 0; j < out; j++) acc[j] += gr[j];
+                    }
+                    #pragma omp critical
+                    for (int j = 0; j < out; j++) gb[j] += acc[j];
                 }
             }
 
             // residual: the gradient passes straight through
             if (residual && residual->requires_grad()) {
                 const int n = rows * out;
+                float* gr = residual->grad();
                 #pragma omp parallel for schedule(static) if(n >= 32768)
-                for (int i = 0; i < n; i++) residual->grad()[i] += g[i];
+                for (int i = 0; i < n; i++) gr[i] += g[i];
             }
         };
     }
