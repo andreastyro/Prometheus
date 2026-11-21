@@ -58,29 +58,50 @@ bool is_floating(DType d) {
 
 // fp16: 1 sign, 5 exponent, 10 mantissa bits. Values too small for a normal
 // fp16 flush to zero and values too large saturate to infinity.
+// IEEE-754 binary16 <-> binary32, exact: round to nearest even, subnormals
+// kept (not flushed), infinities and NaNs kept (a NaN stays a quiet NaN).
+// Checked against numpy over zeros, subnormals, the normal boundaries,
+// overflow, infinity and NaN (tests/test_dtypes.py).
 static uint16_t f32_to_f16(float f) {
     uint32_t x;
     memcpy(&x, &f, 4);
-    uint16_t sign = (x >> 16) & 0x8000;
-    int32_t  exp  = ((x >> 23) & 0xFF) - 127 + 15;
-    uint32_t mant = x & 0x7FFFFF;
-    if (exp <= 0)  return sign;
-    if (exp >= 31) return sign | 0x7C00;
-    // round to nearest even on the 13 bits dropped
-    uint32_t half = mant >> 13, rest = mant & 0x1FFF;
-    uint16_t h = sign | (uint16_t)(exp << 10) | (uint16_t)half;
-    if (rest > 0x1000 || (rest == 0x1000 && (half & 1))) h++;
-    return h;
+    const uint16_t sign = (uint16_t)((x >> 16) & 0x8000);
+    const uint32_t e32 = (x >> 23) & 0xFF, mant = x & 0x7FFFFF;
+    if (e32 == 0xFF) return sign | 0x7C00 | (mant ? 0x200 : 0);          // inf, or a quiet NaN
+    const int32_t exp = (int32_t)e32 - 127 + 15;
+    if (exp >= 31) return sign | 0x7C00;                                  // overflow -> inf
+    if (exp <= 0) {                                                        // a half subnormal (or 0)
+        if (exp < -10) return sign;                                       // under half of the smallest
+        const uint32_t m = mant | 0x800000, shift = (uint32_t)(14 - exp);
+        uint32_t h = m >> shift;
+        const uint32_t rest = m & ((1u << shift) - 1), half = 1u << (shift - 1);
+        if (rest > half || (rest == half && (h & 1))) h++;                 // may round up into the normals
+        return sign | (uint16_t)h;
+    }
+    uint32_t h = ((uint32_t)exp << 10) | (mant >> 13);
+    const uint32_t rest = mant & 0x1FFF;
+    if (rest > 0x1000 || (rest == 0x1000 && (h & 1))) h++;                // may carry into inf: correct
+    return sign | (uint16_t)h;
 }
 
 static float f16_to_f32(uint16_t h) {
-    uint32_t sign = (uint32_t)(h & 0x8000) << 16;
-    int32_t  exp  = (h >> 10) & 0x1F;
-    uint32_t mant = h & 0x3FF;
+    const uint32_t sign = (uint32_t)(h & 0x8000) << 16;
+    const uint32_t exp = (h >> 10) & 0x1F, mant = h & 0x3FF;
     uint32_t x;
-    if (exp == 0)       x = sign | (mant << 13);
-    else if (exp == 31) x = sign | 0x7F800000 | (mant << 13);
-    else                x = sign | ((uint32_t)(exp + 127 - 15) << 23) | (mant << 13);
+    if (exp == 0) {
+        if (mant == 0) {
+            x = sign;                                                      // +-0
+        } else {                                                           // subnormal: normalise
+            int32_t e = -1;
+            uint32_t m = mant;
+            do { m <<= 1; e++; } while (!(m & 0x400));
+            x = sign | ((uint32_t)(127 - 15 - e) << 23) | ((m & 0x3FF) << 13);
+        }
+    } else if (exp == 31) {
+        x = sign | 0x7F800000 | (mant << 13);                              // inf / NaN
+    } else {
+        x = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+    }
     float f;
     memcpy(&f, &x, 4);
     return f;

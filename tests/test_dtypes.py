@@ -247,6 +247,34 @@ def test_autocast():
     check("GradScaler: scaled float16 backward unscales to finite grads", clean and np.isfinite(g16).all())
 
 
+def test_half_edge_cases():
+    print("\n=== float16 / bfloat16 conversions: zeros, subnormals, boundaries, inf, NaN ===\n")
+    vals = np.array([0.0, -0.0, 5.96e-8, -5.96e-8, 2.98e-8, 2.99e-8, 1e-7, 6.0e-5, 6.1035156e-5, 6.104e-5,
+                     1.0, 65504.0, 65519.0, 65520.0, 1e5, -1e5, np.inf, -np.inf, np.nan, 3.14159, -2.5e-6],
+                    dtype=np.float32)
+    ref16 = vals.astype(np.float16)
+    n = len(vals)
+    two = p.Tensor([2, n], np.concatenate([vals, vals]).tolist())
+    for name, x in [("contiguous", p.Tensor([n], vals.tolist())),
+                    ("strided: the element-by-element path", p.transpose(two))]:   # [n, 2], not contiguous
+        h = x.to(p.float16)
+        back = np.array(h.to(p.float32).numpy()).reshape(-1) if name == "contiguous" else             np.array(h.to(p.float32).numpy())[:, 0]
+        want = ref16.astype(np.float32)
+        same = all((np.isnan(a) and np.isnan(b)) or (a == b and np.signbit(a) == np.signbit(b))
+                   for a, b in zip(back, want))
+        check("float16 round trip matches numpy (%s)" % name, same)
+    # every float16 bit pattern read back as numpy reads it
+    bits = np.arange(65536, dtype=np.uint32).astype(np.uint16)
+    every = bits.view(np.float16).astype(np.float32)
+    h = p.Tensor([65536], every.tolist()).to(p.float16)
+    back = np.array(h.to(p.float32).numpy()).reshape(-1)
+    ok = np.array_equal(np.isnan(back), np.isnan(every)) and np.array_equal(back[~np.isnan(every)], every[~np.isnan(every)])
+    check("all 65536 float16 values survive float32 -> float16 -> float32", ok)
+    # element access (the scalar path): a float16 subnormal read as its value
+    s = p.Tensor([1], [5.960464477539063e-08]).to(p.float16)
+    check("float16 subnormal 0x0001 reads as 5.96e-8", abs(float(np.array(s.to(p.float32).numpy()).reshape(-1)[0]) - 5.960464477539063e-08) < 1e-12)
+
+
 def main():
     print("Dtypes")
     test_promotion()
@@ -254,6 +282,7 @@ def main():
     test_float64()
     test_half()
     test_autocast()
+    test_half_edge_cases()
     print("\n%d checks, %d failed" % (CHECKS[0], len(FAILURES)))
     print("PASS" if not FAILURES else "FAIL")
     sys.exit(1 if FAILURES else 0)

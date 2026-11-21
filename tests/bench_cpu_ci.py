@@ -2,7 +2,8 @@
 # slowdown: each model's time over PyTorch's must stay under a limit. Ratios,
 # not absolute times, so the varying speed of CI machines cancels out. The
 # limits are today's ratios on a Ryzen AI 7 350 (GPT ~1.0, CNN ~1.07, LSTM
-# ~1.45) with room for the noise of a shared runner.
+# ~1.45) with room for the noise of a shared runner. Both sides need the
+# same BLAS (MKL): against OpenBLAS the comparison measures the library.
 #
 #   python tests/bench_cpu_ci.py
 import os
@@ -27,6 +28,8 @@ def median(script, lib, args):
     return float(m.group(1))
 
 
+import prometheus as p
+print("Prometheus:", p.backend(), "| PyTorch:", __import__("torch").__config__.parallel_info().splitlines()[0:3])
 failed = []
 print("| Model | Prometheus | PyTorch | ratio | limit |")
 print("|---|---|---|---|---|")
