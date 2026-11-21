@@ -841,6 +841,15 @@ void Tensor::backward() {
             NoGrad off;
             parts = node->backward_graph(t, parts_g);
         }
+        // A GPU intermediate's gradient is done with once its node has run.
+        // Let it go: an input handed the very same buffer (a cast to the dtype
+        // it already has, a reshape, an add's pass-through) then takes it over
+        // instead of copying it -- under bf16 autocast those copies were ~2 ms
+        // of a 12-layer GPT step. Leaves (parameters) keep theirs.
+        if (t->device() == Device::CUDA && t->grad_fn()) {
+            parts_g.reset();
+            t->release_grad_buffer();
+        }
         for (size_t i = 0; i < node->inputs.size() && i < parts.size(); i++) {
             const TensorPtr& in = node->inputs[i];
             if (!(parts[i] && in && in->requires_grad())) continue;

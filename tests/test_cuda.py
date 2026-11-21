@@ -183,6 +183,24 @@ def test_fuse():
     check("fuse: GPU kernel matches the ops on the CPU", np.abs(out["cuda"][0] - out["cpu"][0]).max() < 1e-4)
     check("fuse: gradient of each input (one broadcast)",
           np.abs(out["cuda"][1] - out["cpu"][1]).max() < 1e-3 and np.abs(out["cuda"][2] - out["cpu"][2]).max() < 1e-3)
+    # a single same-shape op: library or generated kernel, chosen by timing both once
+    from prometheus.compiler import executor
+    add = p.fuse(lambda a, b: a * b)
+    r = add(T(xv).cuda(), T(xv).cuda())
+    check("fuse: single op measured, the faster kept, the result right",
+          ("mul", tuple(xv.shape)) in executor.tuned() and np.abs(r.cpu().numpy() - xv * xv).max() < 1e-5)
+
+    # half inputs stay half: read and written in their dtype, computed in float32
+    xh, th = T(xv).cuda().to(p.float16), T(tv).cuda().to(p.float16)
+    xh.requires_grad = True
+    yh = fused(xh, th)
+    p.sum(p.reshape(yh, [-1]), -1).backward()
+    y32 = fused(T(xv).cuda(), T(tv).cuda())
+    check("fuse: float16 in, float16 out", yh.dtype == p.float16)
+    check("fuse: float16 result within half precision of float32",
+          np.abs(yh.to(p.float32).cpu().numpy() - y32.cpu().numpy()).max() / np.abs(y32.cpu().numpy()).max() < 5e-3)
+    check("fuse: float16 input gets a gradient", np.isfinite(np.array(xh.grad)).all())
+
     # a reduction inside: two generated kernels around the library's mean
     def loss(x, t):
         y = x * p.fx.sigmoid(x) - t

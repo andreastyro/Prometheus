@@ -1820,16 +1820,18 @@ void scale_inplace(float* a, int64_t n, float c) {
 namespace {
 constexpr int FUSE_MAX = 8;
 struct FuseIn {
-    const float* p[FUSE_MAX];
+    const void* p[FUSE_MAX];
     Index ix[FUSE_MAX];
+    int io[FUSE_MAX];          // each input's dtype: 0 float32, 2 float16, 3 bfloat16
 };
 struct FuseOut {
     float* p[FUSE_MAX];
+    int atom[FUSE_MAX];        // 1: p is the input's own (zeroed) shape, added into atomically
 };
 const char* const FUSE_HELPERS = R"(
 #define FUSE_MAX 8
-struct FuseIn { const float* p[FUSE_MAX]; Index ix[FUSE_MAX]; };
-struct FuseOut { float* p[FUSE_MAX]; };
+struct FuseIn { const void* p[FUSE_MAX]; Index ix[FUSE_MAX]; int io[FUSE_MAX]; };
+struct FuseOut { float* p[FUSE_MAX]; int atom[FUSE_MAX]; };
 __device__ __forceinline__ float f_sigmoid(float v) { return 1.0f / (1.0f + expf(-v)); }
 __device__ __forceinline__ float f_gelu(float v) { return 0.5f * v * (1.0f + tanhf(0.7978845608f * (v + 0.044715f * v * v * v))); }
 __device__ __forceinline__ float f_gelu_d(float v) {
@@ -1849,16 +1851,19 @@ const string& fuse_source(const string& fwd, const string& bwd, const vector<int
     if (it != cache.end()) return it->second;
     string loads;
     for (int j = 0; j < k; j++)
-        loads += "    const float x" + to_string(j) + " = in.p[" + to_string(j) + "][at(in.ix[" + to_string(j) + "], i)];\n";
+        loads += "    const float x" + to_string(j) + " = ldx(in.p[" + to_string(j) + "], in.io[" + to_string(j) +
+                 "], at(in.ix[" + to_string(j) + "], i));\n";
     string body = string(FUSE_HELPERS) +
-        "extern \"C\" __global__ void fz_fwd(FuseIn in, float* y, long long n) {\n"
-        "    const long long i = gid(); if (i >= n) return;\n" + loads + fwd + "\n    y[i] = out;\n}\n"
+        "extern \"C\" __global__ void fz_fwd(FuseIn in, void* y, int yio, long long n) {\n"
+        "    const long long i = gid(); if (i >= n) return;\n" + loads + fwd + "\n    stx(y, yio, i, out);\n}\n"
         "extern \"C\" __global__ void fz_bwd(FuseIn in, const float* G, FuseOut o, long long n) {\n"
         "    const long long i = gid(); if (i >= n) return;\n" + loads +
         "    const float g = G[i];\n" + bwd + "\n";
     for (int j = 0; j < k; j++)
         if (mask[j])                           // null: that input needs no gradient
-            body += "    if (o.p[" + to_string(j) + "]) o.p[" + to_string(j) + "][i] = d" + to_string(j) + ";\n";
+            body += "    if (o.p[" + to_string(j) + "]) { if (o.atom[" + to_string(j) + "]) atomicAdd(o.p[" +
+                    to_string(j) + "] + at(in.ix[" + to_string(j) + "], i), d" + to_string(j) + "); else o.p[" +
+                    to_string(j) + "][i] = d" + to_string(j) + "; }\n";
     body += "}\n";
     return cache.emplace(key, src(body.c_str())).first->second;
 }
@@ -1871,22 +1876,31 @@ TensorPtr fused_map(const string& fwd, const string& bwd, const vector<int>& mas
     const int k = (int)inputs0.size();
     if (k < 1 || k > FUSE_MAX) throw runtime_error("fuse: 1 to 8 tensor inputs");
     if ((int)mask.size() != k) throw runtime_error("fuse: one gradient flag per input");
+    // float16 / bfloat16 inputs are read as they are (computed in float32); the
+    // result is in that half dtype when every input has it, else float32
+    auto io_of = [](DType d) { return d == DType::BFloat16 ? 3 : d == DType::Float16 ? 2 : 0; };
     vector<TensorPtr> in;
     Shape shape;
     for (int j = 0; j < k; j++) {
-        in.push_back(f32(inputs0[j], "fuse"));
+        const DType d = inputs0[j]->dtype();
+        in.push_back(io_of(d) ? on_device(inputs0[j], "fuse") : f32(inputs0[j], "fuse"));
         shape = j ? broadcast_shapes(shape, in[j]->shape()) : in[j]->shape();
     }
+    DType od = in[0]->dtype();
+    for (auto& t : in) if (t->dtype() != od) od = F32;
+    if (!io_of(od)) od = F32;
     const string& source = fuse_source(fwd, bwd, mask, k);
-    auto out = empty_cuda(shape);
+    auto out = empty_cuda(shape, od);
     FuseIn fi{};
     for (int j = 0; j < k; j++) {
-        fi.p[j] = static_cast<const float*>(base(in[j]));
+        fi.p[j] = base(in[j]);
         fi.ix[j] = index_for(in[j], shape);
+        fi.io[j] = io_of(in[j]->dtype());
     }
-    float* py = static_cast<float*>(out->storage()->data());
+    void* py = out->storage()->data();
+    int yio = io_of(od);
     long long n = out->numel();
-    void* a[] = {&fi, &py, &n};
+    void* a[] = {&fi, &py, &yio, &n};
     if (n) cuda::launch(K("fz_fwd", source), n, a);
     const string* srcp = &source;                  // in the never-destroyed cache
     attach(out, in, "fuse", [in, mask, shape, n, srcp, higher](const TensorPtr&, const TensorPtr& G0) -> vector<TensorPtr> {
@@ -1906,11 +1920,18 @@ TensorPtr fused_map(const string& fwd, const string& bwd, const vector<int>& mas
         FuseOut fo{};
         vector<TensorPtr> full(kk);
         for (int j = 0; j < kk; j++) {
-            fi.p[j] = static_cast<const float*>(base(in[j]));
+            fi.p[j] = base(in[j]);
             fi.ix[j] = index_for(in[j], shape);
+            fi.io[j] = in[j]->dtype() == DType::BFloat16 ? 3 : in[j]->dtype() == DType::Float16 ? 2 : 0;
             if (in[j]->requires_grad() && mask[j]) {
-                full[j] = empty_cuda(shape);
+                // a broadcast input, contiguous, at most 256 outputs per element:
+                // its gradient added into its own shape inside the kernel -- no
+                // output-sized buffer, no separate reduction
+                const int64_t ne = in[j]->numel();
+                const bool atom = in[j]->shape() != shape && in[j]->is_contiguous() && ne > 0 && n / ne <= 256;
+                full[j] = atom ? make_shared<Tensor>(in[j]->shape(), F32, Device::CUDA) : empty_cuda(shape);
                 fo.p[j] = static_cast<float*>(full[j]->storage()->data());
+                fo.atom[j] = atom ? 1 : 0;
             }
         }
         const float* pg = static_cast<const float*>(base(G));
@@ -1920,6 +1941,7 @@ TensorPtr fused_map(const string& fwd, const string& bwd, const vector<int>& mas
         vector<TensorPtr> r(kk);
         for (int j = 0; j < kk; j++)
             if (full[j]) r[j] = full[j]->shape() == in[j]->shape() ? full[j] : sum_to(full[j], in[j]->shape());
+            // (an atomic one already has the input's shape)
         return r;
     });
     return out;

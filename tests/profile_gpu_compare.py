@@ -9,9 +9,10 @@ import sys
 here = os.path.dirname(os.path.abspath(__file__))
 size = ["--layers", "12", "--embed", "768", "--heads", "12", "--seq", "256", "--batch", "8",
         "--amp", "bf16", "--top", "30"] + sys.argv[1:]
-for label, args in [("Prometheus", ["prometheus"]), ("PyTorch eager", ["torch"]),
-                    ("torch.compile", ["torch", "--compile"])]:
+for label, args, env in [("Prometheus", ["prometheus"], {}),
+                         ("Prometheus, flash attention", ["prometheus"], {"PROMETHEUS_ATTENTION": "flash"}),
+                         ("PyTorch eager", ["torch"], {})]:
     print("\n==== %s ====" % label, flush=True)
     out = subprocess.run([sys.executable, os.path.join(here, "profile_gpu_gpt.py")] + args + size,
-                         capture_output=True, text=True)
+                         capture_output=True, text=True, env=dict(os.environ, **env))
     print((out.stdout + out.stderr).strip()[-6000:], flush=True)

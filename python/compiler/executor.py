@@ -80,8 +80,8 @@ def _run_region(graph, root, env):
 #   reshape, transpose          -> views: no kernel
 #   an element-wise region      -> one generated kernel (codegen + NVRTC)
 #     ... of a single op whose inputs all have the output's shape
-#                               -> the library's own kernel (vectorised float4
-#                                  loads, nothing to compile) instead
+#                               -> the library's own kernel or the generated
+#                                  one, whichever measured faster (_choose)
 _SINGLE = {"add": "add", "sub": "subtract", "mul": "multiply", "div": "divide",
            "exp": "exp_op", "log": "log_op", "sqrt": "sqrt_op", "abs": "abs_op", "tanh": "tanh_op",
            "sigmoid": "sigmoid", "relu": "relu", "gelu": "gelu"}
@@ -101,6 +101,45 @@ def backend(graph, v):
             return "library-elementwise"
         return "generated"
     return "none"
+
+
+# Where both the library and a generated kernel can run a value (a single
+# same-shape element-wise op), the first run with each (op, shape) times both
+# and keeps the faster -- not during a CUDA Graph capture, which cannot wait
+# for the GPU (the rule above decides there). tuned() shows the choices.
+_tuned = {}
+
+
+def tuned():
+    """The measured choices so far: (op, shape) -> "library" or "generated"."""
+    return dict(_tuned)
+
+
+def _time(fn, reps=3):
+    import time
+    fn()
+    _C.cuda_synchronize()
+    t0 = time.perf_counter()
+    for _ in range(reps):
+        fn()
+    _C.cuda_synchronize()
+    return time.perf_counter() - t0
+
+
+def _choose(graph, v, env):
+    key = (v.op, tuple(v.shape))
+    if key not in _tuned:
+        if _C.cuda_capturing():
+            return "library"
+        was = _C.is_grad_enabled()
+        _C.set_grad_enabled(False)
+        try:
+            lib = _time(lambda: _run_library(v, env))
+            gen = _time(lambda: _run_region(graph, v, env))
+        finally:
+            _C.set_grad_enabled(was)
+        _tuned[key] = "library" if lib <= gen else "generated"
+    return _tuned[key]
 
 
 def _run_library(v, env):
@@ -187,7 +226,9 @@ def run(graph, tensors):
     last = _last_use(graph, order)
     for step, v in enumerate(order):
         b = backend(graph, v)
-        if b == "generated" or (b == "library-elementwise" and any(a.id not in env for a in v.args)):
+        if b == "library-elementwise":
+            b = "generated" if any(a.id not in env for a in v.args) else _choose(graph, v, env)
+        if b == "generated":
             env[v.id] = _run_region(graph, v, env)
         else:
             env[v.id] = _run_library(v, env)

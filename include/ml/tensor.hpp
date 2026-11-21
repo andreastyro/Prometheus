@@ -236,6 +236,9 @@ public:
     void ensure_grad();
     /// Allocate if needed and zero.
     void zero_grad();
+    /// Drop a GPU tensor's gradient buffer (backward(), for intermediates
+    /// whose node has run: see Tensor::backward).
+    void release_grad_buffer() { grad_dev_.reset(); }
     void reset_grad() { zero_grad(); }
 
     const std::shared_ptr<GradNode>& grad_fn() const { return grad_fn_; }

@@ -716,13 +716,14 @@ static const string& FATC_SRC(int D, int io) {
 // [D][BC] where it reads them along BC. S = R C^T is built per tile, turned
 // into probabilities with the row statistics, and multiplied on: the
 // accumulator fragment of S lines up with the A operand of the next product,
-// so P never leaves registers. Fragment layouts are PTX's for m16n8k16:
+// so P never leaves registers. Fragments come from shared memory through
+// ldmatrix (.trans where the product reads a tile along its rows), so every
+// tile is stored once, row-major, loaded 16 bytes at a time. Fragment layouts are PTX's for m16n8k16:
 // g = lane / 4 picks the row (g and g + 8), t = lane % 4 the column pair.
 #define BR 64
 #define BC (FA_D <= 64 ? 64 : 32)
 #define NT (BC / 8)
 #define KP (FA_D + 8)
-#define TP (BC + 8)
 #define LOG2E 1.4426950408889634f
 #define FA_INF __int_as_float(0x7f800000)
 
@@ -754,28 +755,29 @@ __device__ __forceinline__ float hf(unsigned short h) {
     return h2f(h);
 #endif
 }
+__device__ __forceinline__ unsigned smem(const void* p) {
+    unsigned a;
+    asm("{ .reg .u64 t; cvta.to.shared.u64 t, %1; cvt.u32.u64 %0, t; }" : "=r"(a) : "l"(p));
+    return a;
+}
+// two 8 x 8 matrices from shared memory as an mma B fragment: lanes 0-15
+// give the row addresses (the rest are ignored)
+__device__ __forceinline__ void ldm2(unsigned* b, const unsigned short* p) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];" : "=r"(b[0]), "=r"(b[1]) : "r"(smem(p)));
+}
+__device__ __forceinline__ void ldm2t(unsigned* b, const unsigned short* p) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];" : "=r"(b[0]), "=r"(b[1]) : "r"(smem(p)));
+}
 // rows [r0, r0 + rows) of a [B*S, *] half matrix (row stride ld, head column
-// offset co) into a [rows][KP] tile; rows past S read as zero
+// offset co) into a [rows][KP] tile, 16 bytes at a time; rows past S read as zero
 __device__ void tile_rows(unsigned short* dst, const unsigned short* src, long long ld, long long co, int b, int S,
                           int r0, int rows) {
-    const int pairs = FA_D / 2;
-    for (int x = threadIdx.x; x < rows * pairs; x += blockDim.x) {
-        const int r = x / pairs, c = (x % pairs) * 2, s = r0 + r;
-        unsigned v = 0u;
-        if (s < S) v = *(const unsigned*)(src + ((long long)b * S + s) * ld + co + c);
-        *(unsigned*)(dst + r * KP + c) = v;
-    }
-}
-// the same rows transposed: dst[d][r], a [FA_D][TP] tile
-__device__ void tile_cols(unsigned short* dst, const unsigned short* src, long long ld, long long co, int b, int S,
-                          int r0, int rows) {
-    const int pairs = FA_D / 2;
-    for (int x = threadIdx.x; x < rows * pairs; x += blockDim.x) {
-        const int r = x / pairs, c = (x % pairs) * 2, s = r0 + r;
-        unsigned v = 0u;
-        if (s < S) v = *(const unsigned*)(src + ((long long)b * S + s) * ld + co + c);
-        dst[c * TP + r] = (unsigned short)(v & 0xffffu);
-        dst[(c + 1) * TP + r] = (unsigned short)(v >> 16);
+    const int vecs = FA_D / 8;
+    for (int x = threadIdx.x; x < rows * vecs; x += blockDim.x) {
+        const int r = x / vecs, c = (x % vecs) * 8, s = r0 + r;
+        uint4 v = make_uint4(0u, 0u, 0u, 0u);
+        if (s < S) v = *(const uint4*)(src + ((long long)b * S + s) * ld + co + c);
+        *(uint4*)(dst + r * KP + c) = v;
     }
 }
 // this warp's 16 rows as A fragments over D (FA_D / 16 k-steps)
@@ -792,24 +794,24 @@ __device__ void frag_rows(unsigned (*a)[4], const unsigned short* src, long long
         a[ks][3] = r1 < S ? *(const unsigned*)(src + ((long long)b * S + r1) * ld + co + c + 8) : 0u;
     }
 }
-// acc[n] (16 x 8 tiles over BC) = rows . tile^T, the tile [BC][KP]
+// acc[n] (16 x 8 tiles over BC) = rows . tile^T, the tile [BC][KP] (n along its rows)
 __device__ __forceinline__ void rows_by_tile(float (*acc)[4], const unsigned (*a)[4], const unsigned short* tile) {
-    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    const int lane = threadIdx.x & 31, lr = lane & 7, lh = ((lane >> 3) & 1) * 8;
     #pragma unroll
     for (int n = 0; n < NT; n++) {
         acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.0f;
         #pragma unroll
         for (int ks = 0; ks < FA_D / 16; ks++) {
             unsigned b[2];
-            b[0] = *(const unsigned*)(tile + (n * 8 + g) * KP + ks * 16 + t * 2);
-            b[1] = *(const unsigned*)(tile + (n * 8 + g) * KP + ks * 16 + t * 2 + 8);
+            ldm2(b, tile + (n * 8 + lr) * KP + ks * 16 + lh);
             mma16816(acc[n], a[ks], b);
         }
     }
 }
-// out[n] (16 x 8 tiles over D) += p . tileT, p the 16 x BC accumulator, tileT [FA_D][TP]
-__device__ __forceinline__ void acc_by_tile(float (*out)[4], const float (*p)[4], const unsigned short* tileT) {
-    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+// out[n] (16 x 8 tiles over D) += p . tile, p the 16 x BC accumulator and the
+// tile [BC][KP] read transposed (k along its rows)
+__device__ __forceinline__ void acc_by_tile(float (*out)[4], const float (*p)[4], const unsigned short* tile) {
+    const int lane = threadIdx.x & 31, lr = (lane & 7) + ((lane >> 3) & 1) * 8;
     #pragma unroll
     for (int kk = 0; kk < BC / 16; kk++) {
         unsigned a[4];
@@ -820,8 +822,7 @@ __device__ __forceinline__ void acc_by_tile(float (*out)[4], const float (*p)[4]
         #pragma unroll
         for (int n = 0; n < FA_D / 8; n++) {
             unsigned b[2];
-            b[0] = *(const unsigned*)(tileT + (n * 8 + g) * TP + kk * 16 + t * 2);
-            b[1] = *(const unsigned*)(tileT + (n * 8 + g) * TP + kk * 16 + t * 2 + 8);
+            ldm2t(b, tile + (kk * 16 + lr) * KP + n * 8);
             mma16816(out[n], a, b);
         }
     }
@@ -832,7 +833,7 @@ extern "C" __global__ void __launch_bounds__(128) fat_fwd(
         const unsigned short* Q, const unsigned short* Kp, const unsigned short* V, long long lq, long long lv,
         unsigned short* O, float* L, int S, int H, int E, float scale, int causal) {
     __shared__ __align__(16) unsigned short ks[BC * KP];
-    __shared__ __align__(16) unsigned short vt[FA_D * TP];
+    __shared__ __align__(16) unsigned short vs[BC * KP];
     const int bh = blockIdx.y, b = bh / H, h = bh % H, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int g = lane >> 2, t = lane & 3;
     const int q0 = blockIdx.x * BR, row0 = q0 + warp * 16;
@@ -848,7 +849,7 @@ extern "C" __global__ void __launch_bounds__(128) fat_fwd(
     for (int j0 = 0; j0 < kend; j0 += BC) {
         __syncthreads();
         tile_rows(ks, Kp, lq, co, b, S, j0, BC);
-        tile_cols(vt, V, lv, co, b, S, j0, BC);
+        tile_rows(vs, V, lv, co, b, S, j0, BC);
         __syncthreads();
         float s[NT][4];
         rows_by_tile(s, qa, ks);
@@ -879,7 +880,7 @@ extern "C" __global__ void __launch_bounds__(128) fat_fwd(
             l0 += s[n][0] + s[n][1];
             l1 += s[n][2] + s[n][3];
         }
-        acc_by_tile(o, s, vt);
+        acc_by_tile(o, s, vs);
     }
     l0 += __shfl_xor_sync(0xffffffffu, l0, 1); l0 += __shfl_xor_sync(0xffffffffu, l0, 2);
     l1 += __shfl_xor_sync(0xffffffffu, l1, 1); l1 += __shfl_xor_sync(0xffffffffu, l1, 2);
@@ -904,7 +905,6 @@ extern "C" __global__ void __launch_bounds__(128) fat_dq(
         float scale, int causal) {
     __shared__ __align__(16) unsigned short ks[BC * KP];
     __shared__ __align__(16) unsigned short vs[BC * KP];
-    __shared__ __align__(16) unsigned short kt[FA_D * TP];
     const int bh = blockIdx.y, b = bh / H, h = bh % H, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int g = lane >> 2, t = lane & 3;
     const int q0 = blockIdx.x * BR, row0 = q0 + warp * 16;
@@ -924,7 +924,6 @@ extern "C" __global__ void __launch_bounds__(128) fat_dq(
         __syncthreads();
         tile_rows(ks, Kp, lq, co, b, S, j0, BC);
         tile_rows(vs, V, lv, co, b, S, j0, BC);
-        tile_cols(kt, Kp, lq, co, b, S, j0, BC);
         __syncthreads();
         float s[NT][4], dp[NT][4];
         rows_by_tile(s, qa, ks);
@@ -939,7 +938,7 @@ extern "C" __global__ void __launch_bounds__(128) fat_dq(
                 s[n][e] = p * (dp[n][e] - (e < 2 ? D0 : D1));
             }
         }
-        acc_by_tile(dq, s, kt);
+        acc_by_tile(dq, s, ks);
     }
     #pragma unroll
     for (int n = 0; n < FA_D / 8; n++) {
@@ -957,8 +956,6 @@ extern "C" __global__ void __launch_bounds__(128) fat_dkv(
         int E, float scale, int causal) {
     __shared__ __align__(16) unsigned short qs[BC * KP];
     __shared__ __align__(16) unsigned short gs[BC * KP];
-    __shared__ __align__(16) unsigned short qt[FA_D * TP];
-    __shared__ __align__(16) unsigned short gt[FA_D * TP];
     __shared__ float ls[BC], dvs[BC];
     const int bh = blockIdx.y, b = bh / H, h = bh % H, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int g = lane >> 2, t = lane & 3;
@@ -979,8 +976,6 @@ extern "C" __global__ void __launch_bounds__(128) fat_dkv(
         __syncthreads();
         tile_rows(qs, Q, lq, co, b, S, i0, BC);
         tile_rows(gs, dO, E, co, b, S, i0, BC);
-        tile_cols(qt, Q, lq, co, b, S, i0, BC);
-        tile_cols(gt, dO, E, co, b, S, i0, BC);
         for (int x = threadIdx.x; x < BC; x += blockDim.x) {
             const int q = i0 + x;
             ls[x] = q < S ? L[(long long)bh * S + q] * LOG2E : 0.0f;
@@ -1001,8 +996,8 @@ extern "C" __global__ void __launch_bounds__(128) fat_dkv(
                 dp[n][e] = p * (dp[n][e] - dvs[qc]);
             }
         }
-        acc_by_tile(dv, s, gt);
-        acc_by_tile(dk, dp, qt);
+        acc_by_tile(dv, s, gs);
+        acc_by_tile(dk, dp, qs);
     }
     const int r0 = row0 + g, r1 = row0 + g + 8;
     #pragma unroll

@@ -102,17 +102,17 @@ One training step, ms, against PyTorch 2.15 (with flash attention) on an A100, r
 | Model | Prometheus | PyTorch eager | torch.compile |
 |---|---|---|---|
 | GPT 4×256, float32 | **5.1** | 7.2 | 4.8 |
-| GPT 4×256, bf16 | **2.6** | 7.7 | 2.4 |
-| GPT 12×768, TF32 | **23.3** | 25.2 | 25.2 |
-| GPT 12×768, bf16 | **18.9** | 25.9 | 17.6 |
-| GPT 12×768, float32 | 78.2 | 78.0 | 80.4 |
+| GPT 4×256, bf16 | **2.4** | 7.8 | 2.2 |
+| GPT 12×768, TF32 | **22.9** | 27.4 | 26.0 |
+| GPT 12×768, bf16 | **17.9** | 26.0 | 17.6 |
+| GPT 12×768, float32 | **77.2** | 77.3 | 80.0 |
 | CNN, batch 64 | **1.0** | 1.6 | 1.8 |
 | `p.fuse` swish + MSE | **0.40** | 0.59 | 0.54 |
 | LSTM / GRU (with a CUDA Graph) | **2.2 / 2.0** | 2.3 / 2.4 | |
 | RNN | 2.0 | 0.9 | 1.0 |
 
 Behind: bf16 against `torch.compile` (it fuses across ops), and the plain RNN (cuDNN's persistent
-kernel). On a GTX 970 the GPT step is 16.5 ms against PyTorch's 19.4.
+kernel). On a GTX 970 (PyTorch 2.14 eager): GPT 16.9 vs 18.9 ms, CNN 4.4 vs 5.2, RNN 2.3 vs 3.5, LSTM and GRU even.
 
 On the CPU, `matmul` uses MKL, OpenBLAS or a built-in tiled kernel, chosen at runtime
 (`p.backend()`, `p.set_blas`). A 16.8M-parameter GPT step runs at 1530-1680 tokens/s with MKL
