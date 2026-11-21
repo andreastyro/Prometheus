@@ -197,6 +197,30 @@ jobs:
           if [ "${{ matrix.backend }}" = openblas ]; then export PROMETHEUS_BLAS=openblas; else export PROMETHEUS_BLAS=tiled; fi
           bash .github/annotate.sh ctest --test-dir build --output-on-failure
 
+  # ── A clean install, then a long training run ──────────────────────────
+  # pip's isolated build (pyproject.toml's build requirements) in a fresh
+  # virtual environment, run from outside the source tree so the installed
+  # package is what is imported; then 300 training steps checking that the
+  # loss falls and memory stays flat.
+  install:
+    name: clean install + long training run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install into a fresh environment
+        run: |
+          python -m venv /tmp/clean
+          /tmp/clean/bin/python -m pip install --upgrade pip
+          /tmp/clean/bin/python -m pip install numpy
+          /tmp/clean/bin/python -m pip install .
+      - name: Long training run from outside the source tree
+        run: |
+          cp tests/test_long_training.py /tmp/
+          cd /tmp && /tmp/clean/bin/python test_long_training.py
+
   # ── CPU speed against PyTorch, so a slowdown fails the build ─────────────
   benchmarks:
     name: CPU benchmarks vs PyTorch

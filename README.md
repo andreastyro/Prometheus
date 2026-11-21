@@ -134,6 +134,24 @@ GPU tests: [tests/test_cuda.cpp](tests/test_cuda.cpp) and [tests/test_cuda.py](t
 (they skip without a GPU); `python tests/build_gpu_tests.py --run` builds and runs the C++ suite;
 `modal run tests/modal_gpu.py --gpu A100` runs everything plus the benchmarks on a rented GPU.
 
+## Configuration
+
+| Setting | What it picks |
+|---|---|
+| `p.set_blas("mkl" \| "openblas" \| "tiled" \| "auto")`, `PROMETHEUS_BLAS` | CPU matmul: a BLAS library loaded at runtime, or the built-in packed kernel (`p.backend()` shows the choice) |
+| `PROMETHEUS_SIMD=base \| avx2 \| avx512` | CPU vector kernels; AVX2 by default where the CPU has it |
+| `p.set_float32_matmul_precision("high")` | TF32 tensor cores for float32 GPU matmuls |
+| `p.set_attention_backend("auto" \| "math" \| "flash")`, `PROMETHEUS_ATTENTION` | GPU attention |
+| `p.set_default_autocast(p.bfloat16)` | GPU mixed precision without an `autocast` scope |
+| `PROMETHEUS_ALLOCATOR=async` | the driver's stream-ordered GPU allocator instead of the caching one |
+| `PROMETHEUS_CUDNN=0`, `PROMETHEUS_KERNEL_CACHE` | turn cuDNN off; where compiled GPU kernels are kept |
+
+Tested: CPython 3.12 and 3.14; Windows (MSVC 2022, MinGW GCC 15), Linux
+(GCC, Ubuntu in CI), macOS on Apple Silicon (Clang, in CI); x86-64 with AVX2 /
+AVX-512 picked at runtime, ARM64 on the portable code. GPU: NVIDIA, Maxwell (GTX 900) onward with CUDA 12's
+NVRTC and cuBLAS, Turing onward with CUDA 13; bfloat16 and TF32 on compute
+8.0+. Tested on a GTX 970, T4 and A100.
+
 ## Examples
 
 | File | What it shows |

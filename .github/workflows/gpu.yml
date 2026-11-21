@@ -1,0 +1,45 @@
+name: GPU
+
+# The GPU suites (tests/test_cuda.cpp, tests/test_cuda.py, strided and
+# safetensors on the device) on a rented NVIDIA card through Modal
+# (tests/modal_gpu.py): weekly, and by hand from the Actions tab. Needs the
+# repository secrets MODAL_TOKEN_ID and MODAL_TOKEN_SECRET (modal token new);
+# without them the job says so and passes. Never on pull requests: the token
+# would be exposed to forks.
+
+on:
+  schedule:
+    - cron: "0 4 * * 1"          # Mondays 04:00 UTC
+  workflow_dispatch:
+    inputs:
+      gpu:
+        description: "Modal GPU type (T4, L4, A100, H100)"
+        default: "T4"
+
+jobs:
+  gpu:
+    name: GPU suites on Modal (${{ github.event.inputs.gpu || 'T4' }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run on Modal
+        run: |
+          if [ -z "$MODAL_TOKEN_ID" ]; then
+            echo "No Modal token in the repository secrets: GPU suites not run."
+            exit 0
+          fi
+          python -m pip install modal
+          GPU="${{ github.event.inputs.gpu || 'T4' }}"
+          python -m modal run tests/modal_gpu.py --gpu "$GPU" --no-bench | tee gpu.log
+          # every suite prints "N checks, M failed" and PASS / FAIL
+          if grep -E "FAIL|[1-9][0-9]* failed|exit [1-9]" gpu.log; then
+            echo "::error::a GPU suite failed"
+            exit 1
+          fi

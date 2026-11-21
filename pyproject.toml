@@ -1,0 +1,6 @@
+# What a build needs before setup.py runs: pip installs these into an isolated
+# environment, so `pip install .` works on a clean machine (setup.py imports
+# pybind11 for its headers). The package's own metadata stays in setup.py.
+[build-system]
+requires = ["setuptools>=64", "wheel", "pybind11>=2.10"]
+build-backend = "setuptools.build_meta"
