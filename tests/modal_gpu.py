@@ -83,6 +83,8 @@ def run(bench: bool = True, rounds: int = 2, compile_: bool = True, wide: bool =
     if suites:
         step("C++ GPU suite", [sys.executable, "tests/build_gpu_tests.py", "--run"])
         step("Python GPU suite", [sys.executable, "tests/test_cuda.py"])
+        step("strided inputs (CPU and GPU)", [sys.executable, "tests/test_strided.py"])
+        step("safetensors (GPU tensors too)", [sys.executable, "tests/test_safetensors.py"])
     if script:
         step(script, [sys.executable] + script.split(), everything=True)
     if bench:

@@ -144,6 +144,46 @@ def test_compile():
     check("compile: a step that reads a value back runs eagerly", f.eager_only and abs(v - 10.0) < 1e-6)
 
 
+def test_compiler_graphs():
+    print("\n=== compiler: branching graphs, fallback, memory ===\n")
+    from prometheus.compiler import executor
+    rng = np.random.default_rng(11)
+    xv = rng.standard_normal((8, 12)).astype(np.float32)
+    wv = (rng.standard_normal((12, 10)) * 0.3).astype(np.float32)
+
+    def branchy(x, w):
+        h = x @ w                                    # shared by three branches
+        a = p.fx.gelu(h)
+        b = p.fx.sigmoid(h) * h
+        c = p.fx.mean(h * h)
+        return a * b + c - p.fx.sum(a, 0) / 8.0
+    fused = p.fuse(branchy)
+    res = []
+    for fn in (fused, branchy):
+        x, w = T(xv).cuda(), T(wv).cuda()
+        x.requires_grad = True
+        w.requires_grad = True
+        y = fn(x, w)
+        p.sum(p.reshape(y, [-1]), -1).backward()
+        res.append((y.cpu().numpy(), np.array(x.grad), np.array(w.grad)))
+    check("compiler: a branching graph with a shared intermediate matches unfused",
+          all(np.abs(a - b).max() <= 1e-4 * max(1.0, np.abs(b).max()) for a, b in zip(res[0], res[1])))
+
+    g = fused.graph(2)
+    peak, total = executor.plan(g, [(8, 12), (12, 10)])
+    check("compiler: intermediates released at last use on a branching graph", 0 < peak < total)
+
+    def unknown(x):
+        return p.exp_op(x) * 2.0                     # a library op on a symbol: not traceable
+    f2 = p.fuse(unknown)
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        out = f2(T(xv).cuda())
+    check("compiler: an untraceable function falls back to running unfused",
+          f2.eager and np.abs(out.cpu().numpy() - 2.0 * np.exp(xv)).max() < 1e-3 * np.exp(np.abs(xv)).max())
+
+
 def test_prefetch():
     print("\n=== prefetch: batches upload on a second stream ===\n")
     rng = np.random.default_rng(3)
@@ -272,6 +312,7 @@ def main():
     test_training()
     test_compile()
     test_prefetch()
+    test_compiler_graphs()
     test_fuse()
     print("\n%d checks, %d failed" % (CHECKS[0], len(FAILURES)))
     print("PASS" if not FAILURES else "FAIL")

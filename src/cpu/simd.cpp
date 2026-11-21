@@ -187,7 +187,7 @@ void gemm_acc(bool ta, bool tb, int m, int n, int k, const float* a, int lda, co
         SIMD_CALL(gemm_acc, ta ? 1 : 0, tb ? 1 : 0, r1 - r0, n, k, ap, lda, b, ldb, c + (long long)r0 * ldc, ldc,
                   buf.data());
     };
-    bool par = threads && work >= (1LL << 21) && m >= 12;
+    bool par = threads && work >= (1LL << 21);       // measured (tests/bench_gemm.py): below, threads lose
 #ifdef _OPENMP
     par = par && !omp_in_parallel();
 #else
@@ -201,10 +201,25 @@ void gemm_acc(bool ta, bool tb, int m, int n, int k, const float* a, int lda, co
         t = omp_get_thread_num();
         nt = omp_get_num_threads();
 #endif
-        // whole 6-row panels per thread
-        const long long panels = (m + 5) / 6, per = (panels + nt - 1) / nt;
-        const int r0 = (int)std::min<long long>(m, t * per * 6), r1 = (int)std::min<long long>(m, (t + 1) * per * 6);
-        if (r0 < r1) rows(r0, r1);
+        const long long panels = (m + 5) / 6;
+        if (panels >= nt) {
+            // whole 6-row panels per thread
+            const long long per = (panels + nt - 1) / nt;
+            const int r0 = (int)std::min<long long>(m, t * per * 6), r1 = (int)std::min<long long>(m, (t + 1) * per * 6);
+            if (r0 < r1) rows(r0, r1);
+        } else {
+            // too few rows to go round (32 x 1024 x 256: 6 panels for 16
+            // threads ran at 29 GFLOP/s, MKL 231): 16-column blocks instead
+            const long long blocks = (n + 15) / 16, per = (blocks + nt - 1) / nt;
+            const int j0 = (int)std::min<long long>(n, t * per * 16), j1 = (int)std::min<long long>(n, (t + 1) * per * 16);
+            if (j0 < j1) {
+                thread_local std::vector<float> buf;
+                const size_t need = (size_t)72 * 256 + (size_t)256 * 1024;
+                if (buf.size() < need) buf.resize(need);
+                const float* bp = tb ? b + (long long)j0 * ldb : b + j0;
+                SIMD_CALL(gemm_acc, ta ? 1 : 0, tb ? 1 : 0, m, j1 - j0, k, a, lda, bp, ldb, c + j0, ldc, buf.data());
+            }
+        }
     }
 }
 

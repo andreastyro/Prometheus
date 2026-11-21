@@ -63,33 +63,38 @@ TensorPtr LayerNorm::forward_as(TensorPtr input, DType out_dtype) {
     input = checked_input("LayerNorm", input);
     int N       = normalized_shape;
     int num_rows = input->num_el() / N;
-    auto output  = make_shared<Tensor>(input->shape());
-
-    // x_hat and inv_std saved per-row for the backward
-    vector<float> x_hat_all(input->num_el());
-    vector<float> inv_std_all(num_rows);
-
-    #pragma omp parallel for schedule(static) if(num_rows >= 64)
-    for (int r = 0; r < num_rows; r++) {
-        int off = r * N;
-
-        float mean_v = 0.0f;
-        for (int i = 0; i < N; i++) mean_v += input->data()[off + i];
-        mean_v /= N;
-
-        float var = 0.0f;
-        for (int i = 0; i < N; i++) {
-            float d = input->data()[off + i] - mean_v;
-            var += d * d;
-        }
-        var /= N;
-
-        float is = 1.0f / sqrtf(var + eps);
-        inv_std_all[r] = is;
-
-        for (int i = 0; i < N; i++) {
-            x_hat_all[off + i] = (input->data()[off + i] - mean_v) * is;
-            output->data()[off + i] = gamma->data()[i] * x_hat_all[off + i] + beta->data()[i];
+    // every element written below: no zero-fill; pointers hoisted so the
+    // loops vectorise (per-element data() / grad() calls kept them scalar:
+    // 4.9 ms against PyTorch's 1.2 for 2048 rows of 768, forward + backward)
+    auto output  = make_shared<Tensor>(input->shape(), Tensor::Uninitialized{});
+    const size_t n = (size_t)input->num_el();
+    // x_hat and inv_std saved per row for the backward, uninitialised
+    std::shared_ptr<float> x_hat_all(new float[n], std::default_delete<float[]>());
+    std::shared_ptr<float> inv_std_all(new float[num_rows > 0 ? num_rows : 1], std::default_delete<float[]>());
+    {
+        const float* X = input->data();
+        const float* G = gamma->data();
+        const float* Bt = beta->data();
+        float* Y = output->data();
+        float* XH = x_hat_all.get();
+        float* IS = inv_std_all.get();
+        #pragma omp parallel for schedule(static) if(num_rows >= 64)
+        for (int r = 0; r < num_rows; r++) {
+            const float* x = X + (size_t)r * N;
+            float mean_v = 0.0f;
+            for (int i = 0; i < N; i++) mean_v += x[i];
+            mean_v /= N;
+            float var = 0.0f;
+            for (int i = 0; i < N; i++) { const float d = x[i] - mean_v; var += d * d; }
+            var /= N;
+            const float is = 1.0f / sqrtf(var + eps);
+            IS[r] = is;
+            float* xh = XH + (size_t)r * N;
+            float* y = Y + (size_t)r * N;
+            for (int i = 0; i < N; i++) {
+                xh[i] = (x[i] - mean_v) * is;
+                y[i] = G[i] * xh[i] + Bt[i];
+            }
         }
     }
 
@@ -101,45 +106,46 @@ TensorPtr LayerNorm::forward_as(TensorPtr input, DType out_dtype) {
         autograd::attach_reference(*node, [eps = eps](const std::vector<TensorPtr>& in) -> TensorPtr {
             return layernorm_ops(in[0], in[1], in[2], eps);
         });
-        node->backward_fn = [input, g, b,
-                            x_hat_all = std::move(x_hat_all),
-                            inv_std_all = std::move(inv_std_all),
-                            num_rows, N](const TensorPtr& output) {
-            #pragma omp parallel for schedule(static) if(num_rows >= 64)
-            for (int r = 0; r < num_rows; r++) {
-                int off = r * N;
-                float is = inv_std_all[r];
-
-                // g[i] = gamma[i] * output.grad[r, i]  (grad w.r.t. x_hat)
-                float sum_g = 0.0f, sum_g_xhat = 0.0f;
-                for (int i = 0; i < N; i++) {
-                    float gi = g->data()[i] * output->grad()[off + i];
-                    sum_g      += gi;
-                    sum_g_xhat += gi * x_hat_all[off + i];
+        node->backward_fn = [input, g, b, x_hat_all, inv_std_all, num_rows, N](const TensorPtr& output) {
+            const float* GO = output->grad();
+            const float* GM = g->data();
+            const float* XH = x_hat_all.get();
+            const float* IS = inv_std_all.get();
+            float* GX = input->requires_grad() ? input->grad() : nullptr;
+            const bool need_gb = g->requires_grad() || b->requires_grad();
+            float* GG = g->requires_grad() ? g->grad() : nullptr;
+            float* GB = b->requires_grad() ? b->grad() : nullptr;
+            #pragma omp parallel if(num_rows >= 64)
+            {
+                // gamma / beta: each thread sums its rows into its own pair of
+                // rows (contiguous reads), added once at the end -- the old
+                // column-at-a-time walk strode N floats per element
+                std::vector<float> pg(need_gb ? (size_t)N : 0, 0.0f), pb(need_gb ? (size_t)N : 0, 0.0f);
+                #pragma omp for schedule(static) nowait
+                for (int r = 0; r < num_rows; r++) {
+                    const float* go = GO + (size_t)r * N;
+                    const float* xh = XH + (size_t)r * N;
+                    if (need_gb)
+                        for (int i = 0; i < N; i++) { pg[i] += go[i] * xh[i]; pb[i] += go[i]; }
+                    if (GX) {
+                        float sum_g = 0.0f, sum_g_xhat = 0.0f;
+                        for (int i = 0; i < N; i++) {
+                            const float gi = GM[i] * go[i];
+                            sum_g += gi;
+                            sum_g_xhat += gi * xh[i];
+                        }
+                        const float is = IS[r], k = is / N;
+                        float* gx = GX + (size_t)r * N;
+                        for (int i = 0; i < N; i++)
+                            gx[i] += k * (N * GM[i] * go[i] - sum_g - xh[i] * sum_g_xhat);
+                    }
                 }
-
-                if (input->requires_grad()) {
+                if (need_gb) {
+                    #pragma omp critical
                     for (int i = 0; i < N; i++) {
-                        float gi = g->data()[i] * output->grad()[off + i];
-                        input->grad()[off + i] += (is / N) * (N * gi - sum_g - x_hat_all[off + i] * sum_g_xhat);
+                        if (GG) GG[i] += pg[i];
+                        if (GB) GB[i] += pb[i];
                     }
-                }
-            }
-
-            // gamma and beta accumulate over every row, so the row loop
-            // cannot be split. Walking the feature index on the outside gives
-            // each thread its own output slot and one pass over the gradient.
-            if (g->requires_grad() || b->requires_grad()) {
-                #pragma omp parallel for schedule(static) if(N >= 256)
-                for (int i = 0; i < N; i++) {
-                    float gg = 0.0f, bg = 0.0f;
-                    for (int r = 0; r < num_rows; r++) {
-                        float go = output->grad()[r * N + i];
-                        gg += go * x_hat_all[r * N + i];
-                        bg += go;
-                    }
-                    if (g->requires_grad()) g->grad()[i] += gg;
-                    if (b->requires_grad()) b->grad()[i] += bg;
                 }
             }
         };

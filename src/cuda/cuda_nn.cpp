@@ -137,6 +137,46 @@ extern "C" __global__ void __launch_bounds__(256, 4) b_layernorm_rows_w(const fl
     const long long o = (long long)blockIdx.x * cols;
     for (int j = threadIdx.x; j < cols; j += blockDim.x) { pg[o + j] = sg[j]; pb[o + j] = sb[j]; }
 }
+// dx only, a block per row, float4 loads (cols % 4 == 0, cols / 4 <= 1024):
+// x, dy and gamma read once into registers, three block reductions. Mean and
+// 1/std written per row for b_layernorm_cols (gamma / beta). PyTorch's layout
+// for this backward: the warp-per-row kernel ran 2x its time on an A100.
+__device__ float ln_block_sum(float v, float* sh) {
+    v = ln_warp_sum(v);
+    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5, nw = (blockDim.x + 31) >> 5;
+    __syncthreads();
+    if (lane == 0) sh[w] = v;
+    __syncthreads();
+    float t = threadIdx.x < nw ? sh[threadIdx.x] : 0.0f;
+    if (w == 0) t = ln_warp_sum(t);
+    if (threadIdx.x == 0) sh[0] = t;
+    __syncthreads();
+    return sh[0];
+}
+extern "C" __global__ void b_ln_row_v4(const float4* x, const float4* g, const float4* dy, float4* dx, int c4,
+                                       float eps, int accum, float* mean_out, float* inv_out) {
+    __shared__ float sh[32];
+    const long long r = blockIdx.x;
+    const int t = threadIdx.x;
+    const bool on = t < c4;
+    const float cols = 4.0f * (float)c4;
+    const float4 z = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    const float4 xv = on ? x[r * c4 + t] : z, dv = on ? dy[r * c4 + t] : z, gv = on ? g[t] : z;
+    const float mean = ln_block_sum(xv.x + xv.y + xv.z + xv.w, sh) / cols;
+    const float a0 = xv.x - mean, a1 = xv.y - mean, a2 = xv.z - mean, a3 = xv.w - mean;
+    const float var = ln_block_sum(on ? a0 * a0 + a1 * a1 + a2 * a2 + a3 * a3 : 0.0f, sh) / cols;
+    const float inv = rsqrtf(var + eps);
+    const float g0 = gv.x * dv.x, g1 = gv.y * dv.y, g2 = gv.z * dv.z, g3 = gv.w * dv.w;
+    const float m1 = ln_block_sum(g0 + g1 + g2 + g3, sh) / cols;
+    const float m2 = ln_block_sum((g0 * a0 + g1 * a1 + g2 * a2 + g3 * a3) * inv, sh) / cols;
+    if (on) {
+        float4 o = make_float4(inv * (g0 - m1 - a0 * inv * m2), inv * (g1 - m1 - a1 * inv * m2),
+                               inv * (g2 - m1 - a2 * inv * m2), inv * (g3 - m1 - a3 * inv * m2));
+        if (accum) { const float4 p = dx[r * c4 + t]; o.x += p.x; o.y += p.y; o.z += p.z; o.w += p.w; }
+        dx[r * c4 + t] = o;
+    }
+    if (t == 0) { mean_out[r] = mean; inv_out[r] = inv; }
+}
 // dg[j] += the blocks' partials, a thread per (column, chunk of 16 blocks):
 // a thread per column alone was 768 threads summing 256 values each (24 us)
 extern "C" __global__ void b_ln_colsum(const float* pg, const float* pb, float* dg, float* db, int blocks,
@@ -235,6 +275,24 @@ vector<TensorPtr> layernorm_backward(const TensorPtr& x0, const TensorPtr& g0, c
             return e && *e ? (e[0] == '1' ? 1 : 0) : -1;
         }();
         const bool split = split_env == 1;                 // measured slower on the A100 too
+        // PROMETHEUS_LN_BWD=warp keeps the warp-per-row kernel
+        static const bool v4_env = [] {
+            const char* e = std::getenv("PROMETHEUS_LN_BWD");
+            return !(e && std::string(e) == "warp");
+        }();
+        const bool aligned = ((reinterpret_cast<uintptr_t>(px) | reinterpret_cast<uintptr_t>(pg) |
+                               reinterpret_cast<uintptr_t>(pd) | reinterpret_cast<uintptr_t>(pdx)) & 15) == 0;
+        if (v4_env && aligned && cols % 4 == 0 && cols / 4 <= 1024) {
+            int c4 = (int)(cols / 4), ac2 = into ? 1 : 0;
+            const unsigned threads = (unsigned)((c4 + 31) / 32 * 32);
+            float* pm2 = static_cast<float*>(pm);
+            float* pi2 = static_cast<float*>(pi);
+            void* a1[] = {&px, &pg, &pd, &pdx, &c4, &eps, &ac2, &pm2, &pi2};
+            cuda::launch(K("b_ln_row_v4", BACKWARD_SRC()), (unsigned)rows, 1, 1, threads, 1, 1, 0, a1);
+            void* a2[] = {&px, &pd, &pm, &pi, &pdg, &pdb, &rows, &cols};
+            cuda::launch(K("b_layernorm_cols", BACKWARD_SRC()), cols * ((rows + 31) / 32), a2);
+            return {into ? nullptr : dx, dg, db};
+        }
         if (split) {
             int no = 0;
             float* pm2 = static_cast<float*>(pm);

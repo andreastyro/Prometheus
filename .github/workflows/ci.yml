@@ -114,6 +114,10 @@ jobs:
       - name: Matmul
         run: bash .github/annotate.sh python tests/test_gemm.py
 
+      # Ops on transposed / permuted views against contiguous copies, values and gradients.
+      - name: Strided inputs
+        run: bash .github/annotate.sh python tests/test_strided.py
+
       # The GPU suite. CI has no GPU, so this checks that it loads and skips
       # cleanly; it runs for real on a machine with an NVIDIA GPU.
       - name: GPU (skips without one)

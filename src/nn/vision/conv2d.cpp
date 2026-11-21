@@ -102,7 +102,7 @@ TensorPtr Conv2D::forward(TensorPtr input){
     if (input->device() == Device::CUDA || weights->device() == Device::CUDA)
         return cuda_ops::conv2d(input, weights, bias, s, p, reference);
 
-    auto output = make_shared<Tensor>(Shape{B, F, Ho, Wo});
+    auto output = make_shared<Tensor>(Shape{B, F, Ho, Wo}, Tensor::Uninitialized{});   // every image writes its block
     const float* X = input->data();
     const float* Wt = weights->data();
     const float* bv = bias->data();

@@ -185,6 +185,34 @@ def test_malformed():
           raises(lambda: p.load_safetensors(variant("len", struct.pack("<Q", 10 ** 9) + raw[8:]))))
 
 
+def test_half_specials_and_devices():
+    print("\n=== float16 special values from another writer; GPU tensors ===\n")
+    if stnp is not None:
+        # written by the official package: every float16 class of value
+        vals = np.array([0.0, -0.0, 5.96e-8, -5.96e-8, 6.1e-5, 65504.0, np.inf, -np.inf, np.nan, 1.5],
+                        dtype=np.float16)
+        stnp.save_file({"h": vals}, path("half_specials.safetensors"))
+        back, _ = p.load_safetensors(path("half_specials.safetensors"))
+        got = np.array(back["h"].to(p.float32).numpy()).reshape(-1)
+        want = vals.astype(np.float32)
+        same = all((np.isnan(a) and np.isnan(b)) or (a == b and np.signbit(a) == np.signbit(b))
+                   for a, b in zip(got, want))
+        check("float16 zeros, subnormals, max, inf, NaN read exactly", back["h"].dtype == p.float16 and same)
+    else:
+        print("  (safetensors not installed: the external file skipped)")
+    if p.cuda_available():
+        rng = np.random.default_rng(4)
+        tensors = {}
+        for dt in ("float32", "float16", "bfloat16", "int64"):
+            vals = sample(dt, (3, 4), rng)
+            tensors[dt] = p.Tensor([3, 4], [float(v) for v in vals.reshape(-1)], getattr(p, dt)).cuda()
+        p.save_safetensors(path("gpu.safetensors"), tensors)
+        back, _ = p.load_safetensors(path("gpu.safetensors"))
+        ok = all(back[k].dtype == t.dtype and np.array_equal(np.array(back[k].numpy()), np.array(t.cpu().numpy()))
+                 for k, t in tensors.items())
+        check("GPU tensors of every dtype saved and read back exactly", ok)
+
+
 def main():
     print("Model files: safetensors")
     test_roundtrip()
@@ -192,6 +220,7 @@ def main():
     test_models_and_checkpoints()
     test_legacy()
     test_malformed()
+    test_half_specials_and_devices()
     print("\n%d checks, %d failed" % (CHECKS[0], len(FAILURES)))
     print("PASS" if not FAILURES else "FAIL")
     sys.exit(1 if FAILURES else 0)

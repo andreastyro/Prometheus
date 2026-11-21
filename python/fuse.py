@@ -135,6 +135,7 @@ class Fused:
     def __init__(self, fn):
         self.fn = fn
         self.graphs = {}
+        self.eager = False          # set when the function cannot be traced
 
     def graph(self, k):
         if k not in self.graphs:
@@ -147,9 +148,18 @@ class Fused:
 
     def __call__(self, *args):
         tensors = [a for a in args if isinstance(a, _C.Tensor)]
-        if not tensors or any(t.device != _C.cuda for t in tensors) or len(args) != len(tensors):
+        if self.eager or not tensors or any(t.device != _C.cuda for t in tensors) or len(args) != len(tensors):
             return self.fn(*args)
-        return executor.run(self.graph(len(args)), list(args))[0]
+        try:
+            g = self.graph(len(args))
+        except (TypeError, ValueError, AttributeError) as e:
+            # an op the tracer does not know (a p.* function on a symbol, Python
+            # control flow on a value): run the function as it is, from now on
+            import warnings
+            warnings.warn("prometheus.fuse: running %s unfused -- %s" % (getattr(self.fn, "__name__", "it"), e))
+            self.eager = True
+            return self.fn(*args)
+        return executor.run(g, list(args))[0]
 
 
 def fuse(fn):
