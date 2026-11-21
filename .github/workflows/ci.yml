@@ -109,6 +109,11 @@ jobs:
       - name: Dtypes
         run: bash .github/annotate.sh python tests/test_dtypes.py
 
+      # The CPU matmul (built-in packed kernel and BLAS) against float64, on
+      # shapes that take the parallel path, at 1 / 2 / 4 / 8 threads.
+      - name: Matmul
+        run: bash .github/annotate.sh python tests/test_gemm.py
+
       # The GPU suite. CI has no GPU, so this checks that it loads and skips
       # cleanly; it runs for real on a machine with an NVIDIA GPU.
       - name: GPU (skips without one)
