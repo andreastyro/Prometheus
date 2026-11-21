@@ -133,16 +133,16 @@ void gelu_bwd(const float* x, const float* gy, float* gx, long long n) {
 }
 
 
-// One LSTM step's gates for a batch row: a = the pre-activations (i f o g, H
-// each) in; g = the activated gates, c = the new cell, h = the output out.
+// One LSTM step's gates for n units of a batch row, the gates H apart: a = the
+// pre-activations (i f o g) in; g = the activated gates, c = the new cell, h = the output out.
 static inline float fsig(float x) { return 1.0f / (1.0f + fexp(-x)); }
 #ifdef SIMD_WIDTH
 static inline vf vsig(vf x) { return vdiv(vset(1.0f), vadd(vset(1.0f), vexp(vmul(vset(-1.0f), x)))); }
 #endif
-void lstm_fwd_row(const float* a, float* g, const float* c_prev, float* c, float* h, int H) {
+void lstm_fwd_row(const float* a, float* g, const float* c_prev, float* c, float* h, int n, int H) {
     int j = 0;
 #ifdef SIMD_WIDTH
-    for (; j + SIMD_WIDTH <= H; j += SIMD_WIDTH) {
+    for (; j + SIMD_WIDTH <= n; j += SIMD_WIDTH) {
         const vf i_ = vsig(vload(a + j)), f_ = vsig(vload(a + H + j));
         const vf o_ = vsig(vload(a + 2 * H + j)), g_ = vtanh(vload(a + 3 * H + j));
         vstore(g + j, i_); vstore(g + H + j, f_); vstore(g + 2 * H + j, o_); vstore(g + 3 * H + j, g_);
@@ -151,7 +151,7 @@ void lstm_fwd_row(const float* a, float* g, const float* c_prev, float* c, float
         vstore(h + j, vmul(o_, vtanh(ct)));
     }
 #endif
-    for (; j < H; j++) {
+    for (; j < n; j++) {
         const float i_ = fsig(a[j]), f_ = fsig(a[H + j]), o_ = fsig(a[2 * H + j]), g_ = ftanh(a[3 * H + j]);
         g[j] = i_; g[H + j] = f_; g[2 * H + j] = o_; g[3 * H + j] = g_;
         const float ct = f_ * c_prev[j] + i_ * g_;
@@ -163,11 +163,11 @@ void lstm_fwd_row(const float* a, float* g, const float* c_prev, float* c, float
 // Its backward for a batch row: g the saved gates, c / c_prev the cells, dh the
 // gradient reaching h; da the gates' gradients out, dc in (from t + 1) and out.
 void lstm_bwd_row(const float* g, const float* c, const float* c_prev, const float* dh, float* da, float* dc,
-                  int H) {
+                  int n, int H) {
     int j = 0;
 #ifdef SIMD_WIDTH
     const vf one = vset(1.0f);
-    for (; j + SIMD_WIDTH <= H; j += SIMD_WIDTH) {
+    for (; j + SIMD_WIDTH <= n; j += SIMD_WIDTH) {
         const vf i_ = vload(g + j), f_ = vload(g + H + j), o_ = vload(g + 2 * H + j), g_ = vload(g + 3 * H + j);
         const vf tc = vtanh(vload(c + j)), d = vload(dh + j);
         const vf dct = vfma(vmul(d, o_), vsub(one, vmul(tc, tc)), vload(dc + j));
@@ -178,7 +178,7 @@ void lstm_bwd_row(const float* g, const float* c, const float* c_prev, const flo
         vstore(dc + j, vmul(dct, f_));
     }
 #endif
-    for (; j < H; j++) {
+    for (; j < n; j++) {
         const float i_ = g[j], f_ = g[H + j], o_ = g[2 * H + j], g_ = g[3 * H + j];
         const float tc = ftanh(c[j]);
         const float dct = dc[j] + dh[j] * o_ * (1.0f - tc * tc);

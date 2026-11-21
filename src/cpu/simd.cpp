@@ -12,20 +12,20 @@
 namespace simd_base {
 void gelu_fwd(const float*, float*, long long);
 void gelu_bwd(const float*, const float*, float*, long long);
-void lstm_fwd_row(const float*, float*, const float*, float*, float*, int);
-void lstm_bwd_row(const float*, const float*, const float*, const float*, float*, float*, int);
+void lstm_fwd_row(const float*, float*, const float*, float*, float*, int, int);
+void lstm_bwd_row(const float*, const float*, const float*, const float*, float*, float*, int, int);
 }
 namespace simd_avx2 {
 void gelu_fwd(const float*, float*, long long);
 void gelu_bwd(const float*, const float*, float*, long long);
-void lstm_fwd_row(const float*, float*, const float*, float*, float*, int);
-void lstm_bwd_row(const float*, const float*, const float*, const float*, float*, float*, int);
+void lstm_fwd_row(const float*, float*, const float*, float*, float*, int, int);
+void lstm_bwd_row(const float*, const float*, const float*, const float*, float*, float*, int, int);
 }
 namespace simd_avx512 {
 void gelu_fwd(const float*, float*, long long);
 void gelu_bwd(const float*, const float*, float*, long long);
-void lstm_fwd_row(const float*, float*, const float*, float*, float*, int);
-void lstm_bwd_row(const float*, const float*, const float*, const float*, float*, float*, int);
+void lstm_fwd_row(const float*, float*, const float*, float*, float*, int, int);
+void lstm_bwd_row(const float*, const float*, const float*, const float*, float*, float*, int, int);
 }
 
 namespace {
@@ -123,17 +123,17 @@ void gelu_bwd(const float* x, const float* gy, float* gx, long long n) {
     });
 }
 
-void lstm_fwd_row(const float* a, float* g, const float* c_prev, float* c, float* h, int H) {
-    if (g_level == 2) simd_avx512::lstm_fwd_row(a, g, c_prev, c, h, H);
-    else if (g_level == 1) simd_avx2::lstm_fwd_row(a, g, c_prev, c, h, H);
-    else simd_base::lstm_fwd_row(a, g, c_prev, c, h, H);
+void lstm_fwd_row(const float* a, float* g, const float* c_prev, float* c, float* h, int n, int H) {
+    if (g_level == 2) simd_avx512::lstm_fwd_row(a, g, c_prev, c, h, n, H);
+    else if (g_level == 1) simd_avx2::lstm_fwd_row(a, g, c_prev, c, h, n, H);
+    else simd_base::lstm_fwd_row(a, g, c_prev, c, h, n, H);
 }
 
 void lstm_bwd_row(const float* g, const float* c, const float* c_prev, const float* dh, float* da, float* dc,
-                  int H) {
-    if (g_level == 2) simd_avx512::lstm_bwd_row(g, c, c_prev, dh, da, dc, H);
-    else if (g_level == 1) simd_avx2::lstm_bwd_row(g, c, c_prev, dh, da, dc, H);
-    else simd_base::lstm_bwd_row(g, c, c_prev, dh, da, dc, H);
+                  int n, int H) {
+    if (g_level == 2) simd_avx512::lstm_bwd_row(g, c, c_prev, dh, da, dc, n, H);
+    else if (g_level == 1) simd_avx2::lstm_bwd_row(g, c, c_prev, dh, da, dc, n, H);
+    else simd_base::lstm_bwd_row(g, c, c_prev, dh, da, dc, n, H);
 }
 
 } // namespace simd

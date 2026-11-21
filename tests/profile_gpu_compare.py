@@ -10,7 +10,7 @@ here = os.path.dirname(os.path.abspath(__file__))
 size = ["--layers", "12", "--embed", "768", "--heads", "12", "--seq", "256", "--batch", "8",
         "--amp", "bf16", "--top", "30"] + sys.argv[1:]
 for label, args, env in [("Prometheus", ["prometheus"], {}),
-                         ("Prometheus, LayerNorm sums fused", ["prometheus"], {"PROMETHEUS_LN_SPLIT": "0"}),
+                         ("Prometheus, LayerNorm split", ["prometheus"], {"PROMETHEUS_LN_SPLIT": "1"}),
                          ("PyTorch eager", ["torch"], {})]:
     print("\n==== %s ====" % label, flush=True)
     out = subprocess.run([sys.executable, os.path.join(here, "profile_gpu_gpt.py")] + args + size,

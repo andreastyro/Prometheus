@@ -78,7 +78,9 @@ extern "C" __global__ void b_layernorm_rows(const float* x, const float* g, cons
 // behind the same addresses (2.6 ms of a GPT step, PyTorch's 0.8).
 // accum: dx += instead of dx = (the input's gradient buffer, already holding
 // another branch's gradient: no separate add pass).
-extern "C" __global__ void b_layernorm_rows_w(const float* x, const float* g, const float* dy, float* dx,
+// x is held in registers, dy re-read (from cache) where needed: holding both
+// (64 floats a thread) left few warps resident on an A100.
+extern "C" __global__ void __launch_bounds__(256, 4) b_layernorm_rows_w(const float* x, const float* g, const float* dy, float* dx,
                                               int cols, float eps, long long rows, int accum,
                                               float* pg, float* pb, int sums) {
     __shared__ float sg[1024], sb[1024];
@@ -90,13 +92,12 @@ extern "C" __global__ void b_layernorm_rows_w(const float* x, const float* g, co
         if (r >= rows) break;
         const float* xr = x + r * cols;
         const float* dyr = dy + r * cols;
-        float xv[32], dv[32];
+        float xv[32];
         float t = 0.0f;
         #pragma unroll
         for (int k = 0; k < 32; k++) {
             const int j = lane + 32 * k;
             xv[k] = j < cols ? xr[j] : 0.0f;
-            dv[k] = j < cols ? dyr[j] : 0.0f;
             t += xv[k];
         }
         const float mean = ln_warp_sum(t) / (float)cols;
@@ -109,12 +110,13 @@ extern "C" __global__ void b_layernorm_rows_w(const float* x, const float* g, co
         for (int k = 0; k < 32; k++) {
             const int j = lane + 32 * k;
             if (j < cols) {
-                const float xh = (xv[k] - mean) * inv, gd = g[j] * dv[k];
+                const float d = dyr[j];
+                const float xh = (xv[k] - mean) * inv, gd = g[j] * d;
                 a += gd;
                 b += gd * xh;
                 if (sums) {
-                    atomicAdd(&sg[j], dv[k] * xh);
-                    atomicAdd(&sb[j], dv[k]);
+                    atomicAdd(&sg[j], d * xh);
+                    atomicAdd(&sb[j], d);
                 }
             }
         }
@@ -125,7 +127,7 @@ extern "C" __global__ void b_layernorm_rows_w(const float* x, const float* g, co
         for (int k = 0; k < 32; k++) {
             const int j = lane + 32 * k;
             if (j < cols) {
-                const float v = inv * (g[j] * dv[k] - m1 - (xv[k] - mean) * inv * m2);
+                const float v = inv * (g[j] * dyr[j] - m1 - (xv[k] - mean) * inv * m2);
                 dxr[j] = accum ? dxr[j] + v : v;
             }
         }
@@ -232,7 +234,7 @@ vector<TensorPtr> layernorm_backward(const TensorPtr& x0, const TensorPtr& g0, c
             const char* e = std::getenv("PROMETHEUS_LN_SPLIT");
             return e && *e ? (e[0] == '1' ? 1 : 0) : -1;
         }();
-        const bool split = split_env == 1 || (split_env == -1 && cuda::compute_capability() >= 80);
+        const bool split = split_env == 1;                 // measured slower on the A100 too
         if (split) {
             int no = 0;
             float* pm2 = static_cast<float*>(pm);

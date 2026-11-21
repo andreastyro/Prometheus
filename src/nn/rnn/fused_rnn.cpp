@@ -391,7 +391,7 @@ Result run(Cell cell, TensorPtr input, TensorPtr h0, TensorPtr c0, int H,
             #pragma omp parallel for schedule(static) if(BH >= 4096)
             for (int bb = 0; bb < B; bb++)           // vectorised gate math (src/cpu/simd)
                 simd::lstm_fwd_row(a.data() + (size_t)bb * GH, gt + (size_t)bb * GH, c_prev + (size_t)bb * H,
-                                   ct + (size_t)bb * H, ht + (size_t)bb * H, H);
+                                   ct + (size_t)bb * H, ht + (size_t)bb * H, H, H);
         } else {
             // r and z from h; n from (r * h)
             const int H2 = 2 * H;
@@ -466,7 +466,7 @@ Result run(Cell cell, TensorPtr input, TensorPtr h0, TensorPtr c0, int H,
             #pragma omp parallel for schedule(static) if(BH >= 4096)
             for (int bb = 0; bb < B; bb++)
                         simd::lstm_bwd_row(gt + (size_t)bb * GH, ct + (size_t)bb * H, c_prev + (size_t)bb * H,
-                                           dh.data() + (size_t)bb * H, da + (size_t)bb * GH, dc.data() + (size_t)bb * H, H);
+                                           dh.data() + (size_t)bb * H, da + (size_t)bb * GH, dc.data() + (size_t)bb * H, H, H);
                     fill(dh.begin(), dh.end(), 0.0f);
                     pgemm(false, true, B, H, GH, da, GH, Whp->data(), GH, 1.0f, dh.data(), H);
                 } else {
