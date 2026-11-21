@@ -102,10 +102,10 @@ One training step, ms, against PyTorch 2.15 (with flash attention) on an A100, r
 | Model | Prometheus | PyTorch eager | torch.compile |
 |---|---|---|---|
 | GPT 4×256, float32 | **5.1** | 7.2 | 4.8 |
-| GPT 4×256, bf16 | **2.8** | 7.8 | 2.2 |
-| GPT 12×768, TF32 | **24.2** | 29.1 | 24.4 |
-| GPT 12×768, bf16 | **20.4** | 26.3 | 17.0 |
-| GPT 12×768, float32 | 78.7 | 77.5 | 79.0 |
+| GPT 4×256, bf16 | **2.6** | 7.7 | 2.4 |
+| GPT 12×768, TF32 | **23.3** | 25.2 | 25.2 |
+| GPT 12×768, bf16 | **18.9** | 25.9 | 17.6 |
+| GPT 12×768, float32 | 78.2 | 78.0 | 80.4 |
 | CNN, batch 64 | **1.0** | 1.6 | 1.8 |
 | `p.fuse` swish + MSE | **0.40** | 0.59 | 0.54 |
 | LSTM / GRU (with a CUDA Graph) | **2.2 / 2.0** | 2.3 / 2.4 | |

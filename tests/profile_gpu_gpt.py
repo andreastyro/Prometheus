@@ -3,6 +3,10 @@
 as tests/bench_gpu_gpt.py.
 
     python tests/profile_gpu_gpt.py prometheus|torch [--top N] [--steps N]
+        [--amp bf16] [--compile] [--manual-attn]
+
+PyTorch's attention is scaled_dot_product_attention unless --manual-attn;
+--compile runs it through torch.compile (max-autotune).
 """
 import argparse
 import sys
@@ -17,6 +21,9 @@ ap.add_argument("--embed", type=int, default=256)
 ap.add_argument("--heads", type=int, default=4)
 ap.add_argument("--layers", type=int, default=4)
 ap.add_argument("--batch", type=int, default=8)
+ap.add_argument("--amp", choices=["bf16"], help="autocast to bfloat16")
+ap.add_argument("--compile", action="store_true", help="PyTorch: torch.compile(mode='max-autotune')")
+ap.add_argument("--manual-attn", action="store_true", help="PyTorch: matmul / mask / softmax attention")
 args = ap.parse_args()
 
 import numpy as np
@@ -39,7 +46,12 @@ if args.lib == "prometheus":
 
     def step():
         opt.zero_grad()
-        p.cross_entropy_sparse_seq(model.forward(x), tg).backward()
+        if args.amp:
+            with p.autocast(p.bfloat16):
+                loss = p.cross_entropy_sparse_seq(model.forward(x), tg)
+        else:
+            loss = p.cross_entropy_sparse_seq(model.forward(x), tg)
+        loss.backward()
         opt.step()
 
     for _ in range(3):
@@ -56,7 +68,6 @@ else:
     import torch.nn as nn
     import torch.nn.functional as F
     from torch.profiler import profile, ProfilerActivity
-    sys.argv = [sys.argv[0], "torch"]
     torch.manual_seed(0)
     E, H, L, V, S = args.embed, args.heads, args.layers, args.vocab, args.seq
 
@@ -74,9 +85,14 @@ else:
             b, s, e = x.shape
             y = self.n1(x)
             q, k, v = (m(y).view(b, s, self.h, e // self.h).transpose(1, 2) for m in (self.q, self.k, self.v))
-            att = (q @ k.transpose(-2, -1)) / (e // self.h) ** 0.5
-            att = att.masked_fill(torch.triu(torch.ones(s, s, device=x.device, dtype=torch.bool), 1), float("-inf"))
-            y = (F.softmax(att, -1) @ v).transpose(1, 2).reshape(b, s, e)
+            if args.manual_attn:
+                att = (q @ k.transpose(-2, -1)) / (e // self.h) ** 0.5
+                att = att.masked_fill(torch.triu(torch.ones(s, s, device=x.device, dtype=torch.bool), 1),
+                                      float("-inf"))
+                y = F.softmax(att, -1) @ v
+            else:
+                y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            y = y.transpose(1, 2).reshape(b, s, e)
             x = x + self.o(y)
             return x + self.f2(F.gelu(self.f1(self.n2(x)), approximate="tanh"))
 
@@ -104,12 +120,16 @@ else:
     x = torch.tensor(ids, device=dev)
     tg = torch.tensor(targets, device=dev)
 
+    fwd = torch.compile(model, mode="max-autotune") if args.compile else model
+
     def step():
         opt.zero_grad()
-        F.cross_entropy(model(x).view(-1, V), tg).backward()
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=bool(args.amp)):
+            loss = F.cross_entropy(fwd(x).view(-1, V).float(), tg)
+        loss.backward()
         opt.step()
 
-    for _ in range(3):
+    for _ in range(5 if args.compile else 3):
         step()
     torch.cuda.synchronize()
     with profile(activities=[ProfilerActivity.CUDA]) as prof:

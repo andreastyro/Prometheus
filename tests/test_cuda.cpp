@@ -714,15 +714,18 @@ int main() {
         }
 
         // flash attention against the S x S path: output and input gradient
-        for (int variant = 0; variant < 4; variant++) {
-            const bool causal = variant != 1, rp = variant == 2, half = variant == 3;
-            auto x0 = random_tensor({2, 70, 64}, 421 + variant);        // 70: a partial tile
-            auto w = G(random_tensor({2, 70, 64}, 425));
+        // variants 3 and 4 run under autocast: on compute 8.0+ the tensor-core
+        // kernels (head size 16, then 64 over three key tiles with RoPE)
+        for (int variant = 0; variant < 5; variant++) {
+            const bool causal = variant != 1, rp = variant == 2 || variant == 4, half = variant >= 3;
+            const int64_t E_ = variant == 4 ? 128 : 64, H_ = variant == 4 ? 2 : 4, S_ = variant == 4 ? 150 : 70;
+            auto x0 = random_tensor({2, S_, E_}, 421 + variant);        // a partial last tile
+            auto w = G(random_tensor({2, S_, E_}, 425));
             TensorPtr outs[2], grads[2];
             for (int f = 0; f < 2; f++) {
                 cuda::set_attention_backend(f ? "flash" : "math");
                 Tensor::manual_seed(11);
-                MultiHeadAttention m(64, 4, causal, rp);
+                MultiHeadAttention m((int)E_, (int)H_, causal, rp);
                 m.to(Device::CUDA);
                 auto x = G(x0);
                 x->set_requires_grad(true);
@@ -746,7 +749,8 @@ int main() {
                 float s = 0; for (float e : v->to_vector()) s = std::max(s, std::fabs(e)); return std::max(s, 1e-12f);
             };
             const char* names[] = {"flash attention, causal", "flash attention, not causal",
-                                   "flash attention, causal + RoPE", "flash attention under autocast"};
+                                   "flash attention, causal + RoPE", "flash attention under autocast",
+                                   "flash attention under autocast, head size 64, RoPE"};
             CHECK_NEAR(names[variant], max_diff(outs[1], outs[0]) / ref(outs[0]), 0.0f, t);
             CHECK_NEAR((std::string(names[variant]) + ": gradient").c_str(), max_diff(grads[1], grads[0]) / ref(grads[0]),
                        0.0f, 2 * t);

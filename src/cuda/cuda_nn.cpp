@@ -70,21 +70,23 @@ extern "C" __global__ void b_layernorm_rows(const float* x, const float* g, cons
     if (lane == 0) { mean_out[r] = mean; inv_out[r] = inv; }
 }
 // The same with x and dy held in registers (rows of up to 1024), and the
-// gamma / beta sums done here too: each block folds its rows' dy * xhat and dy
-// into shared memory and adds one value per column (dg, db start at zero) --
-// the separate column pass read x and dy a second time. Each warp takes 4
-// rows, so there are as many atomics per column as the old chunked pass had.
+// gamma / beta sums started here: each block folds its 8 rows' dy * xhat and
+// dy into shared memory and writes one partial per column to its own slice of
+// pg / pb ([blocks, cols]); b_ln_colsum adds the slices. A warp per row, so a
+// 2048-row step has 256 blocks: 4 rows a warp left half an A100 idle, and the
+// partials added atomically into one row of 768 floats queued every block
+// behind the same addresses (2.6 ms of a GPT step, PyTorch's 0.8).
 // accum: dx += instead of dx = (the input's gradient buffer, already holding
 // another branch's gradient: no separate add pass).
 extern "C" __global__ void b_layernorm_rows_w(const float* x, const float* g, const float* dy, float* dx,
                                               int cols, float eps, long long rows, int accum,
-                                              float* dg, float* db) {
+                                              float* pg, float* pb) {
     __shared__ float sg[1024], sb[1024];
     for (int j = threadIdx.x; j < cols; j += blockDim.x) { sg[j] = 0.0f; sb[j] = 0.0f; }
     __syncthreads();
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    for (int q = 0; q < 4; q++) {
-        const long long r = ((long long)blockIdx.x * 8 + warp) * 4 + q;
+    for (int q = 0; q < 1; q++) {
+        const long long r = (long long)blockIdx.x * 8 + warp;
         if (r >= rows) break;
         const float* xr = x + r * cols;
         const float* dyr = dy + r * cols;
@@ -126,7 +128,20 @@ extern "C" __global__ void b_layernorm_rows_w(const float* x, const float* g, co
         }
     }
     __syncthreads();
-    for (int j = threadIdx.x; j < cols; j += blockDim.x) { atomicAdd(&dg[j], sg[j]); atomicAdd(&db[j], sb[j]); }
+    const long long o = (long long)blockIdx.x * cols;
+    for (int j = threadIdx.x; j < cols; j += blockDim.x) { pg[o + j] = sg[j]; pb[o + j] = sb[j]; }
+}
+// dg[j] += the blocks' partials, a thread per (column, chunk of 16 blocks):
+// a thread per column alone was 768 threads summing 256 values each (24 us)
+extern "C" __global__ void b_ln_colsum(const float* pg, const float* pb, float* dg, float* db, int blocks,
+                                       int cols) {
+    const long long i = gid();
+    const int chunks = (blocks + 15) / 16;
+    if (i >= (long long)cols * chunks) return;
+    const int j = (int)(i % cols), k0 = (int)(i / cols) * 16, k1 = min(blocks, k0 + 16);
+    float a = 0.0f, b = 0.0f;
+    for (int k = k0; k < k1; k++) { a += pg[(long long)k * cols + j]; b += pb[(long long)k * cols + j]; }
+    atomicAdd(dg + j, a); atomicAdd(db + j, b);
 }
 // gamma / beta gradients: a thread per (chunk of 32 rows, column), added
 // atomically -- one thread per column left most of the GPU idle
@@ -201,10 +216,17 @@ vector<TensorPtr> layernorm_backward(const TensorPtr& x0, const TensorPtr& g0, c
     void* pdg = dg->storage()->data();
     void* pdb = db->storage()->data();
     if (rows && cols <= 1024) {
-        // dx, and dgamma / dbeta, in one kernel
+        // dx and the blocks' gamma / beta partials in one kernel, the partials summed by a second
         int cc = (int)cols, ac = into ? 1 : 0;
-        void* aw[] = {&px, &pg, &pd, &pdx, &cc, &eps, &rows, &ac, &pdg, &pdb};
-        cuda::launch(K("b_layernorm_rows_w", BACKWARD_SRC()), (unsigned)((rows + 31) / 32), 1, 1, 256, 1, 1, 0, aw);
+        const int blocks = (int)((rows + 7) / 8);
+        auto part = empty_cuda({2LL * blocks * cols});
+        float* ppg = static_cast<float*>(part->storage()->data());
+        float* ppb = ppg + (size_t)blocks * cols;
+        void* aw[] = {&px, &pg, &pd, &pdx, &cc, &eps, &rows, &ac, &ppg, &ppb};
+        cuda::launch(K("b_layernorm_rows_w", BACKWARD_SRC()), (unsigned)blocks, 1, 1, 256, 1, 1, 0, aw);
+        int bl = blocks;
+        void* ac2[] = {&ppg, &ppb, &pdg, &pdb, &bl, &cc};
+        cuda::launch(K("b_ln_colsum", BACKWARD_SRC()), cols * ((blocks + 15) / 16), ac2);
         return {into ? nullptr : dx, dg, db};
     }
     void* a1[] = {&px, &pg, &pd, &pdx, &pm, &pi, &cols, &eps, &rows};
@@ -676,6 +698,332 @@ extern "C" __global__ void fa_dkv(const void* Q, const void* Kp, const void* V, 
     return cache.emplace(D, src(body.c_str())).first->second;
 }
 
+// tensor-core flash attention's source, compiled once per (head size, half dtype)
+static const string& FATC_SRC(int D, int io) {
+    static std::mutex mu;
+    static auto& cache = *new std::unordered_map<int, string>();       // never destroyed: Kernel keeps c_str()
+    std::lock_guard<std::mutex> lock(mu);
+    const int key = D * 10 + io;
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
+    const string body = "#define FA_D " + to_string(D) + "\n#define FA_HALF " + to_string(io) + "\n" +
+                        string(R"FA(// Flash attention on tensor cores (compute 8.0+), FlashAttention-2's scheme:
+// mma.sync m16n8k16 with bf16 (FA_HALF 3) or fp16 (2) operands and float32
+// accumulators. A block is 4 warps; each warp owns 16 rows of its side
+// (queries, or keys in the dK / dV pass) and their operand fragments in
+// registers; the other side passes through shared memory BC rows at a time
+// -- as [BC][D] tiles where the product reads them along D, and transposed
+// [D][BC] where it reads them along BC. S = R C^T is built per tile, turned
+// into probabilities with the row statistics, and multiplied on: the
+// accumulator fragment of S lines up with the A operand of the next product,
+// so P never leaves registers. Fragment layouts are PTX's for m16n8k16:
+// g = lane / 4 picks the row (g and g + 8), t = lane % 4 the column pair.
+#define BR 64
+#define BC (FA_D <= 64 ? 64 : 32)
+#define NT (BC / 8)
+#define KP (FA_D + 8)
+#define TP (BC + 8)
+#define LOG2E 1.4426950408889634f
+#define FA_INF __int_as_float(0x7f800000)
+
+__device__ __forceinline__ void mma16816(float* c, const unsigned* a, const unsigned* b) {
+#if FA_HALF == 3
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#else
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#endif
+}
+// two floats -> one register of two halves, lo in the low 16 bits
+__device__ __forceinline__ unsigned pack2(float lo, float hi) {
+    unsigned r;
+#if FA_HALF == 3
+    asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(r) : "f"(hi), "f"(lo));
+#else
+    asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(r) : "f"(hi), "f"(lo));
+#endif
+    return r;
+}
+__device__ __forceinline__ float hf(unsigned short h) {
+#if FA_HALF == 3
+    return bf2f(h);
+#else
+    return h2f(h);
+#endif
+}
+// rows [r0, r0 + rows) of a [B*S, *] half matrix (row stride ld, head column
+// offset co) into a [rows][KP] tile; rows past S read as zero
+__device__ void tile_rows(unsigned short* dst, const unsigned short* src, long long ld, long long co, int b, int S,
+                          int r0, int rows) {
+    const int pairs = FA_D / 2;
+    for (int x = threadIdx.x; x < rows * pairs; x += blockDim.x) {
+        const int r = x / pairs, c = (x % pairs) * 2, s = r0 + r;
+        unsigned v = 0u;
+        if (s < S) v = *(const unsigned*)(src + ((long long)b * S + s) * ld + co + c);
+        *(unsigned*)(dst + r * KP + c) = v;
+    }
+}
+// the same rows transposed: dst[d][r], a [FA_D][TP] tile
+__device__ void tile_cols(unsigned short* dst, const unsigned short* src, long long ld, long long co, int b, int S,
+                          int r0, int rows) {
+    const int pairs = FA_D / 2;
+    for (int x = threadIdx.x; x < rows * pairs; x += blockDim.x) {
+        const int r = x / pairs, c = (x % pairs) * 2, s = r0 + r;
+        unsigned v = 0u;
+        if (s < S) v = *(const unsigned*)(src + ((long long)b * S + s) * ld + co + c);
+        dst[c * TP + r] = (unsigned short)(v & 0xffffu);
+        dst[(c + 1) * TP + r] = (unsigned short)(v >> 16);
+    }
+}
+// this warp's 16 rows as A fragments over D (FA_D / 16 k-steps)
+__device__ void frag_rows(unsigned (*a)[4], const unsigned short* src, long long ld, long long co, int b, int S,
+                          int row0) {
+    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    const int r0 = row0 + g, r1 = row0 + g + 8;
+    #pragma unroll
+    for (int ks = 0; ks < FA_D / 16; ks++) {
+        const int c = ks * 16 + t * 2;
+        a[ks][0] = r0 < S ? *(const unsigned*)(src + ((long long)b * S + r0) * ld + co + c) : 0u;
+        a[ks][1] = r1 < S ? *(const unsigned*)(src + ((long long)b * S + r1) * ld + co + c) : 0u;
+        a[ks][2] = r0 < S ? *(const unsigned*)(src + ((long long)b * S + r0) * ld + co + c + 8) : 0u;
+        a[ks][3] = r1 < S ? *(const unsigned*)(src + ((long long)b * S + r1) * ld + co + c + 8) : 0u;
+    }
+}
+// acc[n] (16 x 8 tiles over BC) = rows . tile^T, the tile [BC][KP]
+__device__ __forceinline__ void rows_by_tile(float (*acc)[4], const unsigned (*a)[4], const unsigned short* tile) {
+    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    #pragma unroll
+    for (int n = 0; n < NT; n++) {
+        acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.0f;
+        #pragma unroll
+        for (int ks = 0; ks < FA_D / 16; ks++) {
+            unsigned b[2];
+            b[0] = *(const unsigned*)(tile + (n * 8 + g) * KP + ks * 16 + t * 2);
+            b[1] = *(const unsigned*)(tile + (n * 8 + g) * KP + ks * 16 + t * 2 + 8);
+            mma16816(acc[n], a[ks], b);
+        }
+    }
+}
+// out[n] (16 x 8 tiles over D) += p . tileT, p the 16 x BC accumulator, tileT [FA_D][TP]
+__device__ __forceinline__ void acc_by_tile(float (*out)[4], const float (*p)[4], const unsigned short* tileT) {
+    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    #pragma unroll
+    for (int kk = 0; kk < BC / 16; kk++) {
+        unsigned a[4];
+        a[0] = pack2(p[2 * kk][0], p[2 * kk][1]);
+        a[1] = pack2(p[2 * kk][2], p[2 * kk][3]);
+        a[2] = pack2(p[2 * kk + 1][0], p[2 * kk + 1][1]);
+        a[3] = pack2(p[2 * kk + 1][2], p[2 * kk + 1][3]);
+        #pragma unroll
+        for (int n = 0; n < FA_D / 8; n++) {
+            unsigned b[2];
+            b[0] = *(const unsigned*)(tileT + (n * 8 + g) * TP + kk * 16 + t * 2);
+            b[1] = *(const unsigned*)(tileT + (n * 8 + g) * TP + kk * 16 + t * 2 + 8);
+            mma16816(out[n], a, b);
+        }
+    }
+}
+
+// forward: O = softmax(scale Q K^T) V, and each row's log-sum-exp L
+extern "C" __global__ void __launch_bounds__(128) fat_fwd(
+        const unsigned short* Q, const unsigned short* Kp, const unsigned short* V, long long lq, long long lv,
+        unsigned short* O, float* L, int S, int H, int E, float scale, int causal) {
+    __shared__ __align__(16) unsigned short ks[BC * KP];
+    __shared__ __align__(16) unsigned short vt[FA_D * TP];
+    const int bh = blockIdx.y, b = bh / H, h = bh % H, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int g = lane >> 2, t = lane & 3;
+    const int q0 = blockIdx.x * BR, row0 = q0 + warp * 16;
+    const long long co = (long long)h * FA_D;
+    unsigned qa[FA_D / 16][4];
+    frag_rows(qa, Q, lq, co, b, S, row0);
+    float o[FA_D / 8][4];
+    #pragma unroll
+    for (int n = 0; n < FA_D / 8; n++) o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.0f;
+    float m0 = (-FA_INF), m1 = (-FA_INF), l0 = 0.0f, l1 = 0.0f;
+    const float c = scale * LOG2E;
+    const int kend = causal ? min(S, q0 + BR) : S;
+    for (int j0 = 0; j0 < kend; j0 += BC) {
+        __syncthreads();
+        tile_rows(ks, Kp, lq, co, b, S, j0, BC);
+        tile_cols(vt, V, lv, co, b, S, j0, BC);
+        __syncthreads();
+        float s[NT][4];
+        rows_by_tile(s, qa, ks);
+        float mx0 = m0, mx1 = m1;
+        #pragma unroll
+        for (int n = 0; n < NT; n++) {
+            #pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int key = j0 + n * 8 + t * 2 + (e & 1), row = row0 + g + (e >> 1) * 8;
+                const bool ok = key < S && (!causal || key <= row);
+                s[n][e] = ok ? s[n][e] * c : (-FA_INF);
+            }
+            mx0 = fmaxf(mx0, fmaxf(s[n][0], s[n][1]));
+            mx1 = fmaxf(mx1, fmaxf(s[n][2], s[n][3]));
+        }
+        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 1)); mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 1)); mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 2));
+        const float base0 = mx0 == (-FA_INF) ? 0.0f : mx0, base1 = mx1 == (-FA_INF) ? 0.0f : mx1;
+        const float al0 = exp2f(m0 - base0), al1 = exp2f(m1 - base1);
+        m0 = mx0; m1 = mx1;
+        l0 *= al0; l1 *= al1;
+        #pragma unroll
+        for (int n = 0; n < FA_D / 8; n++) { o[n][0] *= al0; o[n][1] *= al0; o[n][2] *= al1; o[n][3] *= al1; }
+        #pragma unroll
+        for (int n = 0; n < NT; n++) {
+            s[n][0] = exp2f(s[n][0] - base0); s[n][1] = exp2f(s[n][1] - base0);
+            s[n][2] = exp2f(s[n][2] - base1); s[n][3] = exp2f(s[n][3] - base1);
+            l0 += s[n][0] + s[n][1];
+            l1 += s[n][2] + s[n][3];
+        }
+        acc_by_tile(o, s, vt);
+    }
+    l0 += __shfl_xor_sync(0xffffffffu, l0, 1); l0 += __shfl_xor_sync(0xffffffffu, l0, 2);
+    l1 += __shfl_xor_sync(0xffffffffu, l1, 1); l1 += __shfl_xor_sync(0xffffffffu, l1, 2);
+    const float i0 = l0 > 0.0f ? 1.0f / l0 : 0.0f, i1 = l1 > 0.0f ? 1.0f / l1 : 0.0f;
+    const int r0 = row0 + g, r1 = row0 + g + 8;
+    #pragma unroll
+    for (int n = 0; n < FA_D / 8; n++) {
+        const int d = n * 8 + t * 2;
+        if (r0 < S) *(unsigned*)(O + ((long long)b * S + r0) * E + co + d) = pack2(o[n][0] * i0, o[n][1] * i0);
+        if (r1 < S) *(unsigned*)(O + ((long long)b * S + r1) * E + co + d) = pack2(o[n][2] * i1, o[n][3] * i1);
+    }
+    if (t == 0) {
+        if (r0 < S) L[(long long)bh * S + r0] = (m0 + log2f(l0)) / LOG2E;
+        if (r1 < S) L[(long long)bh * S + r1] = (m1 + log2f(l1)) / LOG2E;
+    }
+}
+
+// dQ, query rows: P from L, dP = dO V^T, dS = P (dP - Dv), dQ = scale dS K
+extern "C" __global__ void __launch_bounds__(128) fat_dq(
+        const unsigned short* Q, const unsigned short* Kp, const unsigned short* V, long long lq, long long lv,
+        const unsigned short* dO, const float* L, const float* Dv, float* dQ, long long ldq, int S, int H, int E,
+        float scale, int causal) {
+    __shared__ __align__(16) unsigned short ks[BC * KP];
+    __shared__ __align__(16) unsigned short vs[BC * KP];
+    __shared__ __align__(16) unsigned short kt[FA_D * TP];
+    const int bh = blockIdx.y, b = bh / H, h = bh % H, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int g = lane >> 2, t = lane & 3;
+    const int q0 = blockIdx.x * BR, row0 = q0 + warp * 16;
+    const long long co = (long long)h * FA_D;
+    unsigned qa[FA_D / 16][4], ga[FA_D / 16][4];
+    frag_rows(qa, Q, lq, co, b, S, row0);
+    frag_rows(ga, dO, E, co, b, S, row0);
+    const int r0 = row0 + g, r1 = row0 + g + 8;
+    const float L0 = r0 < S ? L[(long long)bh * S + r0] * LOG2E : 0.0f, L1 = r1 < S ? L[(long long)bh * S + r1] * LOG2E : 0.0f;
+    const float D0 = r0 < S ? Dv[(long long)bh * S + r0] : 0.0f, D1 = r1 < S ? Dv[(long long)bh * S + r1] : 0.0f;
+    float dq[FA_D / 8][4];
+    #pragma unroll
+    for (int n = 0; n < FA_D / 8; n++) dq[n][0] = dq[n][1] = dq[n][2] = dq[n][3] = 0.0f;
+    const float c = scale * LOG2E;
+    const int kend = causal ? min(S, q0 + BR) : S;
+    for (int j0 = 0; j0 < kend; j0 += BC) {
+        __syncthreads();
+        tile_rows(ks, Kp, lq, co, b, S, j0, BC);
+        tile_rows(vs, V, lv, co, b, S, j0, BC);
+        tile_cols(kt, Kp, lq, co, b, S, j0, BC);
+        __syncthreads();
+        float s[NT][4], dp[NT][4];
+        rows_by_tile(s, qa, ks);
+        rows_by_tile(dp, ga, vs);
+        #pragma unroll
+        for (int n = 0; n < NT; n++) {
+            #pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int key = j0 + n * 8 + t * 2 + (e & 1), row = row0 + g + (e >> 1) * 8;
+                const bool ok = key < S && row < S && (!causal || key <= row);
+                const float p = ok ? exp2f(s[n][e] * c - (e < 2 ? L0 : L1)) : 0.0f;
+                s[n][e] = p * (dp[n][e] - (e < 2 ? D0 : D1));
+            }
+        }
+        acc_by_tile(dq, s, kt);
+    }
+    #pragma unroll
+    for (int n = 0; n < FA_D / 8; n++) {
+        const int d = n * 8 + t * 2;
+        if (r0 < S) { float* q = dQ + ((long long)b * S + r0) * ldq + co + d; q[0] = dq[n][0] * scale; q[1] = dq[n][1] * scale; }
+        if (r1 < S) { float* q = dQ + ((long long)b * S + r1) * ldq + co + d; q[0] = dq[n][2] * scale; q[1] = dq[n][3] * scale; }
+    }
+}
+
+// dK and dV, key rows: P^T from L, dV = P^T dO, dP^T = V dO^T,
+// dS^T = P^T (dP^T - Dv), dK = scale dS^T Q
+extern "C" __global__ void __launch_bounds__(128) fat_dkv(
+        const unsigned short* Q, const unsigned short* Kp, const unsigned short* V, long long lq, long long lv,
+        const unsigned short* dO, const float* L, const float* Dv, float* dK, float* dV, long long ldk, int S, int H,
+        int E, float scale, int causal) {
+    __shared__ __align__(16) unsigned short qs[BC * KP];
+    __shared__ __align__(16) unsigned short gs[BC * KP];
+    __shared__ __align__(16) unsigned short qt[FA_D * TP];
+    __shared__ __align__(16) unsigned short gt[FA_D * TP];
+    __shared__ float ls[BC], dvs[BC];
+    const int bh = blockIdx.y, b = bh / H, h = bh % H, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int g = lane >> 2, t = lane & 3;
+    const int k0 = blockIdx.x * BR, row0 = k0 + warp * 16;
+    const long long co = (long long)h * FA_D;
+    unsigned ka[FA_D / 16][4], va[FA_D / 16][4];
+    frag_rows(ka, Kp, lq, co, b, S, row0);
+    frag_rows(va, V, lv, co, b, S, row0);
+    float dk[FA_D / 8][4], dv[FA_D / 8][4];
+    #pragma unroll
+    for (int n = 0; n < FA_D / 8; n++) {
+        dk[n][0] = dk[n][1] = dk[n][2] = dk[n][3] = 0.0f;
+        dv[n][0] = dv[n][1] = dv[n][2] = dv[n][3] = 0.0f;
+    }
+    const float c = scale * LOG2E;
+    const int istart = causal ? (k0 / BC) * BC : 0;
+    for (int i0 = istart; i0 < S; i0 += BC) {
+        __syncthreads();
+        tile_rows(qs, Q, lq, co, b, S, i0, BC);
+        tile_rows(gs, dO, E, co, b, S, i0, BC);
+        tile_cols(qt, Q, lq, co, b, S, i0, BC);
+        tile_cols(gt, dO, E, co, b, S, i0, BC);
+        for (int x = threadIdx.x; x < BC; x += blockDim.x) {
+            const int q = i0 + x;
+            ls[x] = q < S ? L[(long long)bh * S + q] * LOG2E : 0.0f;
+            dvs[x] = q < S ? Dv[(long long)bh * S + q] : 0.0f;
+        }
+        __syncthreads();
+        float s[NT][4], dp[NT][4];
+        rows_by_tile(s, ka, qs);           // S^T: keys x queries
+        rows_by_tile(dp, va, gs);          // dP^T
+        #pragma unroll
+        for (int n = 0; n < NT; n++) {
+            #pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int qc = n * 8 + t * 2 + (e & 1), q = i0 + qc, key = row0 + g + (e >> 1) * 8;
+                const bool ok = q < S && key < S && (!causal || key <= q);
+                const float p = ok ? exp2f(s[n][e] * c - ls[qc]) : 0.0f;
+                s[n][e] = p;
+                dp[n][e] = p * (dp[n][e] - dvs[qc]);
+            }
+        }
+        acc_by_tile(dv, s, gt);
+        acc_by_tile(dk, dp, qt);
+    }
+    const int r0 = row0 + g, r1 = row0 + g + 8;
+    #pragma unroll
+    for (int n = 0; n < FA_D / 8; n++) {
+        const int d = n * 8 + t * 2;
+        if (r0 < S) {
+            float* k = dK + ((long long)b * S + r0) * ldk + co + d;
+            float* v = dV + ((long long)b * S + r0) * ldk + co + d;
+            k[0] = dk[n][0] * scale; k[1] = dk[n][1] * scale; v[0] = dv[n][0]; v[1] = dv[n][1];
+        }
+        if (r1 < S) {
+            float* k = dK + ((long long)b * S + r1) * ldk + co + d;
+            float* v = dV + ((long long)b * S + r1) * ldk + co + d;
+            k[0] = dk[n][2] * scale; k[1] = dk[n][3] * scale; v[0] = dv[n][2]; v[1] = dv[n][3];
+        }
+    }
+}
+)FA");
+    return cache.emplace(key, src(body.c_str())).first->second;
+}
+
 // Which attention runs: the S x S path (cuBLAS gemms and a softmax kernel --
 // the faster one at ordinary lengths) or flash (no S x S buffers: memory
 // linear in the length). "auto" takes flash once the score buffers would
@@ -724,7 +1072,12 @@ TensorPtr attention_qkv(const TensorPtr& qkv0, int heads, bool causal, bool rope
         pq = q; pk = k; lqk = E;
     }
     const void* pv = px + 2 * E * es;
+    // flash (asked for, or for memory at long sequences): on tensor cores for
+    // half precision on compute 8.0+. Not the default at ordinary lengths: on
+    // an A100 (GPT 12 x 768, seq 256) it takes 4.8 ms a step against 3.3 for
+    // the S x S path -- the kernels want ldmatrix / cp.async / larger tiles
     const bool flash = use_flash(B, H, S, D);
+    const bool tc = flash && half && cuda::compute_capability() >= 80 && D % 16 == 0 && D <= 128;
     auto O = empty_cuda({B, S, E}, dt);
     void* po = O->storage()->data();
     TensorPtr P, Lse;                                  // S x S probabilities, or flash's log-sum-exp rows
@@ -734,9 +1087,14 @@ TensorPtr attention_qkv(const TensorPtr& qkv0, int heads, bool causal, bool rope
         int io_ = io, ioo = io, s2 = (int)S, h2 = (int)H, e2 = (int)E, cz = causal ? 1 : 0;
         float sc = scale;
         float* pl = static_cast<float*>(Lse->storage()->data());
-        void* a[] = {&pq, &pk, &pv, &lq_, &lv_, &io_, &po, &ioo, &pl, &s2, &h2, &e2, &sc, &cz};
-        if (B * H * S)
+        if (tc && B * H * S) {
+            void* a[] = {&pq, &pk, &pv, &lq_, &lv_, &po, &pl, &s2, &h2, &e2, &sc, &cz};
+            cuda::launch(K("fat_fwd", FATC_SRC((int)D, io)), (unsigned)((S + 63) / 64), (unsigned)(B * H), 1, 128,
+                         1, 1, 0, a);
+        } else if (B * H * S) {
+            void* a[] = {&pq, &pk, &pv, &lq_, &lv_, &io_, &po, &ioo, &pl, &s2, &h2, &e2, &sc, &cz};
             cuda::launch(K("fa_fwd", FA_SRC((int)D)), (unsigned)((S + 63) / 64), (unsigned)(B * H), 1, 64, 1, 1, 0, a);
+        }
     } else {
     P = empty_cuda({B, H, S, S}, dt);
     void* pp = P->storage()->data();
@@ -804,7 +1162,7 @@ TensorPtr attention_qkv(const TensorPtr& qkv0, int heads, bool causal, bool rope
             return reshape(permute(o, {0, 2, 1, 3}), {B, S, E});
         });
         auto reference = node->backward_graph;
-        node->backward_graph = [reference, qkv, Qr, Kr, P, Lse, flash, causal, B, S, E, H, D, scale, rope, half,
+        node->backward_graph = [reference, qkv, Qr, Kr, P, Lse, flash, tc, causal, B, S, E, H, D, scale, rope, half,
                                 dt, io, es](const TensorPtr& out, const TensorPtr& G0) -> vector<TensorPtr> {
             if (grad_enabled()) return reference(out, G0);
             // the gradient in the products' dtype: rounded to half once under autocast
@@ -833,10 +1191,17 @@ TensorPtr attention_qkv(const TensorPtr& qkv0, int heads, bool causal, bool rope
                     void* a0[] = {&pg, &iog, &po, &ioo, &pd, &s2, &h2, &e2, &rows};
                     cuda::launch(K("fa_dot", FA_SRC((int)D)), rows, a0);
                     const unsigned gx = (unsigned)((S + 63) / 64), gy = (unsigned)(B * H);
-                    void* a1[] = {&pq, &pk, &pv, &lq_, &lv_, &io_, &pg, &iog, &pl, &pd, &pdq, &ld3, &s2, &h2, &e2, &sc, &cz};
-                    cuda::launch(K("fa_dq", FA_SRC((int)D)), gx, gy, 1, 64, 1, 1, 0, a1);
-                    void* a2[] = {&pq, &pk, &pv, &lq_, &lv_, &io_, &pg, &iog, &pl, &pd, &pdk, &pdv, &ld3, &s2, &h2, &e2, &sc, &cz};
-                    cuda::launch(K("fa_dkv", FA_SRC((int)D)), gx, gy, 1, 64, 1, 1, 0, a2);
+                    if (tc) {
+                        void* a1[] = {&pq, &pk, &pv, &lq_, &lv_, &pg, &pl, &pd, &pdq, &ld3, &s2, &h2, &e2, &sc, &cz};
+                        cuda::launch(K("fat_dq", FATC_SRC((int)D, io)), gx, gy, 1, 128, 1, 1, 0, a1);
+                        void* a2[] = {&pq, &pk, &pv, &lq_, &lv_, &pg, &pl, &pd, &pdk, &pdv, &ld3, &s2, &h2, &e2, &sc, &cz};
+                        cuda::launch(K("fat_dkv", FATC_SRC((int)D, io)), gx, gy, 1, 128, 1, 1, 0, a2);
+                    } else {
+                        void* a1[] = {&pq, &pk, &pv, &lq_, &lv_, &io_, &pg, &iog, &pl, &pd, &pdq, &ld3, &s2, &h2, &e2, &sc, &cz};
+                        cuda::launch(K("fa_dq", FA_SRC((int)D)), gx, gy, 1, 64, 1, 1, 0, a1);
+                        void* a2[] = {&pq, &pk, &pv, &lq_, &lv_, &io_, &pg, &iog, &pl, &pd, &pdk, &pdv, &ld3, &s2, &h2, &e2, &sc, &cz};
+                        cuda::launch(K("fa_dkv", FA_SRC((int)D)), gx, gy, 1, 64, 1, 1, 0, a2);
+                    }
                 }
                 if (rope) {
                     long long rr = B * S;

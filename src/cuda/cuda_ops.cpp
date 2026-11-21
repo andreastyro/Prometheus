@@ -269,6 +269,24 @@ extern "C" __global__ void k_accumulate(float* g, const void* a, int da, long lo
     const float v = ldf(a, da, at(ix, i));
     g[i] = assign ? v : g[i] + v;
 }
+// float32 <-> bfloat16 / float16, contiguous, four at a time: the casts around
+// mixed-precision gemms (weights in, gradients back) -- the generic k_cast
+// switched on both dtypes per element and ran at a fraction of bandwidth
+extern "C" __global__ void k_f32_to_half4(const float4* a, uint2* y, long long n4, int dy) {
+    long long i = gid(); if (i >= n4) return;
+    const float4 v = a[i];
+    unsigned short h0, h1, h2, h3;
+    if (dy == 3) { h0 = f2bf(v.x); h1 = f2bf(v.y); h2 = f2bf(v.z); h3 = f2bf(v.w); }
+    else { h0 = f2h(v.x); h1 = f2h(v.y); h2 = f2h(v.z); h3 = f2h(v.w); }
+    y[i] = make_uint2((unsigned)h0 | ((unsigned)h1 << 16), (unsigned)h2 | ((unsigned)h3 << 16));
+}
+extern "C" __global__ void k_half_to_f324(const uint2* a, float4* y, long long n4, int da) {
+    long long i = gid(); if (i >= n4) return;
+    const uint2 v = a[i];
+    const unsigned short h0 = v.x & 0xffff, h1 = v.x >> 16, h2 = v.y & 0xffff, h3 = v.y >> 16;
+    y[i] = da == 3 ? make_float4(bf2f(h0), bf2f(h1), bf2f(h2), bf2f(h3))
+                   : make_float4(h2f(h0), h2f(h1), h2f(h2), h2f(h3));
+}
 // float32 gradients, contiguous, four at a time
 extern "C" __global__ void k_accumulate4(float4* g, const float4* a, long long n4, int assign) {
     long long i = gid(); if (i >= n4) return;
@@ -426,6 +444,20 @@ TensorPtr cast(const TensorPtr& a, DType d) {
     void* py = out->storage()->data();
     int da = (int)a->dtype(), dy = (int)d;
     long long n = out->numel();
+    const bool half_d = d == DType::BFloat16 || d == DType::Float16;
+    const bool half_a = a->dtype() == DType::BFloat16 || a->dtype() == DType::Float16;
+    if (ix.nd < 0 && n >= 4 && n % 4 == 0 && ((uintptr_t)pa & 15) == 0 && ((uintptr_t)py & 15) == 0 &&
+        ((a->dtype() == F32 && half_d) || (half_a && d == F32))) {
+        long long n4 = n / 4;
+        if (a->dtype() == F32) {
+            void* args[] = {&pa, &py, &n4, &dy};
+            cuda::launch(K("k_f32_to_half4", CAST_SRC()), n4, args);
+        } else {
+            void* args[] = {&pa, &py, &n4, &da};
+            cuda::launch(K("k_half_to_f324", CAST_SRC()), n4, args);
+        }
+        return out;
+    }
     void* args[] = {&pa, &da, &py, &dy, &n, &ix};
     cuda::launch(K("k_cast", CAST_SRC()), n, args);
     return out;
