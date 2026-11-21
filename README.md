@@ -111,13 +111,30 @@ One training step, ms, against PyTorch 2.15 (with flash attention) on an A100, r
 | LSTM / GRU (with a CUDA Graph) | **2.2 / 2.0** | 2.3 / 2.4 | |
 | RNN | 2.0 | 0.9 | 1.0 |
 
-Behind: bf16 against `torch.compile` (it fuses across ops), and the plain RNN (cuDNN's persistent
-kernel). On a GTX 970 (PyTorch 2.14 eager): GPT 16.9 vs 18.9 ms, CNN 4.4 vs 5.2, RNN 2.3 vs 3.5, LSTM and GRU even.
+Behind: the plain RNN (cuDNN's persistent kernel); bf16 is within 2% of `torch.compile`.
+On a GTX 970 (PyTorch 2.14 eager): GPT 16.9 vs 18.9 ms, CNN 4.4 vs 5.2, RNN 2.3 vs 3.5, LSTM and GRU even.
 
-On the CPU, `matmul` uses MKL, OpenBLAS or a built-in tiled kernel, chosen at runtime
-(`p.backend()`, `p.set_blas`). A 16.8M-parameter GPT step runs at 1530-1680 tokens/s with MKL
-against PyTorch's 1920-1980 on a Ryzen AI 7 350; pooling, norms, GRU, embeddings and optimizers
-are faster than PyTorch's, convolutions about 3x slower.
+On the CPU (Ryzen AI 7 350, MKL, against PyTorch 2.15 on the same machine; ms, forward +
+backward, [tests/bench_ops.py](tests/bench_ops.py) and the `bench_gpu_*.py --device cpu` steps):
+
+| | Prometheus | PyTorch |
+|---|---|---|
+| GPT 4×256 training step | **184-191** | 188-193 |
+| CNN training step, batch 64 | 45.5 | 42.4 |
+| GRU training step | 52.1 | 49.8 |
+| Attention, 8×256×768, 12 heads | **147** | 165 |
+| GELU, 1M floats (forward) | **0.47** | 1.3-1.7 |
+| Conv2D 16×32×32×32 → 64 | 11.7 | 9.3 |
+| LayerNorm 8×256×768 | 2.7 | 1.2 |
+| LSTM 64×32, 128 → 256 | 34.5 | 25.7 |
+
+Element-wise ops run at PyTorch's speed, with GELU, the LSTM gates and float32 ↔ half
+conversions in AVX2 / AVX-512 picked at runtime. Conv2D and LSTM trail PyTorch's oneDNN
+kernels. `matmul` uses MKL or OpenBLAS when one loads (`p.backend()`, `p.set_blas`), else a
+built-in packed AVX2 kernel within reach of MKL on large products (2048³: 310-320 GFLOP/s
+against MKL's 320-440 across runs; 1024×768×3072: 280 vs 310-320,
+[tests/bench_gemm.py](tests/bench_gemm.py)). A CI job fails if the CPU falls behind PyTorch
+past a set ratio.
 
 ## Install
 
@@ -175,6 +192,6 @@ examples/     runnable Python examples
 
 ## Roadmap
 
-- Close the bf16 gap to `torch.compile` (tensor-core flash attention)
-- Faster recurrent layers and CPU convolutions
+- The CPU conv and LSTM gaps to oneDNN (a direct-convolution kernel, or oneDNN bundled)
+- bf16 gradients end to end on the GPU, if bf16 becomes the default
 - Meta-learning and continual-learning methods on top of higher-order gradients
