@@ -238,12 +238,16 @@ void save_safetensors(const string& path, const NamedTensors& tensors,
     if (!little_endian())
         throw runtime_error("save_safetensors: big-endian hosts are not supported");
 
-    // contiguous copies in each tensor's own dtype: a view is written as its
-    // values, not as the storage it happens to share
+    // contiguous host copies in each tensor's own dtype: a view is written as
+    // its values, not as the storage it happens to share; a GPU tensor is
+    // copied to the host first (written straight from its device pointer it
+    // crashed -- and with it save_model / save_checkpoint of a model on the GPU)
     vector<TensorPtr> data;
     for (auto& kv : tensors) {
         if (kv.first.empty()) throw runtime_error("save_safetensors: a tensor has an empty name");
-        data.push_back(kv.second->detach());
+        auto d = kv.second->detach();
+        if (d->device() != Device::CPU) d = d->to(Device::CPU);
+        data.push_back(d);
     }
     {
         vector<string> names;
