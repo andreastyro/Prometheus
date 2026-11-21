@@ -16,6 +16,22 @@
 using namespace std;
 
 namespace rnn_kernel {
+
+// float buffers the kernels overwrite completely: a std::vector<float>(n)
+// zero-fills, and for the projections, gates, cells and gradients that was
+// ~25 MB of memset an LSTM step (1.7-2.9 ms of setup -> 0.2)
+template <class T> struct NoInit : std::allocator<T> {
+    template <class U> struct rebind { using other = NoInit<U>; };
+    NoInit() = default;
+    template <class U> NoInit(const NoInit<U>&) {}
+    template <class U, class... A> void construct(U* p, A&&... a) {
+        if constexpr (sizeof...(A) == 0) ::new ((void*)p) U;
+        else ::new ((void*)p) U(std::forward<A>(a)...);
+    }
+};
+using FV = std::vector<float, NoInit<float>>;
+
+
 namespace {
 
 inline float sigm(float x) { return 1.0f / (1.0f + std::exp(-x)); }
@@ -157,13 +173,13 @@ static Result run_gru_after_cpu(TensorPtr input, TensorPtr h0, int H, const vect
     const float* bhn = b[3]->data();
 
     // every step's input projection plus (b_r, b_z, b_n), one gemm
-    auto gates = make_shared<vector<float>>((size_t)SB * GH);
+    auto gates = make_shared<FV>((size_t)SB * GH);
     for (int64_t r = 0; r < SB; r++) memcpy(&(*gates)[(size_t)r * GH], bp.data(), GH * sizeof(float));
     pgemm(false, false, (int)SB, GH, I, input->data(), I, Wxp->data(), GH, 1.0f, gates->data(), GH);
 
     auto packed = make_shared<Tensor>(Shape{SB * H});
     float* OUT = packed->data();
-    auto HN = make_shared<vector<float>>((size_t)SB * H);
+    auto HN = make_shared<FV>((size_t)SB * H);
     vector<float> zero_h((size_t)BH, 0.0f), hh((size_t)B * GH);
     const float* h_init = h0 ? h0->data() : zero_h.data();
 
@@ -205,7 +221,8 @@ static Result run_gru_after_cpu(TensorPtr input, TensorPtr h0, int H, const vect
             const float* dOUT = packed->grad();
             vector<float> zero((size_t)BH, 0.0f);
             const float* h_init = h0 ? h0->data() : zero.data();
-            vector<float> dA((size_t)SB * GH), dHH((size_t)SB * GH), dh((size_t)BH, 0.0f);
+            FV dA((size_t)SB * GH), dHH((size_t)SB * GH);
+            vector<float> dh((size_t)BH, 0.0f);
             for (int t = S - 1; t >= 0; t--) {
                 const float* hp = t ? OUTd + (size_t)(t - 1) * BH : h_init;
                 const float* gt = gates->data() + (size_t)t * B * GH;
@@ -240,22 +257,22 @@ static Result run_gru_after_cpu(TensorPtr input, TensorPtr h0, int H, const vect
             for (auto& w : Wx) wx = wx || w->requires_grad();
             for (auto& w : Wh) wh = wh || w->requires_grad();
             if (wx) {
-                vector<float> d((size_t)I * GH, 0.0f);
+                FV d((size_t)I * GH);      // beta 0: written whole
                 pgemm(true, false, I, GH, (int)SB, input->data(), I, dA.data(), GH, 0.0f, d.data(), GH);
                 unpack_add(d.data(), Wx, I, H, 0, 3);
             }
             if (wh) {
-                vector<float> Hprev((size_t)SB * H);
+                FV Hprev((size_t)SB * H);
                 memcpy(Hprev.data(), h_init, BH * sizeof(float));
                 if (S > 1) memcpy(Hprev.data() + BH, OUTd, (size_t)(S - 1) * BH * sizeof(float));
-                vector<float> d((size_t)H * GH, 0.0f);
+                FV d((size_t)H * GH);
                 pgemm(true, false, H, GH, (int)SB, Hprev.data(), H, dHH.data(), GH, 0.0f, d.data(), GH);
                 unpack_add(d.data(), Wh, H, H, 0, 3);
             }
             // b_r, b_z, b_n from dA; b_hn from dHH's n part
             for (int k = 0; k < 4; k++) {
                 if (!b[k]->requires_grad()) continue;
-                const vector<float>& src = k < 3 ? dA : dHH;
+                const FV& src = k < 3 ? dA : dHH;
                 const int col = (k < 3 ? k : 2) * H;
                 vector<double> acc((size_t)H, 0.0);
                 for (int64_t r = 0; r < SB; r++) {
@@ -353,7 +370,7 @@ Result run(Cell cell, TensorPtr input, TensorPtr h0, TensorPtr c0, int H,
     for (int k = 0; k < G; k++) memcpy(&bp[(size_t)k * H], b[k]->data(), H * sizeof(float));
 
     // 1. every timestep's input projection, plus bias, in one gemm
-    auto XP = make_shared<vector<float>>((size_t)SB * GH);
+    auto XP = make_shared<FV>((size_t)SB * GH);
     for (int64_t r = 0; r < SB; r++) memcpy(&(*XP)[(size_t)r * GH], bp.data(), GH * sizeof(float));
     pgemm(false, false, (int)SB, GH, I, input->data(), I, Wxp->data(), GH, 1.0f, XP->data(), GH);
 
@@ -363,9 +380,9 @@ Result run(Cell cell, TensorPtr input, TensorPtr h0, TensorPtr c0, int H,
     float* OUT = packed->data();
 
     // saved for the backward pass
-    auto gates = make_shared<vector<float>>((size_t)SB * GH);   // activated gates per step
-    auto cell_state = lstm ? make_shared<vector<float>>((size_t)SB * H) : nullptr;
-    auto rh = cell == Cell::GRU ? make_shared<vector<float>>((size_t)SB * H) : nullptr;
+    auto gates = make_shared<FV>((size_t)SB * GH);   // activated gates per step
+    auto cell_state = lstm ? make_shared<FV>((size_t)SB * H) : nullptr;
+    auto rh = cell == Cell::GRU ? make_shared<FV>((size_t)SB * H) : nullptr;
 
     vector<float> zero_h((size_t)BH, 0.0f);
     const float* h_init = h0 ? h0->data() : zero_h.data();
@@ -444,7 +461,7 @@ Result run(Cell cell, TensorPtr input, TensorPtr h0, TensorPtr c0, int H,
             const float* c_init = (lstm && c0) ? c0->data() : zero.data();
 
             // dA: gradient of each step's pre-activations, [SB, GH]
-            vector<float> dA((size_t)SB * GH);
+            FV dA((size_t)SB * GH);
             vector<float> dh((size_t)BH, 0.0f), dc((size_t)BH, 0.0f), drh((size_t)BH);
             if (lstm) memcpy(dc.data(), dOUT + SB * H, BH * sizeof(float));
 
@@ -517,7 +534,7 @@ Result run(Cell cell, TensorPtr input, TensorPtr h0, TensorPtr c0, int H,
             for (auto& w : b)  wb = wb || w->requires_grad();
 
             if (wx) {                         // dWx [I, GH] = X^T @ dA
-                vector<float> d((size_t)I * GH, 0.0f);
+                FV d((size_t)I * GH);      // beta 0: written whole
                 pgemm(true, false, I, GH, (int)SB, input->data(), I, dA.data(), GH, 0.0f, d.data(), GH);
                 unpack_add(d.data(), Wx, I, H, 0, G);
             }
@@ -547,10 +564,10 @@ Result run(Cell cell, TensorPtr input, TensorPtr h0, TensorPtr c0, int H,
             }
             if (wh) {
                 // h_{t-1} for every step, [SB, H]: h0 then the outputs shifted by one
-                vector<float> Hprev((size_t)SB * H);
+                FV Hprev((size_t)SB * H);
                 memcpy(Hprev.data(), h0 ? h0->data() : zero.data(), BH * sizeof(float));
                 if (S > 1) memcpy(Hprev.data() + BH, OUTd, (size_t)(S - 1) * BH * sizeof(float));
-                vector<float> d((size_t)H * GH, 0.0f);
+                FV d((size_t)H * GH);
                 if (cell != Cell::GRU) {      // dWh [H, GH] = Hprev^T @ dA
                     pgemm(true, false, H, GH, (int)SB, Hprev.data(), H, dA.data(), GH, 0.0f, d.data(), GH);
                 } else {                      // r, z from h; n from r*h
