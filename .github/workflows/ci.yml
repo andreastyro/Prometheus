@@ -188,6 +188,24 @@ jobs:
           if [ "${{ matrix.backend }}" = openblas ]; then export PROMETHEUS_BLAS=openblas; else export PROMETHEUS_BLAS=tiled; fi
           bash .github/annotate.sh ctest --test-dir build --output-on-failure
 
+  # ── CPU speed against PyTorch, so a slowdown fails the build ─────────────
+  benchmarks:
+    name: CPU benchmarks vs PyTorch
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          sudo apt-get update && sudo apt-get install -y libopenblas-dev
+          python -m pip install --upgrade pip pybind11 numpy setuptools wheel
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          PROMETHEUS_USE_OPENMP=1 python -m pip install . --no-build-isolation
+      - name: Benchmark (fails past a ratio to PyTorch)
+        run: bash .github/annotate.sh python tests/bench_cpu_ci.py
+
   # ── Examples, so they cannot rot silently ────────────────────────────────
   examples:
     name: Examples and ONNX export

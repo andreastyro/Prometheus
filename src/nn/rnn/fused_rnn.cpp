@@ -1,3 +1,4 @@
+#include "../../cpu/simd.hpp"
 #include "ml/nn/rnn/fused_rnn.hpp"
 #include "../../ops_internal.hpp"
 #include "ml/cuda.hpp"
@@ -388,18 +389,9 @@ Result run(Cell cell, TensorPtr input, TensorPtr h0, TensorPtr c0, int H,
             const float* c_prev = t ? cell_state->data() + (size_t)(t - 1) * BH : c_init;
             float* ct = cell_state->data() + (size_t)t * BH;
             #pragma omp parallel for schedule(static) if(BH >= 4096)
-            for (int bb = 0; bb < B; bb++) {
-                const float* ar = a.data() + (size_t)bb * GH;
-                float* gr = gt + (size_t)bb * GH;
-                for (int j = 0; j < H; j++) {
-                    const float i_ = sigm(ar[j]), f_ = sigm(ar[H + j]);
-                    const float o_ = sigm(ar[2 * H + j]), g_ = std::tanh(ar[3 * H + j]);
-                    gr[j] = i_; gr[H + j] = f_; gr[2 * H + j] = o_; gr[3 * H + j] = g_;
-                    const int64_t k = (int64_t)bb * H + j;
-                    ct[k] = f_ * c_prev[k] + i_ * g_;
-                    ht[k] = o_ * std::tanh(ct[k]);
-                }
-            }
+            for (int bb = 0; bb < B; bb++)           // vectorised gate math (src/cpu/simd)
+                simd::lstm_fwd_row(a.data() + (size_t)bb * GH, gt + (size_t)bb * GH, c_prev + (size_t)bb * H,
+                                   ct + (size_t)bb * H, ht + (size_t)bb * H, H);
         } else {
             // r and z from h; n from (r * h)
             const int H2 = 2 * H;
@@ -472,21 +464,9 @@ Result run(Cell cell, TensorPtr input, TensorPtr h0, TensorPtr c0, int H,
                     const float* ct = cell_state->data() + (size_t)t * BH;
                     const float* c_prev = t ? cell_state->data() + (size_t)(t - 1) * BH : c_init;
             #pragma omp parallel for schedule(static) if(BH >= 4096)
-            for (int bb = 0; bb < B; bb++) {
-                        const float* gr = gt + (size_t)bb * GH;
-                        float* dr = da + (size_t)bb * GH;
-                        for (int j = 0; j < H; j++) {
-                            const int64_t k = (int64_t)bb * H + j;
-                            const float i_ = gr[j], f_ = gr[H + j], o_ = gr[2 * H + j], g_ = gr[3 * H + j];
-                            const float tc = std::tanh(ct[k]);
-                            const float dct = dc[k] + dh[k] * o_ * (1.0f - tc * tc);
-                            dr[j]         = dct * g_ * i_ * (1.0f - i_);
-                            dr[H + j]     = dct * c_prev[k] * f_ * (1.0f - f_);
-                            dr[2 * H + j] = dh[k] * tc * o_ * (1.0f - o_);
-                            dr[3 * H + j] = dct * i_ * (1.0f - g_ * g_);
-                            dc[k] = dct * f_;
-                        }
-                    }
+            for (int bb = 0; bb < B; bb++)
+                        simd::lstm_bwd_row(gt + (size_t)bb * GH, ct + (size_t)bb * H, c_prev + (size_t)bb * H,
+                                           dh.data() + (size_t)bb * H, da + (size_t)bb * GH, dc.data() + (size_t)bb * H, H);
                     fill(dh.begin(), dh.end(), 0.0f);
                     pgemm(false, true, B, H, GH, da, GH, Whp->data(), GH, 1.0f, dh.data(), H);
                 } else {
