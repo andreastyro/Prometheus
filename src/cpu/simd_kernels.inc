@@ -190,4 +190,106 @@ void lstm_bwd_row(const float* g, const float* c, const float* c_prev, const flo
     }
 }
 
+
+// float32 <-> bfloat16 / float16, contiguous. bf16: round to nearest even
+// (NaN kept quiet), the bit pattern the scalar store uses; f16 through F16C.
+static inline unsigned short f2bf_s(float f) {
+    unsigned int u;
+    memcpy(&u, &f, 4);
+    if ((u & 0x7fffffffu) > 0x7f800000u) return (unsigned short)((u >> 16) | 0x40);
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return (unsigned short)(u >> 16);
+}
+static inline float bf2f_s(unsigned short h) {
+    const unsigned int u = (unsigned int)h << 16;
+    float f;
+    memcpy(&f, &u, 4);
+    return f;
+}
+void f32_to_bf16(const float* x, unsigned short* y, long long n) {
+    long long i = 0;
+#if defined(SIMD_AVX2) || defined(SIMD_AVX512)
+    const __m256i bias = _mm256_set1_epi32(0x7fff), one = _mm256_set1_epi32(1);
+    const __m256i absmask = _mm256_set1_epi32(0x7fffffff), inf = _mm256_set1_epi32(0x7f800000);
+    for (; i + 8 <= n; i += 8) {
+        const __m256i u = _mm256_castps_si256(_mm256_loadu_ps(x + i));
+        const __m256i rounded = _mm256_add_epi32(u, _mm256_add_epi32(bias, _mm256_and_si256(_mm256_srli_epi32(u, 16), one)));
+        const __m256i nan = _mm256_cmpgt_epi32(_mm256_and_si256(u, absmask), inf);
+        const __m256i quiet = _mm256_or_si256(u, _mm256_set1_epi32(0x400000));
+        const __m256i r = _mm256_srli_epi32(_mm256_blendv_epi8(rounded, quiet, nan), 16);
+        // eight 32-bit lanes -> eight 16-bit values
+        const __m128i lo = _mm256_castsi256_si128(r), hi = _mm256_extracti128_si256(r, 1);
+        _mm_storeu_si128((__m128i*)(y + i), _mm_packus_epi32(lo, hi));
+    }
+#endif
+    for (; i < n; i++) y[i] = f2bf_s(x[i]);
+}
+void bf16_to_f32(const unsigned short* x, float* y, long long n) {
+    long long i = 0;
+#if defined(SIMD_AVX2) || defined(SIMD_AVX512)
+    for (; i + 8 <= n; i += 8) {
+        const __m256i w = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i*)(x + i)));
+        _mm256_storeu_ps(y + i, _mm256_castsi256_ps(_mm256_slli_epi32(w, 16)));
+    }
+#endif
+    for (; i < n; i++) y[i] = bf2f_s(x[i]);
+}
+// float32 -> float16 in software, exact round to nearest even, subnormals
+// included: the F16C instruction follows the flush-to-zero mode some
+// libraries in the process switch on, and turned values under 6.1e-5 into 0
+static inline unsigned short f2h_s(float x) {
+    unsigned int u;
+    memcpy(&u, &x, 4);
+    const unsigned int s = (u >> 16) & 0x8000u;
+    int e = (int)((u >> 23) & 0xff) - 127 + 15;
+    unsigned int m = u & 0x7fffff;
+    if (((u >> 23) & 0xff) == 0xff) return (unsigned short)(s | 0x7c00u | (m ? 0x200u : 0u));
+    if (e >= 31) return (unsigned short)(s | 0x7c00u);
+    if (e <= 0) {
+        if (e < -10) return (unsigned short)s;
+        m |= 0x800000u;
+        const unsigned int shift = (unsigned int)(14 - e), r0 = m >> shift, rem = m & ((1u << shift) - 1),
+                           half = 1u << (shift - 1);
+        unsigned int r = r0;
+        if (rem > half || (rem == half && (r & 1u))) r++;
+        return (unsigned short)(s | r);
+    }
+    unsigned int r = ((unsigned int)e << 10) | (m >> 13), rem = m & 0x1fff;
+    if (rem > 0x1000 || (rem == 0x1000 && (r & 1u))) r++;
+    return (unsigned short)(s | r);
+}
+// float16 needs F16C (every AVX2 CPU has it); the portable build returns
+// false and the caller keeps its scalar conversion
+bool f32_to_f16(const float* x, unsigned short* y, long long n) {
+#if defined(SIMD_AVX2) || defined(SIMD_AVX512)
+    long long i = 0;
+    const __m256 tiny = _mm256_set1_ps(6.103515625e-05f), absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+    for (; i + 8 <= n; i += 8) {
+        const __m256 v = _mm256_loadu_ps(x + i);
+        const __m256 a = _mm256_and_ps(v, absmask);
+        // lanes headed for a half subnormal: in software (see f2h_s)
+        const int sub = _mm256_movemask_ps(_mm256_and_ps(_mm256_cmp_ps(a, tiny, _CMP_LT_OQ),
+                                                         _mm256_cmp_ps(a, _mm256_setzero_ps(), _CMP_GT_OQ)));
+        if (sub) { for (int l = 0; l < 8; l++) y[i + l] = f2h_s(x[i + l]); continue; }
+        _mm_storeu_si128((__m128i*)(y + i), _mm256_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT));
+    }
+    for (; i < n; i++) y[i] = f2h_s(x[i]);
+    return true;
+#else
+    (void)x; (void)y; (void)n;
+    return false;
+#endif
+}
+bool f16_to_f32(const unsigned short* x, float* y, long long n) {
+#if defined(SIMD_AVX2) || defined(SIMD_AVX512)
+    long long i = 0;
+    for (; i + 8 <= n; i += 8) _mm256_storeu_ps(y + i, _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(x + i))));
+    for (; i < n; i++) y[i] = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(x[i])));
+    return true;
+#else
+    (void)x; (void)y; (void)n;
+    return false;
+#endif
+}
+
 } // namespace SIMD_NS

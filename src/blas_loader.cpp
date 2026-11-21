@@ -29,6 +29,10 @@ const char* const AUTO_ORDER[] = {"mkl", "openblas"};
 
 using sgemm_t       = void (*)(int, int, int, int, int, int, float, const float*, int,
                                const float*, int, float, float*, int);
+// MKL's cblas_gemm_bf16bf16f32 and OpenBLAS's cblas_sbgemm: bfloat16
+// operands (raw 16-bit), float32 accumulation and result -- the same order
+using gemm_bf16_t   = void (*)(int, int, int, int, int, int, float, const unsigned short*, int,
+                               const unsigned short*, int, float, float*, int);
 using set_threads_t = void (*)(int);
 using get_threads_t = int (*)();
 
@@ -36,6 +40,7 @@ struct Backend {
     std::string   name = "tiled";
     std::string   path;
     sgemm_t       sgemm       = nullptr;
+    gemm_bf16_t   gemm_bf16   = nullptr;     // optional
     set_threads_t set_threads = nullptr;
     get_threads_t get_threads = nullptr;
 };
@@ -155,6 +160,8 @@ bool try_load(const std::string& lib, const std::string& path, Backend* out) {
         b.name  = lib;
         b.sgemm = sgemm;
         b.path  = loaded_path(h, (void*)sgemm);
+        b.gemm_bf16 = (gemm_bf16_t)symbol(h, "cblas_gemm_bf16bf16f32");
+        if (!b.gemm_bf16) b.gemm_bf16 = (gemm_bf16_t)symbol(h, "cblas_sbgemm");
         if (lib == "openblas") {
             b.set_threads = (set_threads_t)symbol(h, "openblas_set_num_threads");
             b.get_threads = (get_threads_t)symbol(h, "openblas_get_num_threads");
@@ -235,6 +242,14 @@ void sgemm(bool trans_a, bool trans_b, int m, int n, int k,
            float beta, float* c, int ldc) {
     g_backend.sgemm(RowMajor, trans_a ? Trans : NoTrans, trans_b ? Trans : NoTrans,
                     m, n, k, alpha, a, lda, b, ldb, beta, c, ldc);
+}
+
+bool has_bf16_gemm() { return available() && g_backend.gemm_bf16 != nullptr; }
+
+void gemm_bf16(bool trans_a, bool trans_b, int m, int n, int k, float alpha, const unsigned short* a, int lda,
+               const unsigned short* b, int ldb, float beta, float* c, int ldc) {
+    g_backend.gemm_bf16(RowMajor, trans_a ? Trans : NoTrans, trans_b ? Trans : NoTrans, m, n, k, alpha, a, lda, b,
+                        ldb, beta, c, ldc);
 }
 
 void set_search_dirs(const std::vector<std::string>& dirs) {

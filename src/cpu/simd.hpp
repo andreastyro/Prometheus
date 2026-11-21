@@ -19,4 +19,12 @@ void lstm_fwd_row(const float* a, float* g, const float* c_prev, float* c, float
 void lstm_bwd_row(const float* g, const float* c, const float* c_prev, const float* dh, float* da, float* dc,
                   int n, int H);
 
+/// float32 <-> bfloat16 / float16, contiguous (bfloat16: round to nearest
+/// even, as the scalar path). The float16 ones need F16C: false when only the
+/// portable build is available, and nothing was converted.
+void f32_to_bf16(const float* x, unsigned short* y, long long n);
+void bf16_to_f32(const unsigned short* x, float* y, long long n);
+bool f32_to_f16(const float* x, unsigned short* y, long long n);
+bool f16_to_f32(const unsigned short* x, float* y, long long n);
+
 } // namespace simd

@@ -674,8 +674,10 @@ TensorPtr Tensor::to(DType target) {
         return shared_from_this();
     if (device() != Device::CPU)      // converted on the host for now
         return to(Device::CPU)->to(target)->to(device());
-    if (is_floating(target) && is_floating(dtype()) && requires_grad_)
-        return cast_op(shared_from_this(), target);     // differentiable
+    // between floating dtypes: cast_op -- differentiable when needed, and the
+    // vectorised float32 <-> half conversions for contiguous tensors
+    if (is_floating(target) && is_floating(dtype()))
+        return cast_op(shared_from_this(), target);
     auto out = make_shared<Tensor>(shape_, target);
     const void* src = storage_->data();
     void* dst = out->storage()->data();

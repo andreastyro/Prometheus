@@ -10,18 +10,30 @@
 #endif
 
 namespace simd_base {
+void f32_to_bf16(const float*, unsigned short*, long long);
+void bf16_to_f32(const unsigned short*, float*, long long);
+bool f32_to_f16(const float*, unsigned short*, long long);
+bool f16_to_f32(const unsigned short*, float*, long long);
 void gelu_fwd(const float*, float*, long long);
 void gelu_bwd(const float*, const float*, float*, long long);
 void lstm_fwd_row(const float*, float*, const float*, float*, float*, int, int);
 void lstm_bwd_row(const float*, const float*, const float*, const float*, float*, float*, int, int);
 }
 namespace simd_avx2 {
+void f32_to_bf16(const float*, unsigned short*, long long);
+void bf16_to_f32(const unsigned short*, float*, long long);
+bool f32_to_f16(const float*, unsigned short*, long long);
+bool f16_to_f32(const unsigned short*, float*, long long);
 void gelu_fwd(const float*, float*, long long);
 void gelu_bwd(const float*, const float*, float*, long long);
 void lstm_fwd_row(const float*, float*, const float*, float*, float*, int, int);
 void lstm_bwd_row(const float*, const float*, const float*, const float*, float*, float*, int, int);
 }
 namespace simd_avx512 {
+void f32_to_bf16(const float*, unsigned short*, long long);
+void bf16_to_f32(const unsigned short*, float*, long long);
+bool f32_to_f16(const float*, unsigned short*, long long);
+bool f16_to_f32(const unsigned short*, float*, long long);
 void gelu_fwd(const float*, float*, long long);
 void gelu_bwd(const float*, const float*, float*, long long);
 void lstm_fwd_row(const float*, float*, const float*, float*, float*, int, int);
@@ -134,6 +146,26 @@ void lstm_bwd_row(const float* g, const float* c, const float* c_prev, const flo
     if (g_level == 2) simd_avx512::lstm_bwd_row(g, c, c_prev, dh, da, dc, n, H);
     else if (g_level == 1) simd_avx2::lstm_bwd_row(g, c, c_prev, dh, da, dc, n, H);
     else simd_base::lstm_bwd_row(g, c, c_prev, dh, da, dc, n, H);
+}
+
+// conversions: split over the threads, each chunk in the chosen build
+#define SIMD_CALL(fn, ...) (g_level == 2 ? simd_avx512::fn(__VA_ARGS__) : g_level == 1 ? simd_avx2::fn(__VA_ARGS__) \
+                                                                       : simd_base::fn(__VA_ARGS__))
+void f32_to_bf16(const float* x, unsigned short* y, long long n) {
+    split(n, [&](long long a, long long b) { SIMD_CALL(f32_to_bf16, x + a, y + a, b - a); });
+}
+void bf16_to_f32(const unsigned short* x, float* y, long long n) {
+    split(n, [&](long long a, long long b) { SIMD_CALL(bf16_to_f32, x + a, y + a, b - a); });
+}
+bool f32_to_f16(const float* x, unsigned short* y, long long n) {
+    if (g_level == 0) return false;
+    split(n, [&](long long a, long long b) { SIMD_CALL(f32_to_f16, x + a, y + a, b - a); });
+    return true;
+}
+bool f16_to_f32(const unsigned short* x, float* y, long long n) {
+    if (g_level == 0) return false;
+    split(n, [&](long long a, long long b) { SIMD_CALL(f16_to_f32, x + a, y + a, b - a); });
+    return true;
 }
 
 } // namespace simd

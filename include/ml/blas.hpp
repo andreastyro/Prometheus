@@ -36,6 +36,15 @@ void sgemm(bool trans_a, bool trans_b, int m, int n, int k,
            float alpha, const float* a, int lda, const float* b, int ldb,
            float beta, float* c, int ldc);
 
+/// Whether the loaded library multiplies bfloat16 directly (MKL's
+/// cblas_gemm_bf16bf16f32, OpenBLAS's cblas_sbgemm) -- on CPUs with
+/// AVX-512 BF16 / AMX, in hardware.
+bool has_bf16_gemm();
+/// C = alpha * op(A) @ op(B) + beta * C with bfloat16 A, B (raw 16-bit) and a
+/// float32 C, row-major. Only call when has_bf16_gemm().
+void gemm_bf16(bool trans_a, bool trans_b, int m, int n, int k, float alpha, const unsigned short* a, int lda,
+               const unsigned short* b, int ldb, float beta, float* c, int ldc);
+
 /// The library's own thread count, or 0 when it cannot report one.
 int  get_threads();
 void set_threads(int n);

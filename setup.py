@@ -161,10 +161,10 @@ class build_ext(_build_ext):
                 if not x86:
                     return []
                 if s.endswith("simd_avx2.cpp"):
-                    return ["/arch:AVX2"] if sys.platform == "win32" else ["-mavx2", "-mfma"]
+                    return ["/arch:AVX2"] if sys.platform == "win32" else ["-mavx2", "-mfma", "-mf16c"]
                 if s.endswith("simd_avx512.cpp"):
                     return ["/arch:AVX512"] if sys.platform == "win32" else \
-                        ["-mavx512f", "-mavx512bw", "-mavx512dq", "-mavx512vl", "-mfma"]
+                        ["-mavx512f", "-mavx512bw", "-mavx512dq", "-mavx512vl", "-mfma", "-mf16c"]
                 return []
             if stale:
                 one = lambda s: original([s], output_dir, macros, include_dirs, debug,

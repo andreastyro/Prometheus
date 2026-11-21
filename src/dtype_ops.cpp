@@ -1,6 +1,9 @@
 // Dtypes beyond float32: promotion, casts, the float64 / half / integer paths
 // of the core ops, comparisons and masks, and autocast. See ops.hpp.
 #include "ops_internal.hpp"
+#include "ml/blas.hpp"
+#include "cpu/simd.hpp"
+#include <cstdlib>
 #include "ml/strided.hpp"
 #include <algorithm>
 #include <cmath>
@@ -62,6 +65,17 @@ TensorPtr convert(const TensorPtr& a, DType d) {
     const void* src = a->storage()->data();
     void* dst = out->storage()->data();
     const DType from = a->dtype();
+    // float32 <-> half, contiguous: the vectorised conversions (the casts
+    // around every CPU mixed-precision op)
+    if (a->is_contiguous() && a->device() == Device::CPU) {
+        const int64_t n = a->numel();
+        const float* f = static_cast<const float*>(src) + a->offset();
+        const unsigned short* h = static_cast<const unsigned short*>(src) + a->offset();
+        if (from == F32 && d == BF16) { simd::f32_to_bf16(f, static_cast<unsigned short*>(dst), n); return out; }
+        if (from == BF16 && d == F32) { simd::bf16_to_f32(h, static_cast<float*>(dst), n); return out; }
+        if (from == F32 && d == F16 && simd::f32_to_f16(f, static_cast<unsigned short*>(dst), n)) return out;
+        if (from == F16 && d == F32 && simd::f16_to_f32(h, static_cast<float*>(dst), n)) return out;
+    }
     if (is_int(from) || from == BOOL)
         strided::for_each(a->shape(), a->strides(), a->offset(), [&](int64_t i, int64_t off) {
             if (is_int(d) || d == BOOL) store_i(dst, d, i, load_i(src, from, off));
@@ -181,7 +195,11 @@ TensorPtr cast_op(TensorPtr a, DType d) {
             node->backward_fn = [a](const TensorPtr& out) {
                 const float* g = out->grad();
                 float* ga = a->grad();
-                for (int64_t i = 0; i < out->numel(); i++) ga[i] += g[i];
+                const int64_t n = out->numel();
+                // every mixed-precision op has one of these: serial, they were
+                // 52 ms of a bf16 GPT step on the CPU
+                #pragma omp parallel for schedule(static) if(n >= 32768)
+                for (int64_t i = 0; i < n; i++) ga[i] += g[i];
             };
         // the gradient goes back at the precision a's buffer keeps: double
         // for float64, float32 for everything else -- not rounded to half
@@ -428,9 +446,84 @@ TensorPtr softmax(const TensorPtr& a, const Self1& self) {
     return out;
 }
 
+// ── bfloat16 matmuls on the CPU, through the BLAS library's bf16 gemm ─────────
+//
+// a [..., k] times b [k, n], both bfloat16, float32 accumulation (MKL's
+// cblas_gemm_bf16bf16f32: AVX-512 BF16 / AMX where the CPU has them). b may
+// be a transposed view (a Linear's W^T). The result is float32 here; the
+// caller rounds it.
+static const unsigned short* bf16_ptr(const TensorPtr& t) {
+    return static_cast<const unsigned short*>(t->storage()->data()) + t->offset();
+}
+static TensorPtr bf16_mm_f32(const TensorPtr& a0, const TensorPtr& b0) {
+    NoGrad off;
+    auto a = a0->is_contiguous() ? a0 : contiguous(a0);
+    const int64_t k = a->shape().back(), n = b0->shape()[1], rows = k ? a->numel() / k : 0;
+    TensorPtr b = b0;
+    bool tb = false;
+    int ldb = (int)n;
+    if (!b->is_contiguous()) {
+        if (b->strides()[0] == 1 && b->strides()[1] == k) { tb = true; ldb = (int)k; }
+        else b = contiguous(b);
+    }
+    Shape os = a->shape();
+    os.back() = n;
+    auto out = make_shared<Tensor>(os, Tensor::Uninitialized{});
+    if (rows && n && k)
+        blas::gemm_bf16(false, tb, (int)rows, (int)n, (int)k, 1.0f, bf16_ptr(a), (int)k, bf16_ptr(b), ldb, 0.0f,
+                        out->data(), (int)n);
+    else if (out->numel())
+        std::fill(out->data(), out->data() + out->numel(), 0.0f);
+    return out;
+}
+// Opt-in (PROMETHEUS_CPU_BF16_GEMM=1): on a Zen 5 laptop MKL's bf16 gemm ran
+// slower than its float32 one (1024 x 768 x 3072: 57 vs 23 ms) -- worth it
+// where the library uses the CPU's bf16 units (Intel AMX).
+static bool bf16_gemm_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("PROMETHEUS_CPU_BF16_GEMM");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+static TensorPtr bf16_matmul(const TensorPtr& a, const TensorPtr& b) {
+    TensorPtr out;
+    {
+        NoGrad off;
+        out = cast_op(bf16_mm_f32(a, b), BF16);
+    }
+    if (!(a->requires_grad() || b->requires_grad())) return out;
+    auto node = make_node(out, {a, b});
+    node->name = "matmul";
+    node->backward_graph = [a, b](const TensorPtr&, const TensorPtr& G) -> vector<TensorPtr> {
+        const int64_t k = a->shape().back(), n = b->shape()[1], rows = k ? a->numel() / k : 0;
+        if (grad_enabled()) {               // recorded: the op form, in float32
+            auto a32 = cast_op(a, F32), b32 = cast_op(b, F32);
+            return {a->requires_grad() ? matmul(G, transpose(b32)) : nullptr,
+                    b->requires_grad() ? matmul(transpose(reshape(a32, {rows, k})), reshape(G, {rows, n})) : nullptr};
+        }
+        // the gradient rounded to bf16 once, both products through the bf16 gemm
+        auto Gh = cast_op(G->is_contiguous() ? G : contiguous(G), BF16);
+        TensorPtr ga, gb;
+        if (a->requires_grad()) ga = reshape(bf16_mm_f32(reshape(Gh, {rows, n}), transpose(b)), a->shape());
+        if (b->requires_grad()) {
+            auto ac = a->is_contiguous() ? a : contiguous(a);
+            gb = make_shared<Tensor>(Shape{k, n}, Tensor::Uninitialized{});
+            if (rows) blas::gemm_bf16(true, false, (int)k, (int)n, (int)rows, 1.0f, bf16_ptr(ac), (int)k, bf16_ptr(Gh),
+                                      (int)n, 0.0f, gb->data(), (int)n);
+            else std::fill(gb->data(), gb->data() + gb->numel(), 0.0f);
+        }
+        return {ga, gb};
+    };
+    return out;
+}
+
 TensorPtr matmul(TensorPtr a, TensorPtr b, const Self2& self) {
     if (a->dtype() == F32 && b->dtype() == F32) return nullptr;
     const DType d = result_type(a, b);
+    if (d == BF16 && a->dtype() == BF16 && b->dtype() == BF16 && b->dim() == 2 && a->dim() >= 2 &&
+        a->device() == Device::CPU && b->device() == Device::CPU && blas::has_bf16_gemm() && bf16_gemm_on())
+        return bf16_matmul(a, b);
     if (d == F32 || is_half(d)) {
         // the float32 kernel, with autocast off so it does not cast straight back
         Autocast off(F32);
