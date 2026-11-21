@@ -2,6 +2,8 @@
 #include "simd.hpp"
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
+#include <vector>
 #ifdef _MSC_VER
 #include <intrin.h>
 #endif
@@ -10,6 +12,7 @@
 #endif
 
 namespace simd_base {
+void gemm_acc(int, int, int, int, int, const float*, int, const float*, int, float*, int, float*);
 void f32_to_bf16(const float*, unsigned short*, long long);
 void bf16_to_f32(const unsigned short*, float*, long long);
 bool f32_to_f16(const float*, unsigned short*, long long);
@@ -20,6 +23,7 @@ void lstm_fwd_row(const float*, float*, const float*, float*, float*, int, int);
 void lstm_bwd_row(const float*, const float*, const float*, const float*, float*, float*, int, int);
 }
 namespace simd_avx2 {
+void gemm_acc(int, int, int, int, int, const float*, int, const float*, int, float*, int, float*);
 void f32_to_bf16(const float*, unsigned short*, long long);
 void bf16_to_f32(const unsigned short*, float*, long long);
 bool f32_to_f16(const float*, unsigned short*, long long);
@@ -30,6 +34,7 @@ void lstm_fwd_row(const float*, float*, const float*, float*, float*, int, int);
 void lstm_bwd_row(const float*, const float*, const float*, const float*, float*, float*, int, int);
 }
 namespace simd_avx512 {
+void gemm_acc(int, int, int, int, int, const float*, int, const float*, int, float*, int, float*);
 void f32_to_bf16(const float*, unsigned short*, long long);
 void bf16_to_f32(const unsigned short*, float*, long long);
 bool f32_to_f16(const float*, unsigned short*, long long);
@@ -166,6 +171,41 @@ bool f16_to_f32(const unsigned short* x, float* y, long long n) {
     if (g_level == 0) return false;
     split(n, [&](long long a, long long b) { SIMD_CALL(f16_to_f32, x + a, y + a, b - a); });
     return true;
+}
+
+// C += op(A) op(B) without BLAS: rows split over the threads (each its own
+// packing buffers), or all on this thread inside a parallel region
+void gemm_acc(bool ta, bool tb, int m, int n, int k, const float* a, int lda, const float* b, int ldb, float* c,
+              int ldc, bool threads) {
+    if (m <= 0 || n <= 0 || k <= 0) return;
+    const long long work = (long long)m * n * k;
+    auto rows = [&](int r0, int r1) {
+        thread_local std::vector<float> buf;
+        const size_t need = (size_t)72 * 256 + (size_t)256 * 1024;
+        if (buf.size() < need) buf.resize(need);
+        const float* ap = ta ? a + r0 : a + (long long)r0 * lda;
+        SIMD_CALL(gemm_acc, ta ? 1 : 0, tb ? 1 : 0, r1 - r0, n, k, ap, lda, b, ldb, c + (long long)r0 * ldc, ldc,
+                  buf.data());
+    };
+    bool par = threads && work >= (1LL << 21) && m >= 12;
+#ifdef _OPENMP
+    par = par && !omp_in_parallel();
+#else
+    par = false;
+#endif
+    if (!par) { rows(0, m); return; }
+    #pragma omp parallel
+    {
+        long long t = 0, nt = 1;
+#ifdef _OPENMP
+        t = omp_get_thread_num();
+        nt = omp_get_num_threads();
+#endif
+        // whole 6-row panels per thread
+        const long long panels = (m + 5) / 6, per = (panels + nt - 1) / nt;
+        const int r0 = (int)std::min<long long>(m, t * per * 6), r1 = (int)std::min<long long>(m, (t + 1) * per * 6);
+        if (r0 < r1) rows(r0, r1);
+    }
 }
 
 } // namespace simd

@@ -27,4 +27,11 @@ void bf16_to_f32(const unsigned short* x, float* y, long long n);
 bool f32_to_f16(const float* x, unsigned short* y, long long n);
 bool f16_to_f32(const unsigned short* x, float* y, long long n);
 
+/// C[m, n] += op(A) op(B), row-major (ta: A stored [k, m]; tb: B stored
+/// [n, k]) -- the matmul used when no BLAS library is loaded: packed panels
+/// and a register-blocked AVX2 / FMA micro-kernel. threads: split the rows
+/// over OpenMP (ignored inside a parallel region).
+void gemm_acc(bool ta, bool tb, int m, int n, int k, const float* a, int lda, const float* b, int ldb, float* c,
+              int ldc, bool threads = true);
+
 } // namespace simd

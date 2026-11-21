@@ -1,3 +1,4 @@
+#include "cpu/simd.hpp"
 #include "ml/matmul_backend.hpp"
 #include <algorithm>
 #include <stdexcept>
@@ -28,22 +29,9 @@ static inline bool worth_parallel(int m, int n, int k) {
 // Tiled cache-friendly matmul — always compiled in as fallback
 static void matmul_tiled(int m, int n, int k,
                          const float* a, const float* b, float* c) {
-    #ifdef PROMETHEUS_USE_OPENMP
-    #pragma omp parallel for schedule(dynamic) if(worth_parallel(m, n, k))
-    #endif
-    for (int i0 = 0; i0 < m; i0 += TILE)
-        for (int k0 = 0; k0 < k; k0 += TILE)
-            for (int j0 = 0; j0 < n; j0 += TILE) {
-                int i_end = std::min(i0 + TILE, m);
-                int k_end = std::min(k0 + TILE, k);
-                int j_end = std::min(j0 + TILE, n);
-                for (int i = i0; i < i_end; i++)
-                    for (int kk = k0; kk < k_end; kk++) {
-                        float a_ik = a[i * k + kk];
-                        for (int j = j0; j < j_end; j++)
-                            c[i * n + j] += a_ik * b[kk * n + j];
-                    }
-            }
+    // packed panels + register-blocked micro-kernel (src/cpu/simd: AVX2 / FMA
+    // chosen at runtime); the old loop-tiled axpy ran 41 s a GPT step on an i5
+    simd::gemm_acc(false, false, m, n, k, a, k, b, n, c, n);
 }
 
 // dA += grad_out @ B^T
@@ -52,41 +40,9 @@ static void matmul_tiled(int m, int n, int k,
 // at once. Accumulates into out, so the caller's existing gradient survives.
 static void matmul_bt_tiled(int m, int inner, int kdim,
                             const float* g, const float* b, float* out) {
-    // out[m, inner] += g[m, kdim] @ b[inner, kdim]^T
-    //
-    // The obvious loop -- accumulate g[i][kk]*b[j][kk] over kk -- reads both
-    // operands contiguously and looks ideal, but it is a floating-point
-    // reduction into a single scalar, and the compiler may not reassociate
-    // that, so it stays scalar. Measured at 128x128x64 it ran 2.6x slower
-    // than transposing b and calling matmul_tiled.
-    //
-    // So pack a tile of b^T into a contiguous buffer and use the same
-    // j-innermost axpy that matmul_tiled uses, which vectorises. The pack is
-    // TILE^2 elements and is amortised over the rows of the tile.
-    #ifdef PROMETHEUS_USE_OPENMP
-    #pragma omp parallel for schedule(dynamic) if(worth_parallel(m, inner, kdim))
-    #endif
-    for (int i0 = 0; i0 < m; i0 += TILE) {
-        float bt[TILE * TILE];
-        int i_end = std::min(i0 + TILE, m);
-        for (int k0 = 0; k0 < kdim; k0 += TILE)
-            for (int j0 = 0; j0 < inner; j0 += TILE) {
-                int k_end = std::min(k0 + TILE, kdim);
-                int j_end = std::min(j0 + TILE, inner);
-
-                for (int j = j0; j < j_end; j++)
-                    for (int kk = k0; kk < k_end; kk++)
-                        bt[(kk - k0) * TILE + (j - j0)] = b[j * kdim + kk];
-
-                for (int i = i0; i < i_end; i++)
-                    for (int kk = k0; kk < k_end; kk++) {
-                        float g_ik = g[i * kdim + kk];
-                        const float* btr = bt + (kk - k0) * TILE - j0;
-                        for (int j = j0; j < j_end; j++)
-                            out[i * inner + j] += g_ik * btr[j];
-                    }
-            }
-    }
+    // packed panels + register-blocked micro-kernel (src/cpu/simd: AVX2 / FMA
+    // chosen at runtime); the old loop-tiled axpy ran 41 s a GPT step on an i5
+    simd::gemm_acc(false, true, m, inner, kdim, g, kdim, b, kdim, out, inner);
 }
 
 // dB += A^T @ grad_out
@@ -95,24 +51,9 @@ static void matmul_bt_tiled(int m, int inner, int kdim,
 // the reduction runs over m inside each tile.
 static void matmul_at_tiled(int m, int inner, int ncols,
                             const float* a, const float* g, float* out) {
-    #ifdef PROMETHEUS_USE_OPENMP
-    #pragma omp parallel for schedule(dynamic) if(worth_parallel(inner, ncols, m))
-    #endif
-    for (int i0 = 0; i0 < inner; i0 += TILE)
-        for (int k0 = 0; k0 < m; k0 += TILE)
-            for (int j0 = 0; j0 < ncols; j0 += TILE) {
-                int i_end = std::min(i0 + TILE, inner);
-                int k_end = std::min(k0 + TILE, m);
-                int j_end = std::min(j0 + TILE, ncols);
-                for (int i = i0; i < i_end; i++)
-                    for (int kk = k0; kk < k_end; kk++) {
-                        float a_ki = a[kk * inner + i];
-                        const float* gk = g + kk * ncols;
-                        float* oi = out + i * ncols;
-                        for (int j = j0; j < j_end; j++)
-                            oi[j] += a_ki * gk[j];
-                    }
-            }
+    // packed panels + register-blocked micro-kernel (src/cpu/simd: AVX2 / FMA
+    // chosen at runtime); the old loop-tiled axpy ran 41 s a GPT step on an i5
+    simd::gemm_acc(true, false, inner, ncols, m, a, inner, g, ncols, out, ncols);
 }
 
 // A BLAS gemm brings its own thread pool. Called from inside an OpenMP
@@ -177,46 +118,9 @@ void gemm_serial(bool trans_a, bool trans_b, int m, int n, int k,
         if (beta == 0.0f)      for (int j = 0; j < n; j++) ci[j] = 0.0f;
         else if (beta != 1.0f) for (int j = 0; j < n; j++) ci[j] *= beta;
     }
-
-    // Every case is arranged so the innermost loop is an axpy over a row of
-    // C, which vectorises; a dot product over k would be a float reduction
-    // the compiler will not reorder.
-    if (!trans_a && !trans_b) {
-        for (int i = 0; i < m; i++) {
-            float* ci = c + (size_t)i * ldc;
-            for (int kk = 0; kk < k; kk++) {
-                const float aik = a[(size_t)i * lda + kk];
-                const float* bk = b + (size_t)kk * ldb;
-                for (int j = 0; j < n; j++) ci[j] += aik * bk[j];
-            }
-        }
-    } else if (trans_a && !trans_b) {
-        for (int kk = 0; kk < k; kk++) {
-            const float* ak = a + (size_t)kk * lda;
-            const float* bk = b + (size_t)kk * ldb;
-            for (int i = 0; i < m; i++) {
-                const float aki = ak[i];
-                float* ci = c + (size_t)i * ldc;
-                for (int j = 0; j < n; j++) ci[j] += aki * bk[j];
-            }
-        }
-    } else if (!trans_a && trans_b) {
-        // pack B^T to [k, n] once so the inner loop is the same axpy
-        std::vector<float> bt((size_t)k * n);
-        for (int j = 0; j < n; j++)
-            for (int kk = 0; kk < k; kk++)
-                bt[(size_t)kk * n + j] = b[(size_t)j * ldb + kk];
-        for (int i = 0; i < m; i++) {
-            float* ci = c + (size_t)i * ldc;
-            for (int kk = 0; kk < k; kk++) {
-                const float aik = a[(size_t)i * lda + kk];
-                const float* btk = bt.data() + (size_t)kk * n;
-                for (int j = 0; j < n; j++) ci[j] += aik * btk[j];
-            }
-        }
-    } else {
+    if (trans_a && trans_b)
         throw std::runtime_error("gemm_serial: transposing both operands is not supported");
-    }
+    simd::gemm_acc(trans_a, trans_b, m, n, k, a, lda, b, ldb, c, ldc, false);   // callers own the threads
 }
 
 const char* matmul_backend_name() {

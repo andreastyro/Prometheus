@@ -292,4 +292,111 @@ bool f16_to_f32(const unsigned short* x, float* y, long long n) {
 #endif
 }
 
+// ── matrix multiply without BLAS ──────────────────────────────────────────────
+//
+// C[m, n] += op(A)[m, k] op(B)[k, n], row-major; ta: A is stored [k, m], tb: B
+// is stored [n, k]. The BLAS scheme: B packed in panels of GN columns and A in
+// panels of GM rows, KC deep, so the micro-kernel streams both contiguously
+// and keeps a GM x GN block of C in registers (AVX2: 12 accumulators of 8).
+// work: GMC * GKC + GKC * GNC floats.
+#define GM 6
+#define GN 16
+#define GKC 256
+#define GMC 72
+#define GNC 1024
+
+static void pack_a(int ta, const float* a, int lda, int i0, int mc, int p0, int kc, float* pa) {
+    for (int ip = 0; ip < mc; ip += GM) {
+        float* d = pa + (long long)ip * kc;
+        for (int p = 0; p < kc; p++)
+            for (int r = 0; r < GM; r++) {
+                const int i = i0 + ip + r;
+                d[p * GM + r] = ip + r < mc ? (ta ? a[(long long)(p0 + p) * lda + i] : a[(long long)i * lda + p0 + p])
+                                            : 0.0f;
+            }
+    }
+}
+
+static void pack_b(int tb, const float* b, int ldb, int p0, int kc, int j0, int nc, float* pb) {
+    for (int jp = 0; jp < nc; jp += GN) {
+        float* d = pb + (long long)jp * kc;
+        for (int p = 0; p < kc; p++) {
+            const int pp = p0 + p;
+            if (!tb && jp + GN <= nc) {
+                const float* s = b + (long long)pp * ldb + j0 + jp;
+                for (int q = 0; q < GN; q++) d[p * GN + q] = s[q];
+            } else {
+                for (int q = 0; q < GN; q++) {
+                    const int j = j0 + jp + q;
+                    d[p * GN + q] = jp + q < nc ? (tb ? b[(long long)j * ldb + pp] : b[(long long)pp * ldb + j]) : 0.0f;
+                }
+            }
+        }
+    }
+}
+
+// C[mr, nr] (row stride ldc) += pa (kc x GM) . pb (kc x GN)
+static void micro(int kc, const float* pa, const float* pb, float* c, int ldc, int mr, int nr) {
+#ifdef SIMD_WIDTH
+    if (mr == GM && nr == GN) {
+        __m256 c00 = _mm256_loadu_ps(c), c01 = _mm256_loadu_ps(c + 8);
+        __m256 c10 = _mm256_loadu_ps(c + ldc), c11 = _mm256_loadu_ps(c + ldc + 8);
+        __m256 c20 = _mm256_loadu_ps(c + 2 * ldc), c21 = _mm256_loadu_ps(c + 2 * ldc + 8);
+        __m256 c30 = _mm256_loadu_ps(c + 3 * ldc), c31 = _mm256_loadu_ps(c + 3 * ldc + 8);
+        __m256 c40 = _mm256_loadu_ps(c + 4 * ldc), c41 = _mm256_loadu_ps(c + 4 * ldc + 8);
+        __m256 c50 = _mm256_loadu_ps(c + 5 * ldc), c51 = _mm256_loadu_ps(c + 5 * ldc + 8);
+        for (int p = 0; p < kc; p++) {
+            const __m256 b0 = _mm256_loadu_ps(pb + p * GN), b1 = _mm256_loadu_ps(pb + p * GN + 8);
+            const float* ap = pa + p * GM;
+            __m256 a;
+            a = _mm256_broadcast_ss(ap + 0); c00 = _mm256_fmadd_ps(a, b0, c00); c01 = _mm256_fmadd_ps(a, b1, c01);
+            a = _mm256_broadcast_ss(ap + 1); c10 = _mm256_fmadd_ps(a, b0, c10); c11 = _mm256_fmadd_ps(a, b1, c11);
+            a = _mm256_broadcast_ss(ap + 2); c20 = _mm256_fmadd_ps(a, b0, c20); c21 = _mm256_fmadd_ps(a, b1, c21);
+            a = _mm256_broadcast_ss(ap + 3); c30 = _mm256_fmadd_ps(a, b0, c30); c31 = _mm256_fmadd_ps(a, b1, c31);
+            a = _mm256_broadcast_ss(ap + 4); c40 = _mm256_fmadd_ps(a, b0, c40); c41 = _mm256_fmadd_ps(a, b1, c41);
+            a = _mm256_broadcast_ss(ap + 5); c50 = _mm256_fmadd_ps(a, b0, c50); c51 = _mm256_fmadd_ps(a, b1, c51);
+        }
+        _mm256_storeu_ps(c, c00); _mm256_storeu_ps(c + 8, c01);
+        _mm256_storeu_ps(c + ldc, c10); _mm256_storeu_ps(c + ldc + 8, c11);
+        _mm256_storeu_ps(c + 2 * ldc, c20); _mm256_storeu_ps(c + 2 * ldc + 8, c21);
+        _mm256_storeu_ps(c + 3 * ldc, c30); _mm256_storeu_ps(c + 3 * ldc + 8, c31);
+        _mm256_storeu_ps(c + 4 * ldc, c40); _mm256_storeu_ps(c + 4 * ldc + 8, c41);
+        _mm256_storeu_ps(c + 5 * ldc, c50); _mm256_storeu_ps(c + 5 * ldc + 8, c51);
+        return;
+    }
+#endif
+    float acc[GM][GN];
+    for (int r = 0; r < GM; r++)
+        for (int q = 0; q < GN; q++) acc[r][q] = 0.0f;
+    for (int p = 0; p < kc; p++)
+        for (int r = 0; r < GM; r++) {
+            const float av = pa[p * GM + r];
+            for (int q = 0; q < GN; q++) acc[r][q] += av * pb[p * GN + q];
+        }
+    for (int r = 0; r < mr; r++)
+        for (int q = 0; q < nr; q++) c[(long long)r * ldc + q] += acc[r][q];
+}
+
+void gemm_acc(int ta, int tb, int m, int n, int k, const float* a, int lda, const float* b, int ldb, float* c,
+              int ldc, float* work) {
+    float* pa = work;
+    float* pb = work + GMC * GKC;
+    for (int j0 = 0; j0 < n; j0 += GNC) {
+        const int nc = n - j0 < GNC ? n - j0 : GNC;
+        for (int p0 = 0; p0 < k; p0 += GKC) {
+            const int kc = k - p0 < GKC ? k - p0 : GKC;
+            pack_b(tb, b, ldb, p0, kc, j0, nc, pb);
+            for (int i0 = 0; i0 < m; i0 += GMC) {
+                const int mc = m - i0 < GMC ? m - i0 : GMC;
+                pack_a(ta, a, lda, i0, mc, p0, kc, pa);
+                for (int jp = 0; jp < nc; jp += GN)
+                    for (int ip = 0; ip < mc; ip += GM)
+                        micro(kc, pa + (long long)ip * kc, pb + (long long)jp * kc,
+                              c + (long long)(i0 + ip) * ldc + j0 + jp, ldc, mc - ip < GM ? mc - ip : GM,
+                              nc - jp < GN ? nc - jp : GN);
+            }
+        }
+    }
+}
+
 } // namespace SIMD_NS
