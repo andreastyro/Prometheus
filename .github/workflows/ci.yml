@@ -238,8 +238,16 @@ jobs:
           PROMETHEUS_USE_OPENMP=1 python -m pip install . --no-build-isolation
       - name: Benchmark (fails past a ratio to PyTorch)
         run: |
+          # pip's MKL: the library and its companions (core, threading layer)
+          # in <prefix>/lib -- named explicitly, and that folder on the loader path
+          LIBDIR=$(python -c "import sys; print(sys.prefix + '/lib')")
+          ls "$LIBDIR" | grep -i -E "mkl|iomp|tbb" || true
+          MKL=$(ls "$LIBDIR"/libmkl_rt.so* 2>/dev/null | head -1)
+          echo "MKL: ${MKL:-not found}"
+          export LD_LIBRARY_PATH="$LIBDIR:${LD_LIBRARY_PATH:-}"
+          export PROMETHEUS_BLAS=mkl PROMETHEUS_BLAS_PATH="$MKL"
           python -c "import prometheus as p; print(p.backend())"
-          PROMETHEUS_BLAS=mkl bash .github/annotate.sh python tests/bench_cpu_ci.py
+          bash .github/annotate.sh python tests/bench_cpu_ci.py
 
   # ── Examples, so they cannot rot silently ────────────────────────────────
   examples:
